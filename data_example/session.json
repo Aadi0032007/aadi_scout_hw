@@ -1,0 +1,14 @@
+{
+  "session_dir": "/home/elephant/.cache/scout/lab/session_20260603_191749",
+  "start_unix": 1780539470.1019914,
+  "start_iso": "2026-06-03T19:17:50.101991",
+  "fps": 15,
+  "frame_count": 2747,
+  "duration_sec": 183.13333333333333,
+  "encoder": "libx264",
+  "width": 1280,
+  "height": 720,
+  "video": "video.mp4",
+  "telemetry": "data.jsonl",
+  "camera": "floor"
+}
