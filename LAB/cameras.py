@@ -78,6 +78,7 @@ class CameraCapture:
             f"{self.name}: started "
             f"{self._cfg.width}x{self._cfg.height}@{self._cfg.fps}fps "
             f"({'RTSP' if self._cfg.is_rtsp else 'V4L2'})"
+            f"{' [hw]' if getattr(self._cfg, 'hw_decode', False) else ''}"
             f"{' [bus]' if self._publish_enabled else ''}",
         )
         return True
@@ -107,6 +108,20 @@ class CameraCapture:
 
     def _open_capture(self) -> cv2.VideoCapture:
         cfg = self._cfg
+
+        # ── Hardware-accelerated path: GStreamer with NVDEC/VIC ──────────────
+        if getattr(cfg, "hw_decode", False):
+            if cfg.is_rtsp:
+                pipeline = self._build_gst_rtsp_pipeline(cfg)
+            else:
+                pipeline = self._build_gst_v4l2_mjpeg_pipeline(cfg)
+            log("cameras", f"{self.name}: gst → {pipeline}")
+            return cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            # Note: appsink and the caps in the pipeline already enforce
+            # resolution, framerate, and 1-frame buffering. Don't call
+            # CAP_PROP_* on a GStreamer capture — those are V4L2-only.
+
+        # ── Legacy CPU path ──────────────────────────────────────────────────
         if cfg.is_rtsp:
             # Set FFmpeg low-latency options transiently so we don't pollute env.
             prev = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
@@ -132,6 +147,46 @@ class CameraCapture:
             except Exception:
                 pass
         return cap
+
+    # ── GStreamer pipeline builders (Jetson hardware path) ───────────────────
+
+    @staticmethod
+    def _build_gst_rtsp_pipeline(cfg: CameraConfig) -> str:
+        """
+        RTSP H.264 → NVDEC → VIC resize → BGR for OpenCV appsink.
+
+        latency=0 disables the rtspsrc jitter buffer (we want freshest frame).
+        protocols pins TCP/UDP per config (matches rtsp_transport).
+        nvvidconv caps force the output resolution via VIC.
+        videoconvert at the tail is BGRx→BGR on CPU (~1ms at 640x480).
+        appsink drop=true max-buffers=1 reproduces the 1-slot buffer semantics.
+        """
+        return (
+            f"rtspsrc location={cfg.source} latency=0 protocols={cfg.rtsp_transport} ! "
+            f"rtph264depay ! h264parse ! nvv4l2decoder ! "
+            f"nvvidconv ! video/x-raw,format=BGRx,width={cfg.width},height={cfg.height} ! "
+            f"videoconvert ! video/x-raw,format=BGR ! "
+            f"appsink drop=true max-buffers=1 sync=false"
+        )
+
+    @staticmethod
+    def _build_gst_v4l2_mjpeg_pipeline(cfg: CameraConfig) -> str:
+        """
+        USB camera (MJPEG) → hw JPEG decoder → VIC → BGR for OpenCV appsink.
+
+        Requires the camera to advertise MJPG at the requested resolution:
+            v4l2-ctl --list-formats-ext -d <device>
+        Requires gst-inspect-1.0 nvv4l2decoder to list the 'mjpeg' property.
+        io-mode=2 selects DMABUF transfer from the V4L2 driver (lower CPU).
+        """
+        return (
+            f"v4l2src device={cfg.source} io-mode=2 ! "
+            f"image/jpeg,width={cfg.width},height={cfg.height},framerate={cfg.fps}/1 ! "
+            f"nvv4l2decoder mjpeg=1 ! "
+            f"nvvidconv ! video/x-raw,format=BGRx ! "
+            f"videoconvert ! video/x-raw,format=BGR ! "
+            f"appsink drop=true max-buffers=1 sync=false"
+        )
 
     def _ensure_publisher(self, frame: np.ndarray) -> None:
         """Lazily create the frame-bus publisher using the actual decoded frame shape."""

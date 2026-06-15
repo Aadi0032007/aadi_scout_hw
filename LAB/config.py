@@ -46,6 +46,13 @@ class CameraConfig:
     # See LAB/frame_bus.py for the reader API.
     publish_frames: bool = False
 
+    # Route capture through a GStreamer pipeline that uses Jetson hardware
+    # blocks (NVDEC for RTSP H.264, nvv4l2decoder mjpeg=1 for USB MJPEG, VIC
+    # for resize/colorspace). The final stage still hands a BGR numpy frame
+    # to OpenCV's appsink so the rest of the system is unchanged.
+    # Requires OpenCV built with GStreamer support (JetPack's default does).
+    hw_decode: bool = False
+
     @property
     def is_rtsp(self) -> bool:
         return self.source.startswith("rtsp://")
@@ -124,30 +131,37 @@ class LabConfig:
     # to external processes (AI inference, debug viewers, etc.) via shared
     # memory. The region appears as /dev/shm/lab_<name>. See LAB/frame_bus.py.
     cameras: list = field(default_factory=lambda: [
-        # Orbital is on the network
-        CameraConfig(
-            name="orbital",
-    	    source="rtsp://revolabs:revolabs123%40@192.168.10.50:554/h264Preview_01_sub",
-	    width=640, height=480, fps=15, rtsp_transport="tcp",
-        ),
+        # Orbital is on the network — RTSP H.264 decoded by NVDEC
+        # CameraConfig(
+        #     name="orbital",
+    	#     source="rtsp://revolabs:revolabs123%40@192.168.10.50:554/h264Preview_01_sub",
+	    # width=640, height=480, fps=15, rtsp_transport="tcp",
+        #     hw_decode=True,
+        # ),
         # Front AI camera is on USB — exposed on the frame bus for inference
+        # NOTE: flip hw_decode=True once you've verified the hw MJPEG pipeline
+        #       works for this cam (`v4l2-ctl --list-formats-ext -d /dev/video8`
+        #       must show MJPG at the configured resolution).
         CameraConfig(
             name="ai_front",
-            source="/dev/video8",
+            source="/dev/video0",
             width=640, height=480, fps=15,
             publish_frames=True,
+            hw_decode=True,
         ),
         # Rear AI camera is on USB (fallback to /dev/videoX if you don't have the exact by-id path)
-        CameraConfig(
-            name="ai_back",
-            source="/dev/video6", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
-            width=640, height=480, fps=15,
-        ),
-        CameraConfig(
-            name="floor",
-            source="/dev/video2", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
-            width=640, height=480, fps=15,
-        ),
+        # CameraConfig(
+        #     name="ai_back",
+        #     source="/dev/video6", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
+        #     width=640, height=480, fps=15,
+        #     hw_decode=False,
+        # ),
+        # CameraConfig(
+        #     name="floor",
+        #     source="/dev/video2", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
+        #     width=640, height=480, fps=15,
+        #     hw_decode=False,
+        # ),
         # Floor camera is on USB
         # CameraConfig(
         #     name="floor",
@@ -213,8 +227,12 @@ class LabConfig:
     record_fps:             int   = 15            # same as stream — frame-aligned
     record_video_bitrate:   str   = "1500k"       # ffmpeg -b:v
     # Encoder preference order — first available wins. Auto-probed at startup.
+    # On Jetson Orin, h264_v4l2m2m routes through the NVENC hardware engine
+    # via /dev/nvhost-msenc. libx264 is the software fallback if v4l2m2m
+    # isn't built into the local ffmpeg.
     record_encoder_preference: list = field(default_factory=lambda: [
-        "libx264",         # software fallback (still fast at 640x480@15)
+        "h264_v4l2m2m",    # Jetson hardware H.264 encoder
+        "libx264",         # software fallback
     ])
 
     # ── Local dongle (evdev) ──────────────────────────────────────────────────
