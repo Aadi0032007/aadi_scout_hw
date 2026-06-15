@@ -25,6 +25,27 @@ Behavior:
 
 The orchestrator passes parsed values into command() — this controller
 does no UDP work and doesn't know about source arbitration.
+
+Recording note
+--------------
+Do NOT pass motion.state to the recorder. It returns raw pre-scaling,
+pre-gate values from the last UDP packet, which:
+    - has ang_z inflated 5× (ang_z_scale not applied)
+    - ignores watchdog / lock / brake zeros
+    - returns stale data when there is no teleoperator (inference mode)
+
+Pass motion.published_state instead. It captures the values that
+_publish_loop actually sent to _send_twist — guaranteed correct because
+the store happens synchronously inside the publish loop, with no ROS2
+subscription delivery timing involved.
+
+Inference mode note
+-------------------
+published_state() tracks what THIS controller's publish loop emits.
+During inference, if a policy writes directly to /cmd_vel without going
+through motion.command(), published_state() will return zeros (watchdog
+fires). In that case the policy should call motion.command() instead of
+publishing independently — that is the correct integration point.
 """
 
 import threading
@@ -54,6 +75,13 @@ class MotionController:
         self._locked        = True   # start locked for safety
         self._braking       = False
         self._last_cmd_t    = 0.0
+
+        # Last values actually handed to _send_twist by the publish loop.
+        # Updated synchronously inside _publish_loop — no subscription
+        # delivery timing or executor scheduling involved. This is what
+        # published_state() exposes to the recorder.
+        self._last_pub_lin: float = 0.0
+        self._last_pub_ang: float = 0.0
 
         # ROS2 handles
         self._node          = None
@@ -136,9 +164,28 @@ class MotionController:
             self._last_cmd_t = time.monotonic()
 
     def state(self) -> tuple[float, float, bool, bool]:
-        """Public read of (lin_x, ang_z, locked, braking). Used by stream badges and recorder."""
+        """Raw pre-gate state: (lin_x, ang_z, locked, braking).
+
+        This is what the teleoperator commanded before ang_z_scale,
+        watchdog, lock, and brake are applied. Used for the stream's
+        speed-badge overlay where showing operator intent is appropriate.
+
+        Do NOT pass this to the recorder. Use published_state() there.
+        """
         with self._lock:
             return self._lin_x, self._ang_z, self._locked, self._braking
+
+    def published_state(self) -> tuple[float, float]:
+        """Return the last (linear_x, angular_z) actually sent to /cmd_vel.
+
+        Updated synchronously in _publish_loop right after _send_twist,
+        so it always reflects what the robot received: post ang_z_scale,
+        post watchdog, post lock/brake. No subscription delivery timing.
+
+        Pass THIS to the recorder, not state().
+        """
+        with self._lock:
+            return self._last_pub_lin, self._last_pub_ang
 
     # ── publisher loop ────────────────────────────────────────────────────────
 
@@ -147,6 +194,13 @@ class MotionController:
         while not self._stop.is_set():
             lin, ang = self._compute_output()
             self._send_twist(lin, ang)
+
+            # Store synchronously — no subscription round-trip needed.
+            # This is the value published_state() will return to the recorder.
+            with self._lock:
+                self._last_pub_lin = lin
+                self._last_pub_ang = ang
+
             self._stop.wait(timeout=interval)
 
     def _compute_output(self) -> tuple[float, float]:

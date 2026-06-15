@@ -6,6 +6,7 @@ Created on Wed Jun  3 20:04:03 2026
 """
 from __future__ import annotations
 
+
 """
 Session recorder — floor camera as H.264 MP4 + telemetry as JSONL.
 
@@ -23,6 +24,20 @@ stop() is robust:
     - safe if called twice
     - still writes session.json after ffmpeg pipe failure
     - finalizes any open session even if _active is already False
+
+motion_state_fn contract
+------------------------
+Pass motion.published_state, NOT motion.state.
+
+motion.published_state() returns (lin_x, ang_z) — the values last seen
+on /cmd_vel after all transforms (ang_z_scale, watchdog, lock, brake).
+This is what the robot actually received and what the dataset should
+record as the action label.
+
+motion.state() returns (lin_x, ang_z, locked, braking) — the raw
+pre-gate values from the last UDP packet. It is 5× wrong on ang_z,
+ignores the watchdog/lock/brake zeros, and is stale during inference
+when there is no teleoperator sending UDP packets.
 """
 
 import json
@@ -49,7 +64,7 @@ class SessionRecorder:
         fps:                int,
         video_bitrate:      str,
         encoder_preference: list,
-        motion_state_fn:    Optional[Callable[[], tuple]] = None,
+        motion_state_fn:    Optional[Callable[[], tuple[float, float]]] = None,
         # imu_get_fn:         Optional[Callable[[], dict]]  = None,
         gps_get_fn:         Optional[Callable[[], dict]]  = None,
     ) -> None:
@@ -470,12 +485,16 @@ class SessionRecorder:
         now_unix = time.time()
         rel_t = round(now_unix - self._start_unix, 4) if self._start_unix else 0.0
 
-        lin_x = ang_z = 0.0
-        locked = braking = False
+        lin_x: float = 0.0
+        ang_z: float = 0.0
 
         if self._motion_state is not None:
             try:
-                lin_x, ang_z, locked, braking = self._motion_state()
+                # published_state() returns (lin_x, ang_z) — the values that
+                # were actually on /cmd_vel: post ang_z_scale, post
+                # watchdog/lock/brake. Correct for both teleoperation and
+                # inference. See MotionController.published_state().
+                lin_x, ang_z = self._motion_state()
             except Exception:
                 pass
 

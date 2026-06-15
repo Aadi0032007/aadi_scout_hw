@@ -90,6 +90,18 @@ class FrameBusPublisher:
 
         self._shm = shared_memory.SharedMemory(name=self._name, create=True, size=size)
 
+        # Python's resource tracker will silently call shm_unlink() when any
+        # Python process that touched this object exits (including forks and
+        # child processes). That deletes the /dev/shm name while the fd stays
+        # open — the publisher keeps writing but readers can't attach by name.
+        # We own the lifetime explicitly: close() calls unlink() at the right
+        # time, so tell the tracker to leave it alone.
+        try:
+            from multiprocessing import resource_tracker
+            resource_tracker.unregister(self._shm._name, "shared_memory")
+        except Exception:
+            pass
+
         # Scalar views into the header — direct memory, no copies.
         buf = self._shm.buf
         self._seq       = np.ndarray((1,), dtype=np.uint64,  buffer=buf, offset=_OFF_SEQ)
@@ -203,6 +215,14 @@ class FrameBusReader:
             self._shm = shared_memory.SharedMemory(name=self._name, create=False)
         except FileNotFoundError:
             return False
+
+        # Same resource tracker issue as the publisher — unregister so the
+        # tracker doesn't unlink the name when this reader process exits.
+        try:
+            from multiprocessing import resource_tracker
+            resource_tracker.unregister(self._shm._name, "shared_memory")
+        except Exception:
+            pass
 
         buf = self._shm.buf
         self._seq       = np.ndarray((1,), dtype=np.uint64,  buffer=buf, offset=_OFF_SEQ)

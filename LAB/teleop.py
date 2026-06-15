@@ -511,7 +511,7 @@ def main() -> None:
         fps=cfg.record_fps,
         video_bitrate=cfg.record_video_bitrate,
         encoder_preference=cfg.record_encoder_preference,
-        motion_state_fn=motion.state,
+        motion_state_fn=motion.published_state,   # reads /cmd_vel echo: post-scale, post-gate, works during inference
         # imu_get_fn=imu.get,
         gps_get_fn=gps.get,
     )
