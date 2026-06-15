@@ -209,7 +209,7 @@ class LabConfig:
 
     # ── Daily streaming ───────────────────────────────────────────────────────
     daily_room_url:         str   = "https://revolabs.daily.co/iwu_scout_1_cam"
-    daily_room_name:        str   = "IWU_SCOUT1"
+    daily_room_name:        str   = "iwu_scout_1_cam"
     stream_width:           int   = 640
     stream_height:          int   = 480
     stream_fps:             int   = 15
