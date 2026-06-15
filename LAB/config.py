@@ -166,7 +166,7 @@ class LabConfig:
         CameraConfig(
             name="driver",
     	    source="rtsp://revolabs:revolabs123%40@192.168.0.231:554/cam/realmonitor?channel=1&subtype=1",
-	    width=640, height=480, fps=15, rtsp_transport="tcp",
+	    width=640, height=480, fps=15, rtsp_transport="udp",
             hw_decode=True,
         ),
         CameraConfig(
