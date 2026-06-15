@@ -53,6 +53,16 @@ class CameraConfig:
     # Requires OpenCV built with GStreamer support (JetPack's default does).
     hw_decode: bool = False
 
+    # Pixel format requested from V4L2 USB cameras (ignored for RTSP).
+    # "MJPG" → motion-JPEG, decoded on the JPEG hardware engine. Lower USB
+    #          bandwidth but lossy. Usually only available at certain rates.
+    # "YUYV" → raw YUY2 (uncompressed). Higher USB bandwidth, lossless,
+    #          no decode needed. Colorspace conversion still runs on VIC.
+    # Run `v4l2-ctl --list-formats-ext -d <device>` to see what each cam
+    # actually supports at which framerates — cameras only allow discrete
+    # combinations, so 'width/height/fps/pixel_format' must all match a row.
+    pixel_format: str = "MJPG"
+
     @property
     def is_rtsp(self) -> bool:
         return self.source.startswith("rtsp://")
@@ -62,6 +72,11 @@ class CameraConfig:
             raise ValueError(
                 f"{self.name}: rtsp_transport must be 'tcp' or 'udp', "
                 f"got {self.rtsp_transport!r}"
+            )
+        if self.pixel_format.upper() not in ("MJPG", "YUYV"):
+            raise ValueError(
+                f"{self.name}: pixel_format must be 'MJPG' or 'YUYV', "
+                f"got {self.pixel_format!r}"
             )
 
 
@@ -132,36 +147,38 @@ class LabConfig:
     # memory. The region appears as /dev/shm/lab_<name>. See LAB/frame_bus.py.
     cameras: list = field(default_factory=lambda: [
         # Orbital is on the network — RTSP H.264 decoded by NVDEC
-        # CameraConfig(
-        #     name="orbital",
-    	#     source="rtsp://revolabs:revolabs123%40@192.168.10.50:554/h264Preview_01_sub",
-	    # width=640, height=480, fps=15, rtsp_transport="tcp",
-        #     hw_decode=True,
-        # ),
-        # Front AI camera is on USB — exposed on the frame bus for inference
-        # NOTE: flip hw_decode=True once you've verified the hw MJPEG pipeline
-        #       works for this cam (`v4l2-ctl --list-formats-ext -d /dev/video8`
-        #       must show MJPG at the configured resolution).
+        CameraConfig(
+            name="orbital",
+    	    source="rtsp://revolabs:revolabs123%40@192.168.10.50:554/h264Preview_01_sub",
+	    width=640, height=480, fps=15, rtsp_transport="tcp",
+            hw_decode=True,
+        ),
+        # Front AI camera is on USB — YUYV at 30fps (the only rate this cam
+        # advertises at 640x480 for YUYV). VIC handles the YUY2→BGRx convert,
+        # so capture stays mostly on hardware. The recorder and streamer
+        # downsample to record_fps/stream_fps automatically via their tick
+        # loops; the spare frames are simply overwritten in the 1-slot buffer.
         CameraConfig(
             name="ai_front",
             source="/dev/video0",
-            width=640, height=480, fps=15,
+            width=640, height=480, fps=30,
+            pixel_format="YUYV",
             publish_frames=True,
             hw_decode=True,
         ),
         # Rear AI camera is on USB (fallback to /dev/videoX if you don't have the exact by-id path)
-        # CameraConfig(
-        #     name="ai_back",
-        #     source="/dev/video6", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
-        #     width=640, height=480, fps=15,
-        #     hw_decode=False,
-        # ),
-        # CameraConfig(
-        #     name="floor",
-        #     source="/dev/video2", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
-        #     width=640, height=480, fps=15,
-        #     hw_decode=False,
-        # ),
+        CameraConfig(
+            name="ai_back",
+            source="/dev/video6", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
+            width=640, height=480, fps=15,
+            hw_decode=False,
+        ),
+        CameraConfig(
+            name="floor",
+            source="/dev/video2", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
+            width=640, height=480, fps=15,
+            hw_decode=False,
+        ),
         # Floor camera is on USB
         # CameraConfig(
         #     name="floor",
@@ -226,13 +243,17 @@ class LabConfig:
     record_height:          int   = 480
     record_fps:             int   = 15            # same as stream — frame-aligned
     record_video_bitrate:   str   = "1500k"       # ffmpeg -b:v
-    # Encoder preference order — first available wins. Auto-probed at startup.
-    # On Jetson Orin, h264_v4l2m2m routes through the NVENC hardware engine
-    # via /dev/nvhost-msenc. libx264 is the software fallback if v4l2m2m
-    # isn't built into the local ffmpeg.
+    # Encoder preference order — first that opens cleanly wins. Auto-probed
+    # at recording start.
+    #   gst_nvenc → GStreamer + nvv4l2h264enc — Jetson HW encoder (NVENC).
+    #               Requires python3-gi + gstreamer1.0-plugins-nvvideo4linux2.
+    #   libx264   → ffmpeg + libx264 — CPU fallback. Always works.
+    # h264_v4l2m2m is intentionally NOT listed: NVIDIA's L4T ffmpeg ships
+    # decoder integration but no working v4l2-m2m encoder, so it fails with
+    # "Could not find a valid device". HW encode is reachable only via GStreamer.
     record_encoder_preference: list = field(default_factory=lambda: [
-        "h264_v4l2m2m",    # Jetson hardware H.264 encoder
-        "libx264",         # software fallback
+        "gst_nvenc",       # Jetson HW encoder via nvv4l2h264enc
+        "libx264",         # CPU fallback
     ])
 
     # ── Local dongle (evdev) ──────────────────────────────────────────────────

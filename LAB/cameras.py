@@ -114,7 +114,11 @@ class CameraCapture:
             if cfg.is_rtsp:
                 pipeline = self._build_gst_rtsp_pipeline(cfg)
             else:
-                pipeline = self._build_gst_v4l2_mjpeg_pipeline(cfg)
+                fmt = getattr(cfg, "pixel_format", "MJPG").upper()
+                if fmt == "YUYV":
+                    pipeline = self._build_gst_v4l2_yuyv_pipeline(cfg)
+                else:
+                    pipeline = self._build_gst_v4l2_mjpeg_pipeline(cfg)
             log("cameras", f"{self.name}: gst → {pipeline}")
             return cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
             # Note: appsink and the caps in the pipeline already enforce
@@ -174,7 +178,8 @@ class CameraCapture:
         """
         USB camera (MJPEG) → hw JPEG decoder → VIC → BGR for OpenCV appsink.
 
-        Requires the camera to advertise MJPG at the requested resolution:
+        Requires the camera to advertise MJPG at the requested resolution
+        AND framerate — cameras only allow discrete combos:
             v4l2-ctl --list-formats-ext -d <device>
         Requires gst-inspect-1.0 nvv4l2decoder to list the 'mjpeg' property.
         io-mode=2 selects DMABUF transfer from the V4L2 driver (lower CPU).
@@ -183,6 +188,26 @@ class CameraCapture:
             f"v4l2src device={cfg.source} io-mode=2 ! "
             f"image/jpeg,width={cfg.width},height={cfg.height},framerate={cfg.fps}/1 ! "
             f"nvv4l2decoder mjpeg=1 ! "
+            f"nvvidconv ! video/x-raw,format=BGRx ! "
+            f"videoconvert ! video/x-raw,format=BGR ! "
+            f"appsink drop=true max-buffers=1 sync=false"
+        )
+
+    @staticmethod
+    def _build_gst_v4l2_yuyv_pipeline(cfg: CameraConfig) -> str:
+        """
+        USB camera (raw YUYV) → VIC colorspace convert → BGR for OpenCV appsink.
+
+        No decode involved (YUYV is uncompressed YUY2). The first nvvidconv
+        pulls raw YUY2 from CPU and does YUY2→BGRx on the VIC hardware block.
+        The final videoconvert is a cheap BGRx→BGR pack on CPU.
+
+        As with MJPEG, width/height/fps must match a row in the camera's
+        format table — cameras advertise discrete combinations only.
+        """
+        return (
+            f"v4l2src device={cfg.source} io-mode=2 ! "
+            f"video/x-raw,format=YUY2,width={cfg.width},height={cfg.height},framerate={cfg.fps}/1 ! "
             f"nvvidconv ! video/x-raw,format=BGRx ! "
             f"videoconvert ! video/x-raw,format=BGR ! "
             f"appsink drop=true max-buffers=1 sync=false"

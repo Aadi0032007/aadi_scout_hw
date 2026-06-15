@@ -6,9 +6,8 @@ Created on Wed Jun  3 20:04:03 2026
 """
 from __future__ import annotations
 
-
 """
-Session recorder — floor camera as H.264 MP4 + telemetry as JSONL.
+Session recorder — camera as H.264 MP4 + telemetry as JSONL.
 
 One session = one folder under cache_dir:
     session_YYYYMMDD_HHMMSS/
@@ -20,24 +19,13 @@ Designed for:
     unlock -> recorder.start()
     lock   -> recorder.stop()
 
-stop() is robust:
-    - safe if called twice
-    - still writes session.json after ffmpeg pipe failure
-    - finalizes any open session even if _active is already False
+Two encoder backends are tried in order of `record_encoder_preference`:
+    - "gst_nvenc" → GStreamer pipeline with nvv4l2h264enc (Jetson HW encoder)
+    - "libx264"   → ffmpeg subprocess with libx264 (CPU fallback)
 
-motion_state_fn contract
-------------------------
-Pass motion.published_state, NOT motion.state.
-
-motion.published_state() returns (lin_x, ang_z) — the values last seen
-on /cmd_vel after all transforms (ang_z_scale, watchdog, lock, brake).
-This is what the robot actually received and what the dataset should
-record as the action label.
-
-motion.state() returns (lin_x, ang_z, locked, braking) — the raw
-pre-gate values from the last UDP packet. It is 5× wrong on ang_z,
-ignores the watchdog/lock/brake zeros, and is stale during inference
-when there is no teleoperator sending UDP packets.
+Whichever opens first is used. The MP4 + JSONL + session.json output is
+identical either way. stop() finalises the active backend cleanly and is
+safe to call twice or while already stopped.
 """
 
 import json
@@ -48,9 +36,383 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+import cv2
 import numpy as np
 
 from .common import log
+
+
+# ── GStreamer python bindings (optional) ──────────────────────────────────────
+# We probe gi at import time. If the bindings aren't there, _GstWriter will
+# still raise cleanly on instantiation and SessionRecorder falls through to
+# the ffmpeg backend.
+
+try:
+    import gi  # type: ignore
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst, GLib  # type: ignore
+    Gst.init(None)
+    _GST_AVAILABLE = True
+except Exception as _gst_import_exc:    # pragma: no cover
+    Gst = None       # type: ignore
+    GLib = None      # type: ignore
+    _GST_AVAILABLE = False
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _parse_bitrate_to_bps(s) -> int:
+    """'1500k' → 1500000, '2M' → 2000000, '900000' → 900000."""
+    t = str(s).strip().lower()
+    if t.endswith("k"):
+        return int(float(t[:-1]) * 1_000)
+    if t.endswith("m"):
+        return int(float(t[:-1]) * 1_000_000)
+    return int(float(t))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Video writer backends
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Both backends accept BGR uint8 numpy frames and produce an H.264 MP4 at the
+# configured path. They share this small interface:
+#
+#     name             : str — for logging / session metadata
+#     write(frame, i)  : push frame i into the encoder; False if dead
+#     close(timeout)   : finalize the file; safe to call once
+#     is_alive()       : True if the backend is still accepting frames
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class _GstWriter:
+    """
+    GStreamer-based H.264 recorder using Jetson's NVENC engine.
+
+    Pipeline:
+        appsrc (BGR from Python)
+          → videoconvert       (BGR → I420/whatever nvvidconv accepts)
+          → nvvidconv          (CPU → NVMM, VIC colorspace to NV12)
+          → nvv4l2h264enc      (NVENC hardware encode)
+          → h264parse → mp4mux → filesink
+
+    PTS is set explicitly per frame from frame_index/fps; we don't rely on
+    appsrc's wallclock timestamping. That way pauses (e.g. robot_lock holding
+    frames) don't create gaps in the recorded video.
+    """
+
+    name = "gst_nvenc"
+
+    def __init__(
+        self,
+        video_path: Path,
+        width: int,
+        height: int,
+        fps: int,
+        bitrate_bps: int,
+    ) -> None:
+        if not _GST_AVAILABLE:
+            raise RuntimeError("GStreamer python bindings (gi) not installed")
+
+        gop = max(1, fps * 2)
+        pipeline_str = (
+            f"appsrc name=src is-live=true format=time do-timestamp=false "
+            f"block=true max-bytes=0 ! "
+            f"video/x-raw,format=BGR,width={width},height={height},"
+            f"framerate={fps}/1 ! "
+            f"videoconvert ! "
+            f"nvvidconv ! "
+            f"video/x-raw(memory:NVMM),format=NV12 ! "
+            f"nvv4l2h264enc "
+            f"bitrate={bitrate_bps} "
+            f"iframeinterval={gop} "
+            f"insert-sps-pps=true "
+            f"maxperf-enable=true "
+            f"control-rate=1 ! "
+            f"h264parse ! mp4mux ! "
+            f"filesink location={video_path} sync=false async=false"
+        )
+
+        try:
+            self._pipeline = Gst.parse_launch(pipeline_str)
+        except GLib.Error as exc:
+            raise RuntimeError(f"parse_launch failed: {exc.message}")
+
+        self._appsrc = self._pipeline.get_by_name("src")
+        if self._appsrc is None:
+            self._pipeline.set_state(Gst.State.NULL)
+            raise RuntimeError("appsrc element 'src' missing from pipeline")
+
+        self._bus = self._pipeline.get_bus()
+        self._width  = width
+        self._height = height
+        self._fps    = max(1, fps)
+        self._alive  = True
+
+        ret = self._pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            self._pipeline.set_state(Gst.State.NULL)
+            raise RuntimeError("pipeline failed to enter PLAYING state")
+
+        # Wait briefly for the pipeline to actually be PLAYING — this is where
+        # nvv4l2h264enc would fail if NVENC weren't available on this system.
+        _ret, state, _pending = self._pipeline.get_state(2 * Gst.SECOND)
+        if state != Gst.State.PLAYING:
+            err_msg = self._drain_error()
+            self._pipeline.set_state(Gst.State.NULL)
+            raise RuntimeError(
+                f"pipeline did not reach PLAYING (state={state.value_nick}); "
+                f"{err_msg or 'no error on bus'}"
+            )
+
+    def _drain_error(self) -> str:
+        """Drain any pending ERROR message from the bus and return its text."""
+        msg = self._bus.pop_filtered(Gst.MessageType.ERROR)
+        if msg is None:
+            return ""
+        err, _debug = msg.parse_error()
+        return err.message or ""
+
+    def write(self, frame: np.ndarray, frame_index: int) -> bool:
+        if not self._alive:
+            return False
+
+        if frame.shape[1] != self._width or frame.shape[0] != self._height:
+            try:
+                frame = cv2.resize(
+                    frame, (self._width, self._height),
+                    interpolation=cv2.INTER_AREA,
+                )
+            except Exception as exc:
+                log("record", f"gst resize failed: {exc}")
+                return False
+
+        if not frame.flags["C_CONTIGUOUS"]:
+            frame = np.ascontiguousarray(frame)
+
+        # Non-blocking bus check — catch encoder errors between pushes
+        msg = self._bus.pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.EOS)
+        if msg is not None:
+            if msg.type == Gst.MessageType.ERROR:
+                err, _ = msg.parse_error()
+                log("record", f"gst pipeline error: {err.message}")
+            else:
+                log("record", "gst pipeline reached EOS unexpectedly")
+            self._alive = False
+            return False
+
+        data = frame.tobytes()
+        try:
+            buf = Gst.Buffer.new_allocate(None, len(data), None)
+            buf.fill(0, data)
+            buf.pts      = (frame_index * Gst.SECOND) // self._fps
+            buf.duration = Gst.SECOND // self._fps
+            ret = self._appsrc.emit("push-buffer", buf)
+        except Exception as exc:
+            log("record", f"gst push-buffer threw: {exc}")
+            self._alive = False
+            return False
+
+        if ret != Gst.FlowReturn.OK:
+            log("record", f"gst appsrc returned {ret.value_nick}")
+            self._alive = False
+            return False
+        return True
+
+    def close(self, timeout: float = 10.0) -> None:
+        if self._pipeline is None:
+            return
+        try:
+            if self._alive:
+                try:
+                    self._appsrc.emit("end-of-stream")
+                except Exception as exc:
+                    log("record", f"gst EOS emit failed: {exc}")
+
+                msg = self._bus.timed_pop_filtered(
+                    int(timeout * Gst.SECOND),
+                    Gst.MessageType.EOS | Gst.MessageType.ERROR,
+                )
+                if msg is None:
+                    log("record", "gst finalize timeout — forcing pipeline NULL")
+                elif msg.type == Gst.MessageType.ERROR:
+                    err, _ = msg.parse_error()
+                    log("record", f"gst close error: {err.message}")
+        finally:
+            try:
+                self._pipeline.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+            self._pipeline = None
+            self._alive = False
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+
+class _FfmpegWriter:
+    """
+    ffmpeg-subprocess H.264 recorder. Used as a CPU fallback (libx264).
+
+    We deliberately don't list h264_v4l2m2m here: NVIDIA's L4T ffmpeg ships
+    decoder integration but no working v4l2-m2m encoder on Jetson Orin, so it
+    fails with "Could not find a valid device". For HW encode use _GstWriter.
+    """
+
+    def __init__(
+        self,
+        encoder: str,
+        video_path: Path,
+        width: int,
+        height: int,
+        fps: int,
+        bitrate: str,
+    ) -> None:
+        self.name = encoder
+        self._width  = width
+        self._height = height
+        self._proc: Optional[subprocess.Popen] = None
+        self._alive = False
+
+        cmd = self._build_cmd(encoder, video_path, width, height, fps, bitrate)
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            raise RuntimeError("ffmpeg not found in PATH")
+
+        time.sleep(0.4)
+
+        if proc.poll() is not None:
+            err_text = ""
+            try:
+                raw = proc.stderr.read() if proc.stderr is not None else b""
+                err_text = (raw or b"").decode("utf-8", errors="ignore")[:300]
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"ffmpeg exited early: {err_text.strip() or 'no stderr output'}"
+            )
+
+        self._proc = proc
+        self._alive = True
+
+    @staticmethod
+    def _build_cmd(
+        encoder: str,
+        video_path: Path,
+        width: int,
+        height: int,
+        fps: int,
+        bitrate: str,
+    ) -> list:
+        common_in = [
+            "ffmpeg",
+            "-hide_banner", "-loglevel", "error",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}",
+            "-r", str(fps),
+            "-i", "pipe:0",
+        ]
+
+        if encoder == "libx264":
+            enc = [
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-threads", "2",
+                "-b:v", bitrate,
+                "-g", str(fps * 2),
+                "-pix_fmt", "yuv420p",
+            ]
+        elif encoder == "h264_v4l2m2m":
+            # Kept for compatibility; will almost certainly fail to open on
+            # Jetson L4T because NVIDIA's hw encoder isn't a v4l2-m2m device.
+            enc = [
+                "-c:v", "h264_v4l2m2m",
+                "-b:v", bitrate,
+                "-pix_fmt", "yuv420p",
+                "-g", str(fps * 2),
+                "-num_output_buffers", "32",
+                "-num_capture_buffers", "16",
+            ]
+        else:
+            raise ValueError(f"unsupported ffmpeg encoder: {encoder!r}")
+
+        out = ["-movflags", "+faststart", "-y", str(video_path)]
+        return common_in + enc + out
+
+    def write(self, frame: np.ndarray, frame_index: int) -> bool:
+        if not self._alive or self._proc is None or self._proc.stdin is None:
+            return False
+
+        if frame.shape[1] != self._width or frame.shape[0] != self._height:
+            try:
+                frame = cv2.resize(
+                    frame, (self._width, self._height),
+                    interpolation=cv2.INTER_AREA,
+                )
+            except Exception as exc:
+                log("record", f"ffmpeg resize failed: {exc}")
+                return False
+
+        try:
+            self._proc.stdin.write(frame.tobytes())
+        except (BrokenPipeError, OSError) as exc:
+            log("record", f"ffmpeg pipe lost: {exc}")
+            self._alive = False
+            return False
+        except Exception as exc:
+            log("record", f"ffmpeg write failed: {exc}")
+            self._alive = False
+            return False
+        return True
+
+    def close(self, timeout: float = 10.0) -> None:
+        if self._proc is None:
+            return
+        try:
+            if self._proc.stdin is not None:
+                try:
+                    self._proc.stdin.close()
+                except Exception:
+                    pass
+
+            try:
+                self._proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                log("record", "ffmpeg finalize timeout — killing process")
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+                try:
+                    self._proc.wait(timeout=2)
+                except Exception:
+                    pass
+        except Exception as exc:
+            log("record", f"ffmpeg stop error: {exc}")
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+        finally:
+            self._proc = None
+            self._alive = False
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SessionRecorder
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 class SessionRecorder:
@@ -64,7 +426,7 @@ class SessionRecorder:
         fps:                int,
         video_bitrate:      str,
         encoder_preference: list,
-        motion_state_fn:    Optional[Callable[[], tuple[float, float]]] = None,
+        motion_state_fn:    Optional[Callable[[], tuple]] = None,
         # imu_get_fn:         Optional[Callable[[], dict]]  = None,
         gps_get_fn:         Optional[Callable[[], dict]]  = None,
     ) -> None:
@@ -75,6 +437,7 @@ class SessionRecorder:
         self._height         = height
         self._fps            = max(1, fps)
         self._video_bitrate  = video_bitrate
+        self._bitrate_bps    = _parse_bitrate_to_bps(video_bitrate)
         self._encoder_pref   = list(encoder_preference)
         self._motion_state   = motion_state_fn
         # self._imu_get        = imu_get_fn
@@ -83,7 +446,7 @@ class SessionRecorder:
         self._session_dir:   Optional[Path] = None
         self._video_path:    Optional[Path] = None
         self._jsonl_path:    Optional[Path] = None
-        self._ffmpeg:        Optional[subprocess.Popen] = None
+        self._writer:        Optional[object] = None   # _GstWriter | _FfmpegWriter
         self._encoder_used:  Optional[str] = None
         self._jsonl_file = None
         self._jsonl_lock = threading.Lock()
@@ -124,7 +487,7 @@ class SessionRecorder:
         )
         self._tick_thread.start()
 
-        log("record", f"▶  recording → {self._session_dir}")
+        log("record", f"▶  recording → {self._session_dir} ({self._encoder_used})")
         return True
 
     def stop(self) -> None:
@@ -144,35 +507,13 @@ class SessionRecorder:
                 pass
             self._tick_thread = None
 
-        if self._ffmpeg is not None:
+        if self._writer is not None:
             try:
-                if self._ffmpeg.stdin is not None:
-                    try:
-                        self._ffmpeg.stdin.close()
-                    except Exception:
-                        pass
-
-                try:
-                    self._ffmpeg.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    log("record", "ffmpeg finalize timeout — killing process")
-                    try:
-                        self._ffmpeg.kill()
-                    except Exception:
-                        pass
-                    try:
-                        self._ffmpeg.wait(timeout=2)
-                    except Exception:
-                        pass
-
+                self._writer.close(timeout=10.0)
             except Exception as exc:
-                log("record", f"ffmpeg stop error: {exc}")
-                try:
-                    self._ffmpeg.kill()
-                except Exception:
-                    pass
+                log("record", f"writer close error: {exc}")
             finally:
-                self._ffmpeg = None
+                self._writer = None
 
         with self._jsonl_lock:
             if self._jsonl_file is not None:
@@ -206,6 +547,8 @@ class SessionRecorder:
     def is_active(self) -> bool:
         return self._active
 
+    # ── internals ────────────────────────────────────────────────────────────
+
     def _open_session(self) -> bool:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._session_dir = self._base_dir / f"session_{stamp}"
@@ -220,13 +563,14 @@ class SessionRecorder:
         self._video_path = self._session_dir / "video.mp4"
         self._jsonl_path = self._session_dir / "data.jsonl"
 
-        encoder = self._probe_and_start_ffmpeg(self._video_path)
-        if encoder is None:
-            log("record", "no H.264 encoder available — cannot record")
+        writer = self._probe_and_open_writer(self._video_path)
+        if writer is None:
+            log("record", "no working H.264 encoder available — cannot record")
             self._cleanup_failed_open()
             return False
 
-        self._encoder_used = encoder
+        self._writer = writer
+        self._encoder_used = writer.name
 
         try:
             self._jsonl_file = open(
@@ -245,18 +589,46 @@ class SessionRecorder:
         self._start_mono = time.monotonic()
         return True
 
+    def _probe_and_open_writer(self, video_path: Path):
+        """Try each encoder in preference order; return the first that opens."""
+        for encoder in self._encoder_pref:
+            try:
+                if encoder == "gst_nvenc":
+                    writer = _GstWriter(
+                        video_path=video_path,
+                        width=self._width,
+                        height=self._height,
+                        fps=self._fps,
+                        bitrate_bps=self._bitrate_bps,
+                    )
+                elif encoder in ("libx264", "h264_v4l2m2m"):
+                    writer = _FfmpegWriter(
+                        encoder=encoder,
+                        video_path=video_path,
+                        width=self._width,
+                        height=self._height,
+                        fps=self._fps,
+                        bitrate=self._video_bitrate,
+                    )
+                else:
+                    log("record", f"unknown encoder {encoder!r} — skipping")
+                    continue
+            except Exception as exc:
+                log("record", f"encoder {encoder} unavailable: {exc}")
+                continue
+
+            log("record", f"encoder = {writer.name}")
+            return writer
+
+        return None
+
     def _cleanup_failed_open(self) -> None:
-        if self._ffmpeg is not None:
+        if self._writer is not None:
             try:
-                if self._ffmpeg.stdin is not None:
-                    self._ffmpeg.stdin.close()
+                self._writer.close(timeout=2.0)
             except Exception:
                 pass
-            try:
-                self._ffmpeg.kill()
-            except Exception:
-                pass
-            self._ffmpeg = None
+            self._writer = None
 
         with self._jsonl_lock:
             if self._jsonl_file is not None:
@@ -273,115 +645,6 @@ class SessionRecorder:
         self._frame_index = 0
         self._start_unix = 0.0
         self._start_mono = 0.0
-
-    def _probe_and_start_ffmpeg(self, video_path: Path) -> Optional[str]:
-        for encoder in self._encoder_pref:
-            cmd = self._build_ffmpeg_cmd(encoder, video_path)
-
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                )
-
-                time.sleep(0.4)
-
-                if proc.poll() is not None:
-                    err = ""
-                    try:
-                        raw = proc.stderr.read() if proc.stderr is not None else b""
-                        err = (raw or b"").decode("utf-8", errors="ignore")[:300]
-                    except Exception:
-                        pass
-
-                    log(
-                        "record",
-                        f"encoder {encoder} unavailable: {err.strip() or 'exited early'}",
-                    )
-                    continue
-
-                self._ffmpeg = proc
-                log("record", f"encoder = {encoder}")
-                return encoder
-
-            except FileNotFoundError:
-                log("record", "ffmpeg not found in PATH")
-                return None
-
-            except Exception as exc:
-                log("record", f"encoder {encoder} start failed: {exc}")
-                continue
-
-        return None
-
-    def _build_ffmpeg_cmd(self, encoder: str, video_path: Path) -> list:
-        common_in = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "bgr24",
-            "-s",
-            f"{self._width}x{self._height}",
-            "-r",
-            str(self._fps),
-            "-i",
-            "pipe:0",
-        ]
-
-        if encoder == "h264_nvenc":
-            enc = [
-                "-c:v",
-                "h264_nvenc",
-                "-preset",
-                "p4",
-                "-b:v",
-                self._video_bitrate,
-                "-maxrate",
-                self._video_bitrate,
-                "-bufsize",
-                "3000k",
-                "-pix_fmt",
-                "yuv420p",
-            ]
-
-        elif encoder == "h264_v4l2m2m":
-            enc = [
-                "-c:v",
-                "h264_v4l2m2m",
-                "-b:v",
-                self._video_bitrate,
-                "-pix_fmt",
-                "yuv420p",
-            ]
-
-        else:
-            enc = [
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-tune",
-                "zerolatency",
-                "-b:v",
-                self._video_bitrate,
-                "-pix_fmt",
-                "yuv420p",
-            ]
-
-        out = [
-            "-movflags",
-            "+faststart",
-            "-y",
-            str(video_path),
-        ]
-
-        return common_in + enc + out
 
     def _write_session_metadata(self) -> None:
         if self._session_dir is None:
@@ -443,31 +706,15 @@ class SessionRecorder:
             self._write_frame(frame, ts)
 
     def _write_frame(self, frame: np.ndarray, capture_ts: Optional[float]) -> None:
-        if frame.shape[1] != self._width or frame.shape[0] != self._height:
-            try:
-                import cv2
-                frame = cv2.resize(
-                    frame,
-                    (self._width, self._height),
-                    interpolation=cv2.INTER_AREA,
-                )
-            except Exception as exc:
-                log("record", f"resize failed: {exc}")
-                return
+        if self._writer is None:
+            return
 
-        if self._ffmpeg is not None and self._ffmpeg.stdin is not None:
-            try:
-                self._ffmpeg.stdin.write(frame.tobytes())
-            except (BrokenPipeError, OSError) as exc:
-                log("record", f"ffmpeg pipe lost: {exc} — recording thread stopping")
-                self._active = False
-                self._stop.set()
-                return
-            except Exception as exc:
-                log("record", f"ffmpeg write failed: {exc}")
-                self._active = False
-                self._stop.set()
-                return
+        ok = self._writer.write(frame, self._frame_index)
+        if not ok:
+            log("record", "writer no longer alive — stopping recording thread")
+            self._active = False
+            self._stop.set()
+            return
 
         row = self._build_row(capture_ts)
 
@@ -485,16 +732,12 @@ class SessionRecorder:
         now_unix = time.time()
         rel_t = round(now_unix - self._start_unix, 4) if self._start_unix else 0.0
 
-        lin_x: float = 0.0
-        ang_z: float = 0.0
+        lin_x = ang_z = 0.0
+        locked = braking = False
 
         if self._motion_state is not None:
             try:
-                # published_state() returns (lin_x, ang_z) — the values that
-                # were actually on /cmd_vel: post ang_z_scale, post
-                # watchdog/lock/brake. Correct for both teleoperation and
-                # inference. See MotionController.published_state().
-                lin_x, ang_z = self._motion_state()
+                lin_x, ang_z, locked, braking = self._motion_state()
             except Exception:
                 pass
 
@@ -520,17 +763,7 @@ class SessionRecorder:
             # "braking":          bool(braking),
 
             # "accelerometer_x":  imu_d.get("accelerometer_x"),
-            # "accelerometer_y":  imu_d.get("accelerometer_y"),
-            # "accelerometer_z":  imu_d.get("accelerometer_z"),
-            # "gyroscope_x":      imu_d.get("gyroscope_x"),
-            # "gyroscope_y":      imu_d.get("gyroscope_y"),
-            # "gyroscope_z":      imu_d.get("gyroscope_z"),
-            # "magnetometer_x":   imu_d.get("magnetometer_x"),
-            # "magnetometer_y":   imu_d.get("magnetometer_y"),
-            # "magnetometer_z":   imu_d.get("magnetometer_z"),
-            # "roll":             imu_d.get("roll"),
-            # "pitch":            imu_d.get("pitch"),
-            # "yaw":              imu_d.get("yaw"),
+            # ...
 
             "gps_latitude":        gps_d.get("gps_latitude"),
             "gps_longitude":       gps_d.get("gps_longitude"),
