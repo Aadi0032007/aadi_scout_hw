@@ -7,47 +7,48 @@ Created on Wed Jun  3 20:04:03 2026
 from __future__ import annotations
 
 
+# -*- coding: utf-8 -*-
 """
-Motion: UDP commands → /cmd_vel via ROS2.
+Motion: UDP commands → Docker ROS1 /cmd_vel via UDP forward.
 
-This is the ONLY rclpy user in the system. Everything else uses direct
-hardware access. The orchestrator calls rclpy.init() once at startup and
-shares the global context with this controller.
+Previously this module used rclpy to publish directly to a local ROS2 node.
+The Segway SmartCar SDK has moved into a ROS1 Docker container
+(segway_ros1), so we now forward motion commands as JSON UDP packets to
+revo_docker_udp_motion_keepalive.py running inside that container.
 
-Behavior:
-    - Publishes geometry_msgs/Twist to /cmd_vel at motion_publish_hz.
-    - Watchdog: if no command arrives within motion_watchdog_sec, output zero.
-    - robot_lock=True → output zero regardless of incoming commands.
-    - brake=True       → output zero regardless of incoming commands.
-    - ang_z is multiplied by ang_z_scale (default 0.20) so turning feels
-      proportional to forward speed. Matches the original.
-    - Publishes 3× zero on stop() for safety.
+The Docker script listens on UDP port 55999 inside the container; the
+container is port-mapped so host port 56000 → container 55999. We send
+to host port 56000. (Host port 55999 is already in use by the gamepad
+listener, so we can't reuse it.)
 
-The orchestrator passes parsed values into command() — this controller
-does no UDP work and doesn't know about source arbitration.
+The Docker script applies its own deadzone/limits and publishes /cmd_vel
+to ROS1 at 50 Hz with keepalive. We run our own publish loop here at
+motion_publish_hz so the Docker side always receives a steady stream
+and its watchdog (HOLD_LAST_CMD_S=0.40s) never trips during normal
+operation.
 
-Recording note
---------------
-Do NOT pass motion.state to the recorder. It returns raw pre-scaling,
-pre-gate values from the last UDP packet, which:
-    - has ang_z inflated 5× (ang_z_scale not applied)
-    - ignores watchdog / lock / brake zeros
-    - returns stale data when there is no teleoperator (inference mode)
+Public API is IDENTICAL to the rclpy version — teleop.py call site
+updated only to pass docker_host/docker_port instead of topic; record.py
+is untouched:
+    command(lin_x, ang_z, locked, braking)   ← called by UDP dispatcher
+    state()           → raw pre-gate values  ← used by stream overlay
+    published_state() → post-gate values     ← used by recorder
+    start() / stop()
 
-Pass motion.published_state instead. It captures the values that
-_publish_loop actually sent to _send_twist — guaranteed correct because
-the store happens synchronously inside the publish loop, with no ROS2
-subscription delivery timing involved.
+Behavior preserved from rclpy version:
+    - Watchdog: zero output if no command within motion_watchdog_sec.
+    - robot_lock=True  → zero output.
+    - brake=True       → zero output.
+    - ang_z multiplied by ang_z_scale (default 0.20).
+    - Sends 3× zero on stop() for safety.
 
-Inference mode note
--------------------
-published_state() tracks what THIS controller's publish loop emits.
-During inference, if a policy writes directly to /cmd_vel without going
-through motion.command(), published_state() will return zeros (watchdog
-fires). In that case the policy should call motion.command() instead of
-publishing independently — that is the correct integration point.
+Wire protocol:
+    JSON  {"lin_x": <float>, "ang_z": <float>}
+    UDP   127.0.0.1:56000  (default; override via docker_host/docker_port)
 """
 
+import json
+import socket
 import threading
 import time
 from typing import Optional
@@ -58,12 +59,14 @@ from .common import log
 class MotionController:
     def __init__(
         self,
-        topic:            str   = "/cmd_vel",
+        docker_host:      str   = "127.0.0.1",
+        docker_port:      int   = 56000,
         publish_hz:       int   = 50,
         watchdog_sec:     float = 0.30,
         ang_z_scale:      float = 0.20,
     ) -> None:
-        self._topic         = topic
+        self._docker_host   = docker_host
+        self._docker_port   = docker_port
         self._publish_hz    = max(1, publish_hz)
         self._watchdog      = watchdog_sec
         self._ang_z_scale   = ang_z_scale
@@ -76,54 +79,34 @@ class MotionController:
         self._braking       = False
         self._last_cmd_t    = 0.0
 
-        # Last values actually handed to _send_twist by the publish loop.
-        # Updated synchronously inside _publish_loop — no subscription
-        # delivery timing or executor scheduling involved. This is what
-        # published_state() exposes to the recorder.
+        # Last values actually sent by the publish loop.
+        # Updated synchronously — no ROS subscription timing involved.
+        # published_state() exposes these to the recorder.
         self._last_pub_lin: float = 0.0
         self._last_pub_ang: float = 0.0
 
-        # ROS2 handles
-        self._node          = None
-        self._pub           = None
-        self._executor      = None
-        self._executor_thread: Optional[threading.Thread] = None
+        # UDP socket (send-only, reused across ticks)
+        self._sock: Optional[socket.socket] = None
 
         # Publisher loop
         self._stop          = threading.Event()
-        self._pub_thread    = threading.Thread(target=self._publish_loop, daemon=True, name="motion-pub")
+        self._pub_thread    = threading.Thread(
+            target=self._publish_loop, daemon=True, name="motion-pub"
+        )
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Create the ROS2 node and start the publish loop.
-
-        rclpy.init() must already have been called by the orchestrator.
-        """
+        """Open the UDP socket and start the publish loop."""
         try:
-            import rclpy   # type: ignore
-            from rclpy.executors import SingleThreadedExecutor   # type: ignore
-            from geometry_msgs.msg import Twist                  # type: ignore
-
-            if not rclpy.ok():
-                log("motion", "rclpy not initialized — orchestrator must call rclpy.init() first")
-                return
-
-            self._node = rclpy.create_node("lab_motion")
-            self._pub  = self._node.create_publisher(Twist, self._topic, 10)
-
-            self._executor = SingleThreadedExecutor()
-            self._executor.add_node(self._node)
-            self._executor_thread = threading.Thread(
-                target=self._executor.spin, daemon=True, name="motion-spin"
-            )
-            self._executor_thread.start()
-
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._pub_thread.start()
-            log("motion", f"publishing → {self._topic} @ {self._publish_hz} Hz "
-                          f"(watchdog={self._watchdog*1000:.0f}ms, ang_scale={self._ang_z_scale})")
-        except ImportError:
-            log("motion", "rclpy not installed — motion disabled")
+            log(
+                "motion",
+                f"forwarding → udp://{self._docker_host}:{self._docker_port} "
+                f"@ {self._publish_hz} Hz "
+                f"(watchdog={self._watchdog*1000:.0f}ms, ang_scale={self._ang_z_scale})"
+            )
         except Exception as exc:
             log("motion", f"start failed: {exc}")
 
@@ -134,23 +117,17 @@ class MotionController:
         except Exception:
             pass
 
-        # Publish 3× zero for safety on shutdown
+        # Send 3× zero for safety so the Docker keepalive ramps to zero
         for _ in range(3):
             self._send_twist(0.0, 0.0)
             time.sleep(0.02)
 
-        if self._executor is not None:
+        if self._sock is not None:
             try:
-                self._executor.shutdown(timeout_sec=1.0)
+                self._sock.close()
             except Exception:
                 pass
-        if self._node is not None:
-            try:
-                self._node.destroy_node()
-            except Exception:
-                pass
-        self._node = None
-        self._pub  = None
+            self._sock = None
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -176,11 +153,11 @@ class MotionController:
             return self._lin_x, self._ang_z, self._locked, self._braking
 
     def published_state(self) -> tuple[float, float]:
-        """Return the last (linear_x, angular_z) actually sent to /cmd_vel.
+        """Return the last (linear_x, angular_z) actually forwarded to Docker.
 
         Updated synchronously in _publish_loop right after _send_twist,
         so it always reflects what the robot received: post ang_z_scale,
-        post watchdog, post lock/brake. No subscription delivery timing.
+        post watchdog, post lock/brake.
 
         Pass THIS to the recorder, not state().
         """
@@ -195,8 +172,8 @@ class MotionController:
             lin, ang = self._compute_output()
             self._send_twist(lin, ang)
 
-            # Store synchronously — no subscription round-trip needed.
-            # This is the value published_state() will return to the recorder.
+            # Store synchronously so published_state() always reflects
+            # what we just forwarded, without any subscription timing.
             with self._lock:
                 self._last_pub_lin = lin
                 self._last_pub_ang = ang
@@ -204,27 +181,25 @@ class MotionController:
             self._stop.wait(timeout=interval)
 
     def _compute_output(self) -> tuple[float, float]:
-        """Apply all safety gates and return (lin_x, ang_z) to publish this tick."""
+        """Apply all safety gates and return (lin_x, ang_z) to send this tick."""
         with self._lock:
-            now          = time.monotonic()
-            watchdog_ok  = (now - self._last_cmd_t) < self._watchdog
-            locked       = self._locked
-            braking      = self._braking
-            lin_x        = self._lin_x
-            ang_z        = self._ang_z * self._ang_z_scale
+            now         = time.monotonic()
+            watchdog_ok = (now - self._last_cmd_t) < self._watchdog
+            locked      = self._locked
+            braking     = self._braking
+            lin_x       = self._lin_x
+            ang_z       = self._ang_z * self._ang_z_scale
 
         if not watchdog_ok or locked or braking:
             return 0.0, 0.0
         return lin_x, ang_z
 
     def _send_twist(self, lin: float, ang: float) -> None:
-        if self._pub is None:
+        """Send a JSON UDP packet to the Docker ROS1 bridge."""
+        if self._sock is None:
             return
         try:
-            from geometry_msgs.msg import Twist   # type: ignore
-            t = Twist()
-            t.linear.x  = float(lin)
-            t.angular.z = float(ang)
-            self._pub.publish(t)
+            payload = json.dumps({"lin_x": lin, "ang_z": ang}).encode()
+            self._sock.sendto(payload, (self._docker_host, self._docker_port))
         except Exception:
             pass

@@ -403,15 +403,9 @@ def main() -> None:
     log("teleop", "local_gamepad = always enabled")
     log("teleop", "=" * 60)
 
-    # ── Init ROS2 once ───────────────────────────────────────────────────────
-
-    rclpy_inited = False
-    try:
-        import rclpy
-        rclpy.init(args=None)
-        rclpy_inited = True
-    except ImportError:
-        log("teleop", "rclpy not available — motion will be disabled")
+    # ── ROS init ─────────────────────────────────────────────────────────────
+    # rclpy is no longer used: /cmd_vel is published by the segway_ros1 Docker
+    # container (ROS1). MotionController forwards (lin_x, ang_z) over UDP.
 
     # ── Core subsystems ──────────────────────────────────────────────────────
 
@@ -426,7 +420,8 @@ def main() -> None:
     gps.start()
 
     motion = MotionController(
-        topic=cfg.cmd_vel_topic,
+        docker_host=cfg.docker_motion_host,
+        docker_port=cfg.docker_motion_port,
         publish_hz=cfg.motion_publish_hz,
         watchdog_sec=cfg.motion_watchdog_sec,
         ang_z_scale=cfg.ang_z_scale,
@@ -727,13 +722,6 @@ def main() -> None:
                 sub.stop_all()
         except Exception as exc:
             log("teleop", f"{sub_name} stop error: {exc}")
-
-    if rclpy_inited:
-        try:
-            import rclpy
-            rclpy.shutdown()
-        except Exception:
-            pass
 
     log("teleop", "done.")
 

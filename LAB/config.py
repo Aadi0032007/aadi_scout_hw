@@ -99,7 +99,12 @@ class LabConfig:
     source_activity_timeout_sec: float = 1.0   # silent > this → other source takes over
 
     # ── Motion ────────────────────────────────────────────────────────────────
-    cmd_vel_topic:          str   = "/cmd_vel"
+    # /cmd_vel publishing has moved into the segway_ros1 Docker container.
+    # We forward (lin_x, ang_z) as JSON UDP to revo_docker_udp_motion_keepalive.py.
+    # Host port 56000 → container port 55999 (script's UDP_PORT). The container
+    # must be launched with `-p 56000:55999/udp` so this forward reaches it.
+    docker_motion_host:     str   = "127.0.0.1"
+    docker_motion_port:     int   = 56000   # host-side port mapped to container's 55999
     motion_publish_hz:      int   = 50
     motion_watchdog_sec:    float = 0.30   # stop robot if no command for this long
     ang_z_scale:            float = 0.20   # turning attenuation (matches original)
@@ -126,7 +131,7 @@ class LabConfig:
     # ── Audio ─────────────────────────────────────────────────────────────────
     piper_model:            str   = str(Path.home() / "Revobots" / "piper" / "voices" / "en_GB-northern_english_male-medium.onnx")
     piper_speaker_id:       Optional[int] = None
-    music_dir:              str   = str(Path.home() / "Revobots" / "Audio")
+    music_dir:              str   = str(Path.home() / "Revobots" / "audio")
     music_tracks: dict      = field(default_factory=lambda: {
         1: "REVOBOTS_Anthem_v1.wav",
         2: "REVO_Track_old1.wav",
@@ -147,19 +152,25 @@ class LabConfig:
     # memory. The region appears as /dev/shm/lab_<name>. See LAB/frame_bus.py.
     cameras: list = field(default_factory=lambda: [
         # Orbital is on the network — RTSP H.264 decoded by NVDEC
-        CameraConfig(
-            name="orbital",
-    	    source="rtsp://revolabs:revolabs123%40@192.168.10.50:554/h264Preview_01_sub",
-	    width=640, height=480, fps=15, rtsp_transport="tcp",
-            hw_decode=True,
-        ),
+        # CameraConfig(
+        #     name="orbital",
+    	#     source="rtsp://revolabs:revolabs123%40@192.168.10.50:554/h264Preview_01_sub",
+	    # width=640, height=480, fps=15, rtsp_transport="tcp",
+        #     hw_decode=True,
+        # ),
         # Front AI camera is on USB — YUYV at 30fps (the only rate this cam
         # advertises at 640x480 for YUYV). VIC handles the YUY2→BGRx convert,
         # so capture stays mostly on hardware. The recorder and streamer
         # downsample to record_fps/stream_fps automatically via their tick
         # loops; the spare frames are simply overwritten in the 1-slot buffer.
         CameraConfig(
-            name="ai_front",
+            name="driver",
+    	    source="rtsp://revolabs:revolabs123%40@192.168.0.231:554/cam/realmonitor?channel=1&subtype=1",
+	    width=640, height=480, fps=15, rtsp_transport="tcp",
+            hw_decode=True,
+        ),
+        CameraConfig(
+            name="ai",
             source="/dev/video0",
             width=640, height=480, fps=30,
             pixel_format="YUYV",
@@ -167,50 +178,47 @@ class LabConfig:
             hw_decode=True,
         ),
         # Rear AI camera is on USB (fallback to /dev/videoX if you don't have the exact by-id path)
-        CameraConfig(
-            name="ai_back",
-            source="/dev/video6", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
-            width=640, height=480, fps=15,
-            hw_decode=False,
-        ),
-        CameraConfig(
-            name="floor",
-            source="/dev/video2", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
-            width=640, height=480, fps=15,
-            hw_decode=False,
-        ),
-        # Floor camera is on USB
         # CameraConfig(
-        #     name="floor",
-        #     source="/dev/floor_cam",        
+        #     name="rear",
+        #     source="/dev/video6", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
         #     width=640, height=480, fps=15,
+        #     hw_decode=False,
         # ),
     ])
 
     # The gamepad sends these camera names. Map them to our internal names above.
     # Anything not listed here is passed through unchanged.
     camera_name_aliases: dict = field(default_factory=lambda: {
-        "pilot":     "orbital",
-        "front":     "ai_front",
-        "rear":      "ai_back",
-        "ai-front":  "ai_front",
-        "ai-back":   "ai_back",
-        "aifront":   "ai_front",
-        "aiback":    "ai_back",
-    })
+    # Orbital camera
+    "pilot":    "orbital",
+    "orbital":  "orbital",
+
+    # AI camera
+    "front":    "ai",
+    "ai-front": "ai",
+    "aifront":  "ai",
+    "ai":       "ai",
+
+    # Driver camera
+    "driver":   "driver",
+
+    # Rear camera
+    "rear":     "rear",
+    "back":     "rear",
+})
 
     # ── Daily streaming ───────────────────────────────────────────────────────
-    daily_room_url:         str   = "https://revolabs.daily.co/scoutlab-pilot-cam"
-    daily_room_name:        str   = "scoutlab-pilot-cam"
+    daily_room_url:         str   = "https://revolabs.daily.co/iwu_scout_1_cam"
+    daily_room_name:        str   = "IWU_SCOUT1"
     stream_width:           int   = 640
     stream_height:          int   = 480
     stream_fps:             int   = 15
-    initial_main_source:    str   = "ai_front"   # which camera is shown on startup
+    initial_main_source:    str   = "driver"   # which camera is shown on startup
 
     # ── PiP thumbnails on the main stream ─────────────────────────────────────
     pip_enabled:            bool  = True
     pip_left_source:        str   = "orbital"     # pilot on left
-    pip_right_source:       str   = "ai_back"     # rear on right
+    pip_right_source:       str   = "rear"     # rear on right
     pip_width:              int   = 160
     pip_height:             int   = 120
     pip_margin:             int   = 10
@@ -238,7 +246,7 @@ class LabConfig:
 
     # ── Recording ─────────────────────────────────────────────────────────────
     cache_dir:              str   = os.path.expanduser("~/.cache/scout/lab")
-    record_camera_name:     str   = "ai_front"       # which camera goes into the MP4
+    record_camera_name:     str   = "ai"       # which camera goes into the MP4
     record_width:           int   = 640
     record_height:          int   = 480
     record_fps:             int   = 15            # same as stream — frame-aligned
