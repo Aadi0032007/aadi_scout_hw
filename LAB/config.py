@@ -152,12 +152,12 @@ class LabConfig:
     # memory. The region appears as /dev/shm/lab_<name>. See LAB/frame_bus.py.
     cameras: list = field(default_factory=lambda: [
         # Orbital is on the network — RTSP H.264 decoded by NVDEC
-        # CameraConfig(
-        #     name="orbital",
-    	#     source="rtsp://revolabs:revolabs123%40@192.168.10.50:554/h264Preview_01_sub",
-	    # width=640, height=480, fps=15, rtsp_transport="tcp",
-        #     hw_decode=True,
-        # ),
+        CameraConfig(
+            name="orbital",
+    	    source="rtsp://admin:revolabs123%40@192.168.10.52:554/cam/realmonitor?channel=1&subtype=1",
+	    width=640, height=480, fps=15, rtsp_transport="tcp",
+            hw_decode=True,
+        ),
         # Front AI camera is on USB — YUYV at 30fps (the only rate this cam
         # advertises at 640x480 for YUYV). VIC handles the YUY2→BGRx convert,
         # so capture stays mostly on hardware. The recorder and streamer
@@ -165,7 +165,7 @@ class LabConfig:
         # loops; the spare frames are simply overwritten in the 1-slot buffer.
         CameraConfig(
             name="driver",
-    	    source="rtsp://revolabs:revolabs123%40@192.168.0.231:554/cam/realmonitor?channel=1&subtype=1",
+    	    source="rtsp://admin:revolabs123%40@192.168.10.51:554/cam/realmonitor?channel=1&subtype=1",
 	    width=640, height=480, fps=15, rtsp_transport="udp",
             hw_decode=True,
         ),
@@ -177,13 +177,13 @@ class LabConfig:
             publish_frames=True,
             hw_decode=True,
         ),
-        # Rear AI camera is on USB (fallback to /dev/videoX if you don't have the exact by-id path)
-        # CameraConfig(
-        #     name="rear",
-        #     source="/dev/video6", # You might need to change this to video0 or video1 depending on how Ubuntu enumerates them
-        #     width=640, height=480, fps=15,
-        #     hw_decode=False,
-        # ),
+        CameraConfig(
+            name="rear",
+    	    source="rtsp://admin:revolabs123%40@192.168.10.50:554/cam/realmonitor?channel=1&subtype=1",
+	    width=640, height=480, fps=15, rtsp_transport="udp",
+            hw_decode=True,
+        ),
+        
     ])
 
     # The gamepad sends these camera names. Map them to our internal names above.
