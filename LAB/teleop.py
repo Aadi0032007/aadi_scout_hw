@@ -49,11 +49,14 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
+from LAB.audio         import AudioController
 from LAB.cameras       import MultiCameraCapture
 from LAB.common        import first_float, log, now_mono, truthy
 from LAB.config        import LabConfig
+from LAB.lights        import LightsController
 from LAB.local_gamepad import LocalGamepad
 from LAB.motion        import MotionController
+from LAB.ptz           import PtzController
 from LAB.record        import SessionRecorder
 from LAB.sensors       import GpsReader, ImuReader
 from LAB.stream        import DailyStream
@@ -394,7 +397,8 @@ def main() -> None:
     log("teleop", f"stream_fps  = {cfg.stream_fps}")
     log(
         "teleop",
-        f"ports       = motion:{cfg.udp_motion_port}",
+        f"ports       = motion:{cfg.udp_motion_port} "
+        f"events:{cfg.udp_events_port} tts:{cfg.udp_tts_port}",
     )
     log("teleop", "local_gamepad = always enabled")
     log("teleop", "=" * 60)
@@ -423,6 +427,8 @@ def main() -> None:
         ang_z_scale=cfg.ang_z_scale,
     )
     motion.start()
+
+
 
     # ── Stream factory ───────────────────────────────────────────────────────
 
@@ -491,6 +497,13 @@ def main() -> None:
         timeout_sec=cfg.source_activity_timeout_sec,
     )
 
+    prev_state = {
+        "a_pressed": False,
+        "b_pressed": False,
+        "button_8": False,
+        "speed_label": None,
+    }
+
     lock_state = {
         "locked": True,
     }
@@ -534,11 +547,18 @@ def main() -> None:
         if cam:
             session_stream_manager.switch_source(str(cam))
 
-    def on_events_packet(pkt: dict, addr, port: int) -> None:
-        return
+        a_pressed = truthy(pkt.get("a", False)) or pkt.get("button") == 1
+        b_pressed = truthy(pkt.get("b", False)) or pkt.get("button") == 2
+        button_8 = pkt.get("button") == cfg.ptz_home_button
 
-    def on_tts_packet(pkt: dict, addr, port: int) -> None:
-        return
+        ab_combo = a_pressed and b_pressed
+        prev_ab = prev_state["a_pressed"] and prev_state["b_pressed"]
+
+
+        prev_state["a_pressed"] = a_pressed
+        prev_state["b_pressed"] = b_pressed
+        prev_state["button_8"] = button_8
+
 
     # ── UDP listeners ────────────────────────────────────────────────────────
 
@@ -548,14 +568,16 @@ def main() -> None:
         "motion",
         on_motion_packet,
     )
+
     udp_motion.start()
+
 
     # ── Local gamepad always on ──────────────────────────────────────────────
 
     local = LocalGamepad(
         on_motion=on_motion_packet,
-        on_events=on_events_packet,
-        on_tts=on_tts_packet,
+        on_events=None,
+        on_tts=None,
         initial_robot_lock=True,
         priority_value=cfg.local_dongle_priority,
     )
@@ -595,6 +617,8 @@ def main() -> None:
 
     for sub_name, sub in [
         ("udp_motion", udp_motion),
+        ("udp_events", None),
+        ("udp_tts", None),
         ("local", local),
         ("motion", motion),
         # ("imu", imu),
