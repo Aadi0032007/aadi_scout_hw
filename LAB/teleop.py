@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-REVO Scout LAB — camera, motion, GPS, and recording only.
+REVO Scout LAB — camera, motion, GPS, recording, and streaming only.
 
 Kept:
     - Camera capture
     - Motion UDP command handling
     - GPS reader
     - Session recording
+    - Daily streaming
 
 Removed:
     - Audio / TTS
     - Lights / signals / talk events
     - PTZ camera control
-    - Daily stream
     - Local gamepad
     - IMU
     - Extra UDP event listeners
@@ -26,7 +26,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
@@ -38,6 +38,7 @@ from LAB.config import LabConfig
 from LAB.motion import MotionController
 from LAB.record import SessionRecorder
 from LAB.sensors import GpsReader
+from LAB.stream import DailyStream
 
 
 # ── UDP listener ──────────────────────────────────────────────────────────────
@@ -112,20 +113,31 @@ def parse_lock_state(pkt: dict, last_known_locked: bool) -> tuple[bool, bool]:
     return last_known_locked, False
 
 
-# ── Recording manager ────────────────────────────────────────────────────────
+# ── Stream + recording manager ────────────────────────────────────────────────
 
-class RecordingManager(threading.Thread):
+class SessionAndStreamManager(threading.Thread):
     """
     Stable unlock:
+        create/start DailyStream
         start a fresh recording session
 
     Stable lock:
-        stop/finalize the recording session
+        stop/finalize recording
+        stop DailyStream
+
+    DailyStream is recreated on every unlock to avoid Thread restart errors.
     """
 
-    def __init__(self, recorder: SessionRecorder, debounce_sec: float = 0.75) -> None:
-        super().__init__(daemon=True, name="recording-manager")
+    def __init__(
+        self,
+        recorder: SessionRecorder,
+        stream_factory: Callable[[], DailyStream],
+        debounce_sec: float = 0.75,
+    ) -> None:
+        super().__init__(daemon=True, name="session-stream-manager")
+
         self._recorder = recorder
+        self._stream_factory = stream_factory
         self._debounce_sec = debounce_sec
 
         self._cv = threading.Condition()
@@ -135,6 +147,10 @@ class RecordingManager(threading.Thread):
         self._applied_locked = True
         self._last_change = time.monotonic()
 
+        self._stream: Optional[DailyStream] = None
+        self._stream_running = False
+        self._pending_camera: Optional[str] = None
+
     def set_robot_lock(self, locked: bool) -> None:
         locked = bool(locked)
 
@@ -142,10 +158,34 @@ class RecordingManager(threading.Thread):
             if locked == self._desired_locked:
                 return
 
-            log("teleop", f"recording desired lock change: {self._desired_locked} -> {locked}")
+            log("teleop", f"manager desired lock change: {self._desired_locked} -> {locked}")
             self._desired_locked = locked
             self._last_change = time.monotonic()
             self._cv.notify()
+
+    def switch_source(self, source_name: str) -> None:
+        if not source_name:
+            return
+
+        with self._cv:
+            self._pending_camera = str(source_name)
+            stream = self._stream if self._stream_running else None
+
+        if stream is not None:
+            try:
+                stream.switch_source(str(source_name))
+            except Exception as exc:
+                log("teleop", f"stream camera switch error: {exc}")
+
+    def set_stream_robot_lock(self, locked: bool) -> None:
+        with self._cv:
+            stream = self._stream if self._stream_running else None
+
+        if stream is not None:
+            try:
+                stream.set_robot_lock(bool(locked))
+            except Exception:
+                pass
 
     def run(self) -> None:
         while True:
@@ -172,13 +212,36 @@ class RecordingManager(threading.Thread):
                 else:
                     self._apply_unlocked()
             except Exception as exc:
-                log("teleop", f"recording manager error: {exc}")
+                log("teleop", f"session/stream manager error: {exc}")
 
             with self._cv:
                 self._applied_locked = target_locked
 
     def _apply_unlocked(self) -> None:
-        log("teleop", "stable unlock — starting new recording session")
+        log("teleop", "stable unlock — starting stream + new recording session")
+
+        try:
+            if not self._stream_running:
+                stream = self._stream_factory()
+                stream.set_robot_lock(False)
+
+                with self._cv:
+                    pending_camera = self._pending_camera
+
+                if pending_camera:
+                    try:
+                        stream.switch_source(pending_camera)
+                    except Exception as exc:
+                        log("teleop", f"initial stream camera switch error: {exc}")
+
+                stream.start()
+
+                with self._cv:
+                    self._stream = stream
+                    self._stream_running = True
+
+        except Exception as exc:
+            log("teleop", f"stream start error: {exc}")
 
         try:
             if not self._recorder.is_active():
@@ -188,13 +251,33 @@ class RecordingManager(threading.Thread):
             log("teleop", f"recorder start error: {exc}")
 
     def _apply_locked(self) -> None:
-        log("teleop", "stable lock — stopping recording")
+        log("teleop", "stable lock — stopping recording + stream")
 
         try:
             self._recorder.set_robot_lock(True)
             self._recorder.stop()
         except Exception as exc:
             log("teleop", f"recorder stop error: {exc}")
+
+        stream_to_stop: Optional[DailyStream] = None
+
+        with self._cv:
+            if self._stream_running and self._stream is not None:
+                stream_to_stop = self._stream
+
+            self._stream = None
+            self._stream_running = False
+
+        if stream_to_stop is not None:
+            try:
+                stream_to_stop.set_robot_lock(True)
+            except Exception:
+                pass
+
+            try:
+                stream_to_stop.stop()
+            except Exception as exc:
+                log("teleop", f"stream stop error: {exc}")
 
     def stop(self) -> None:
         with self._cv:
@@ -212,6 +295,21 @@ class RecordingManager(threading.Thread):
         except Exception as exc:
             log("teleop", f"final recorder stop error: {exc}")
 
+        stream_to_stop: Optional[DailyStream] = None
+
+        with self._cv:
+            if self._stream_running and self._stream is not None:
+                stream_to_stop = self._stream
+
+            self._stream = None
+            self._stream_running = False
+
+        if stream_to_stop is not None:
+            try:
+                stream_to_stop.stop()
+            except Exception as exc:
+                log("teleop", f"final stream stop error: {exc}")
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -221,8 +319,9 @@ def main() -> None:
     log("teleop", "=" * 60)
     log("teleop", f"cache_dir  = {cfg.cache_dir}")
     log("teleop", f"record_fps = {cfg.record_fps}")
+    log("teleop", f"stream_fps = {cfg.stream_fps}")
     log("teleop", f"motion UDP = {cfg.udp_listen_ip}:{cfg.udp_motion_port}")
-    log("teleop", "enabled    = cameras, motion, GPS, recording")
+    log("teleop", "enabled    = cameras, motion, GPS, recording, streaming")
     log("teleop", "=" * 60)
 
     # ── Core subsystems ──────────────────────────────────────────────────────
@@ -241,6 +340,39 @@ def main() -> None:
     )
     motion.start()
 
+    # ── Stream factory ───────────────────────────────────────────────────────
+
+    def make_stream() -> DailyStream:
+        return DailyStream(
+            api_key=cfg.daily_api_key,
+            room_url=cfg.daily_room_url,
+            room_name=cfg.daily_room_name,
+            width=cfg.stream_width,
+            height=cfg.stream_height,
+            fps=cfg.stream_fps,
+            cameras=cameras,
+            name_aliases=cfg.camera_name_aliases,
+            initial_main_source=cfg.initial_main_source,
+            pip_enabled=cfg.pip_enabled,
+            pip_left_source=cfg.pip_left_source,
+            pip_right_source=cfg.pip_right_source,
+            pip_width=cfg.pip_width,
+            pip_height=cfg.pip_height,
+            pip_margin=cfg.pip_margin,
+            pip_gap=cfg.pip_gap,
+            pip_stale_sec=cfg.pip_stale_sec,
+            pip_show_label=cfg.pip_show_label,
+            overlay_speed_badge=cfg.overlay_speed_badge,
+            overlay_camera_name=cfg.overlay_camera_name,
+            overlay_timestamp=cfg.overlay_timestamp,
+            mic_rtsp_url=cfg.mic_rtsp_url,
+            mic_rtsp_transport=cfg.mic_rtsp_transport,
+            mic_sample_rate=cfg.mic_sample_rate,
+            mic_channels=cfg.mic_channels,
+            mic_frame_ms=cfg.mic_frame_ms,
+            motion_state_fn=motion.state,
+        )
+
     recorder = SessionRecorder(
         base_dir=cfg.cache_dir,
         camera_name=cfg.record_camera_name,
@@ -255,11 +387,12 @@ def main() -> None:
     )
     recorder.set_robot_lock(True)
 
-    recording_manager = RecordingManager(
+    session_stream_manager = SessionAndStreamManager(
         recorder=recorder,
+        stream_factory=make_stream,
         debounce_sec=0.75,
     )
-    recording_manager.start()
+    session_stream_manager.start()
 
     lock_state = {
         "locked": True,
@@ -286,9 +419,14 @@ def main() -> None:
         brake = first_float(pkt, ("brake",), default=0.0) > cfg.brake_threshold
 
         motion.command(lin, ang, locked, brake)
+        session_stream_manager.set_stream_robot_lock(locked)
 
         if lock_present:
-            recording_manager.set_robot_lock(locked)
+            session_stream_manager.set_robot_lock(locked)
+
+        cam = pkt.get("camera") or pkt.get("cam") or pkt.get("video_source")
+        if cam:
+            session_stream_manager.switch_source(str(cam))
 
     # ── UDP listener ─────────────────────────────────────────────────────────
 
@@ -311,7 +449,10 @@ def main() -> None:
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
 
-    log("teleop", "ready — stable unlock starts recording; stable lock stops recording")
+    log(
+        "teleop",
+        "ready — stable unlock starts stream+recording; stable lock stops both",
+    )
 
     try:
         while running.is_set():
@@ -324,9 +465,9 @@ def main() -> None:
     log("teleop", "shutting down…")
 
     try:
-        recording_manager.stop()
+        session_stream_manager.stop()
     except Exception as exc:
-        log("teleop", f"recording manager stop error: {exc}")
+        log("teleop", f"session/stream manager stop error: {exc}")
 
     for sub_name, sub in [
         ("udp_motion", udp_motion),
