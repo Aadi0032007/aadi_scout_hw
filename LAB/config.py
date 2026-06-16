@@ -164,7 +164,7 @@ class LabConfig:
         # downsample to record_fps/stream_fps automatically via their tick
         # loops; the spare frames are simply overwritten in the 1-slot buffer.
         CameraConfig(
-            name="driver",
+            name="rear",
     	    source="rtsp://admin:revolabs123%40@192.168.10.51:554/cam/realmonitor?channel=1&subtype=1",
 	    width=640, height=480, fps=15, rtsp_transport="udp",
             hw_decode=True,
@@ -178,7 +178,7 @@ class LabConfig:
             hw_decode=True,
         ),
         CameraConfig(
-            name="rear",
+            name="driver",
     	    source="rtsp://admin:revolabs123%40@192.168.10.50:554/cam/realmonitor?channel=1&subtype=1",
 	    width=640, height=480, fps=15, rtsp_transport="udp",
             hw_decode=True,
