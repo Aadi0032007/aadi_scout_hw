@@ -232,7 +232,7 @@ class LabConfig:
     overlay_timestamp:      bool  = False
 
     # ── Microphone (RTSP audio from orbital → Daily virtual mic) ──────────────
-    mic_rtsp_url:           str   = "rtsp://revolabs:revolabs123%40@192.168.10.50:554/h264Preview_01_sub"
+    mic_rtsp_url:           str   = None
     mic_rtsp_transport:     str   = "tcp"
     mic_sample_rate:        int   = 16000
     mic_channels:           int   = 1
