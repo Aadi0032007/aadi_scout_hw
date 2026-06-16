@@ -177,12 +177,12 @@ class LabConfig:
             publish_frames=True,
             hw_decode=True,
         ),
-        CameraConfig(
-            name="driver",
-    	    source="rtsp://admin:revolabs123%40@192.168.10.50:554/cam/realmonitor?channel=1&subtype=1",
-	    width=640, height=480, fps=15, rtsp_transport="udp",
-            hw_decode=True,
-        ),
+        # CameraConfig(
+        #     name="driver",
+    	#     source="rtsp://admin:revolabs123%40@192.168.10.50:554/cam/realmonitor?channel=1&subtype=1",
+	    # width=640, height=480, fps=15, rtsp_transport="udp",
+        #     hw_decode=True,
+        # ),
         
     ])
 
@@ -213,7 +213,7 @@ class LabConfig:
     stream_width:           int   = 640
     stream_height:          int   = 480
     stream_fps:             int   = 15
-    initial_main_source:    str   = "driver"   # which camera is shown on startup
+    initial_main_source:    str   = "ai"   # which camera is shown on startup
 
     # ── PiP thumbnails on the main stream ─────────────────────────────────────
     pip_enabled:            bool  = True
