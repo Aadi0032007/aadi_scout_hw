@@ -171,7 +171,7 @@ class LabConfig:
         # ),
         CameraConfig(
             name="ai",
-            source="/dev/video0",
+            source="/dev/video2",
             width=640, height=480, fps=30,
             pixel_format="YUYV",
             publish_frames=True,
