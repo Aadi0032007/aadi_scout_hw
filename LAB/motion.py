@@ -162,6 +162,7 @@ class MotionController:
         Pass THIS to the recorder, not state().
         """
         with self._lock:
+            print(self._last_pub_lin, self._last_pub_ang)
             return self._last_pub_lin, self._last_pub_ang
 
     # ── publisher loop ────────────────────────────────────────────────────────
