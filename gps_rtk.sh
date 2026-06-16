@@ -21,7 +21,7 @@ if ! flock -n 9; then
 fi
 
 # ── Config ───────────────────────────────────────────────────────────────────
-LAB_DIR="${LAB_DIR:-$HOME/Revobots/aditya/aadi_scout}"
+LAB_DIR="${LAB_DIR:-$HOME/Revobots/aditya/aadi_scout_hw}"
 GPS_MUX_PY="${LAB_DIR}/LAB/utils/gps_mux.py"
 PTY_PATH="${PTY_PATH:-/tmp/scoutlab_gps_pty}"
 PYTHON="${PYTHON:-/usr/bin/python3}"

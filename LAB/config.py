@@ -152,23 +152,23 @@ class LabConfig:
     # memory. The region appears as /dev/shm/lab_<name>. See LAB/frame_bus.py.
     cameras: list = field(default_factory=lambda: [
         # Orbital is on the network — RTSP H.264 decoded by NVDEC
-        CameraConfig(
-            name="orbital",
-    	    source="rtsp://admin:revolabs123%40@192.168.10.52:554/cam/realmonitor?channel=1&subtype=1",
-	    width=640, height=480, fps=15, rtsp_transport="tcp",
-            hw_decode=True,
-        ),
+        # CameraConfig(
+        #     name="orbital",
+    	#     source="rtsp://admin:revolabs123%40@192.168.10.52:554/cam/realmonitor?channel=1&subtype=1",
+	    # width=640, height=480, fps=15, rtsp_transport="tcp",
+        #     hw_decode=True,
+        # ),
         # Front AI camera is on USB — YUYV at 30fps (the only rate this cam
         # advertises at 640x480 for YUYV). VIC handles the YUY2→BGRx convert,
         # so capture stays mostly on hardware. The recorder and streamer
         # downsample to record_fps/stream_fps automatically via their tick
         # loops; the spare frames are simply overwritten in the 1-slot buffer.
-        CameraConfig(
-            name="rear",
-    	    source="rtsp://admin:revolabs123%40@192.168.10.51:554/cam/realmonitor?channel=1&subtype=1",
-	    width=640, height=480, fps=15, rtsp_transport="udp",
-            hw_decode=True,
-        ),
+        # CameraConfig(
+        #     name="rear",
+    	#     source="rtsp://admin:revolabs123%40@192.168.10.51:554/cam/realmonitor?channel=1&subtype=1",
+	    # width=640, height=480, fps=15, rtsp_transport="udp",
+        #     hw_decode=True,
+        # ),
         CameraConfig(
             name="ai",
             source="/dev/video0",

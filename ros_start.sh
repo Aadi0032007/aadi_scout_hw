@@ -5,7 +5,7 @@
 
 set -e
 
-LAB_DIR="${LAB_DIR:-$HOME/Revobots/aditya/aadi_scout/LAB}"
+LAB_DIR="${LAB_DIR:-$HOME/Revobots/aditya/aadi_scout_hw/LAB}"
 BRINGUP_PID=""
 
 # ── 0. Pre-Flight Cleanup ────────────────────────────────────────────────────
