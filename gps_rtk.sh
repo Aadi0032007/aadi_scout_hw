@@ -21,7 +21,7 @@ if ! flock -n 9; then
 fi
 
 # ── Config ───────────────────────────────────────────────────────────────────
-LAB_DIR="${LAB_DIR:-$HOME/Revobots/aditya/aadi_scout_hw}"
+LAB_DIR="${LAB_DIR:-$HOME/aditya/aadi_scout_hw}"
 GPS_MUX_PY="${LAB_DIR}/LAB/utils/gps_mux.py"
 PTY_PATH="${PTY_PATH:-/tmp/scoutlab_gps_pty}"
 PYTHON="${PYTHON:-/usr/bin/python3}"
@@ -31,7 +31,7 @@ POLARIS_UNIQUE_ID="${POLARIS_UNIQUE_ID:?POLARIS_UNIQUE_ID not set}"
 RECEIVER_SERIAL_BAUD="${RECEIVER_SERIAL_BAUD:-115200}"
 POLARIS_HOSTNAME="${POLARIS_HOSTNAME:-virtualrtk.pointonenav.com}"
 
-POLARIS_BIN="/home/elephant/Revobots/polaris/build/examples/serial_port_client"
+POLARIS_BIN="${POLARIS_BIN:-$HOME/Revobots/polaris/build/examples/serial_port_client}"
 
 MUX_PID=""
 RTK_PID=""
