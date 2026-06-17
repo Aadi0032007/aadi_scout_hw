@@ -257,6 +257,21 @@ class LabConfig:
     temphum_stale_after_sec: float = 10.0
     overlay_temphum:        bool  = True
 
+    # ── Battery (Segway BMS via Docker ROS1) ─────────────────────────────────
+    battery_enabled:        bool  = True
+    battery_container:      str   = "segway_ros1"
+    battery_topic:          str   = "/bms_fb"
+    battery_ros_setup:      str   = "/opt/ros/noetic/setup.bash"
+    battery_ws_setup:       str   = "/root/catkin_ws/devel/setup.bash"
+    battery_poll_sec:       float = 5.0
+    battery_cmd_timeout_sec: float = 3.0
+    # Overlay thresholds (% SOC). At/above `battery_yellow_pct` → green,
+    # at/above `battery_red_pct` → yellow, below → red.
+    battery_yellow_pct:     float = 50.0
+    battery_red_pct:        float = 20.0
+    battery_stale_after_sec: float = 30.0
+    overlay_battery:        bool  = True
+
     # ── Lidar (RPLIDAR S2/S2L over UART) ──────────────────────────────────────
     # Replaces util_lidar_driver.env — everything that used to live there now
     # lives here. The lidar runs in-process as a background thread (see

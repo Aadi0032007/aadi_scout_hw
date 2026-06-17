@@ -50,7 +50,7 @@ from LAB.config        import LabConfig
 from LAB.local_gamepad import LocalGamepad
 from LAB.motion        import MotionController
 from LAB.record        import SessionRecorder
-from LAB.sensors       import GpsReader, ImuReader, LidarReader, TempHumReader
+from LAB.sensors       import BatteryReader, GpsReader, ImuReader, LidarReader, TempHumReader
 from LAB.stream        import DailyStream
 
 
@@ -364,6 +364,20 @@ def main() -> None:
     else:
         temphum = None
 
+    # ── Battery (Segway BMS via Docker ROS1) ─────────────────────────────────
+    if cfg.battery_enabled:
+        battery = BatteryReader(
+            container=cfg.battery_container,
+            topic=cfg.battery_topic,
+            ros_setup=cfg.battery_ros_setup,
+            ws_setup=cfg.battery_ws_setup,
+            poll_sec=cfg.battery_poll_sec,
+            cmd_timeout=cfg.battery_cmd_timeout_sec,
+        )
+        battery.start()
+    else:
+        battery = None
+
     # ── Lidar ────────────────────────────────────────────────────────────────
     # Constructed before MotionController so we can wire its block_fn in as
     # a safety gate evaluated every publish tick (50 Hz).
@@ -486,6 +500,11 @@ def main() -> None:
             temphum_temp_yellow_f=cfg.temphum_temp_yellow_f,
             temphum_temp_red_f=cfg.temphum_temp_red_f,
             temphum_stale_after_sec=cfg.temphum_stale_after_sec,
+            battery_get_fn=(battery.get if battery is not None else None),
+            overlay_battery=cfg.overlay_battery,
+            battery_yellow_pct=cfg.battery_yellow_pct,
+            battery_red_pct=cfg.battery_red_pct,
+            battery_stale_after_sec=cfg.battery_stale_after_sec,
         )
 
     # ── Recorder ─────────────────────────────────────────────────────────────
@@ -692,6 +711,7 @@ def main() -> None:
         # ("imu",      imu),
         ("gps",        gps),
         ("temphum",    temphum),
+        ("battery",    battery),
         ("lidar",      lidar),
         ("cameras",    cameras),
     ]:

@@ -81,6 +81,11 @@ class DailyStream:
         temphum_temp_yellow_f: float = 70.0,
         temphum_temp_red_f:    float = 90.0,
         temphum_stale_after_sec: float = 10.0,
+        battery_get_fn:    Optional[Callable[[], dict]] = None,
+        overlay_battery:   bool = False,
+        battery_yellow_pct: float = 50.0,
+        battery_red_pct:    float = 20.0,
+        battery_stale_after_sec: float = 30.0,
     ) -> None:
         self._api_key      = api_key
         self._room_url     = room_url
@@ -112,6 +117,13 @@ class DailyStream:
         self._temphum_yellow_f   = float(temphum_temp_yellow_f)
         self._temphum_red_f      = float(temphum_temp_red_f)
         self._temphum_stale_sec  = float(temphum_stale_after_sec)
+
+        # Battery overlay
+        self._battery_get_fn     = battery_get_fn
+        self._show_battery       = overlay_battery and (battery_get_fn is not None)
+        self._battery_yellow_pct = float(battery_yellow_pct)
+        self._battery_red_pct    = float(battery_red_pct)
+        self._battery_stale_sec  = float(battery_stale_after_sec)
 
         # Mic
         self._mic_rtsp_url       = mic_rtsp_url
@@ -318,9 +330,13 @@ class DailyStream:
             except Exception:
                 pass
 
-        if self._show_temphum:
+        if self._show_temphum or self._show_battery:
             try:
-                self._overlay_temphum(frame, self._temphum_get_fn())
+                self._overlay_status_panel(
+                    frame,
+                    self._temphum_get_fn() if self._show_temphum else None,
+                    self._battery_get_fn() if self._show_battery else None,
+                )
             except Exception:
                 pass
 
@@ -395,51 +411,72 @@ class DailyStream:
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA,
         )
 
-    def _overlay_temphum(self, frame: np.ndarray, snap: dict) -> None:
-        """Temp + humidity in the bottom-right corner.
+    def _overlay_status_panel(
+        self,
+        frame: np.ndarray,
+        temphum: Optional[dict],
+        battery: Optional[dict],
+    ) -> None:
+        """Bottom-right status stack: temperature, humidity, battery.
 
-        Temperature color (BGR): green < yellow_f, yellow < red_f, else red.
-        Humidity color: dark blue. Stale readings render dim gray.
+        Order (top-to-bottom on screen): T, H, B. Battery sits at the very
+        bottom. Each line is colored by its own threshold logic; stale
+        readings dim to gray. Any of the three can be omitted (pass None or
+        leave the dict empty) and the remaining lines slide down to fill.
         """
-        if not snap or "temp_f" not in snap or "humidity_pct" not in snap:
+        lines: list[tuple[str, tuple[int, int, int]]] = []
+
+        # Temperature + humidity (one dict, two lines)
+        if temphum and "temp_f" in temphum and "humidity_pct" in temphum:
+            t_f   = float(temphum["temp_f"])
+            rh    = float(temphum["humidity_pct"])
+            age   = float(temphum.get("age_sec", 0.0))
+            stale = age > self._temphum_stale_sec
+            if stale:
+                t_color  = (160, 160, 160)
+                rh_color = (160, 160, 160)
+            else:
+                if   t_f <= self._temphum_yellow_f: t_color = (0, 200,   0)
+                elif t_f <= self._temphum_red_f:    t_color = (0, 255, 255)
+                else:                               t_color = (0,   0, 255)
+                rh_color = (139, 0, 0)   # dark blue (BGR)
+            lines.append((f"T:{t_f:.1f}F", t_color))
+            lines.append((f"H:{rh:.0f}%",  rh_color))
+
+        # Battery (one line) — goes at the bottom of the stack.
+        if battery and "bat_soc" in battery:
+            soc   = float(battery["bat_soc"])
+            chg   = bool(battery.get("bat_charging", False))
+            age   = float(battery.get("age_sec", 0.0))
+            stale = age > self._battery_stale_sec
+            if stale:
+                b_color = (160, 160, 160)
+            elif soc >= self._battery_yellow_pct: b_color = (0, 200,   0)
+            elif soc >= self._battery_red_pct:    b_color = (0, 255, 255)
+            else:                                 b_color = (0,   0, 255)
+            b_text = f"B:{soc:.0f}%{'+' if chg else ''}"
+            lines.append((b_text, b_color))
+
+        if not lines:
             return
-
-        t_f = float(snap["temp_f"])
-        rh  = float(snap["humidity_pct"])
-        age = float(snap.get("age_sec", 0.0))
-        stale = age > self._temphum_stale_sec
-
-        if stale:
-            t_color  = (160, 160, 160)
-            rh_color = (160, 160, 160)
-        else:
-            if   t_f <= self._temphum_yellow_f: t_color = (0, 200,   0)  # green
-            elif t_f <= self._temphum_red_f:    t_color = (0, 255, 255)  # yellow
-            else:                               t_color = (0,   0, 255)  # red
-            rh_color = (139, 0, 0)  # dark blue (BGR)
-
-        t_text  = f"T:{t_f:.1f}F"
-        rh_text = f"H:{rh:.0f}%"
 
         font  = cv2.FONT_HERSHEY_SIMPLEX
         scale = 0.65
         thick = 2
+        right_pad  = 10
+        bottom_pad = 14
+        gap        = 6
 
         H, W = frame.shape[:2]
-        (tw, th), _ = cv2.getTextSize(t_text,  font, scale, thick)
-        (hw, hh), _ = cv2.getTextSize(rh_text, font, scale, thick)
-        right_pad = 10
-        bottom_pad = 14
-        gap = 6
 
-        # Right-aligned, stacked bottom-up: humidity below temperature.
-        x_h = W - hw - right_pad
-        y_h = H - bottom_pad
-        x_t = W - tw - right_pad
-        y_t = y_h - hh - gap
-
-        cv2.putText(frame, t_text,  (x_t, y_t), font, scale, t_color,  thick, cv2.LINE_AA)
-        cv2.putText(frame, rh_text, (x_h, y_h), font, scale, rh_color, thick, cv2.LINE_AA)
+        # Measure each line, then place them bottom-up so the last entry
+        # in `lines` sits at the very bottom.
+        sizes = [cv2.getTextSize(t, font, scale, thick)[0] for t, _ in lines]
+        y = H - bottom_pad
+        for (text, color), (tw, th) in zip(reversed(lines), reversed(sizes)):
+            x = W - tw - right_pad
+            cv2.putText(frame, text, (x, y), font, scale, color, thick, cv2.LINE_AA)
+            y -= (th + gap)
 
     # ── Daily token + mic ─────────────────────────────────────────────────────
 

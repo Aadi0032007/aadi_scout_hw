@@ -25,6 +25,7 @@ import os
 import pathlib
 import re
 import struct
+import subprocess
 import threading
 import time
 from typing import Optional
@@ -534,3 +535,143 @@ class TempHumReader:
                 self._last_update = time.monotonic()
 
             self._stop.wait(timeout=self._poll_sec)
+
+
+# ═══ Battery (Segway BMS via Docker ROS1) ═════════════════════════════════════
+#
+# Polls /bms_fb inside the segway_ros1 Docker container via
+# `docker exec ... rostopic echo -n 1 /bms_fb` and parses the YAML-style
+# key/value output rostopic prints. No persistent subprocess — each poll
+# is a fresh `docker exec`, same approach as util_get_battery_charge.sh,
+# just looped and parsed instead of a one-shot print.
+#
+# Fields exposed via get():
+#   bat_soc       - state of charge, %
+#   bat_charging  - True if charging, False if discharging
+#   bat_vol       - voltage, mV
+#   bat_current   - current, mA
+#   bat_temp      - temperature, °C
+#   age_sec       - seconds since the last successful read
+
+_BMS_FIELD_RE = re.compile(
+    r"^\s*(bat_soc|bat_charging|bat_vol|bat_current|bat_temp)\s*:\s*(-?[0-9.]+)\s*$"
+)
+
+
+class BatteryReader:
+    """Reads Segway BMS state from /bms_fb inside the segway_ros1 container.
+
+    Same get()/start()/stop() pattern as ImuReader/GpsReader. Runs its own
+    polling thread; each tick shells out to `docker exec ... rostopic echo`
+    with a timeout, parses the printed fields, and updates a snapshot dict
+    under a lock.
+    """
+
+    def __init__(
+        self,
+        container:    str   = "segway_ros1",
+        topic:        str   = "/bms_fb",
+        ros_setup:    str   = "/opt/ros/noetic/setup.bash",
+        ws_setup:     str   = "/root/catkin_ws/devel/setup.bash",
+        poll_sec:     float = 2.0,
+        cmd_timeout:  float = 3.0,
+    ) -> None:
+        self._container   = container
+        self._topic       = topic
+        self._ros_setup   = ros_setup
+        self._ws_setup    = ws_setup
+        self._poll_sec    = max(0.5, float(poll_sec))
+        self._cmd_timeout = cmd_timeout
+
+        self._data: dict = {}
+        self._last_update: float = 0.0
+        self._lock   = threading.Lock()
+        self._stop   = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="battery-reader")
+
+    def start(self) -> None:
+        self._thread.start()
+        log("sensors", f"Battery reader started (container={self._container}, topic={self._topic})")
+
+    def get(self) -> dict:
+        with self._lock:
+            d = dict(self._data)
+        if self._last_update > 0:
+            d["age_sec"] = time.monotonic() - self._last_update
+        return d
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        backoff = 1.0
+        while not self._stop.is_set():
+            parsed = self._poll_once()
+
+            if parsed is None:
+                self._stop.wait(timeout=backoff)
+                backoff = min(backoff * 2, 10.0)
+                continue
+
+            backoff = 1.0
+            with self._lock:
+                self._data.update(parsed)
+                self._last_update = time.monotonic()
+
+            self._stop.wait(timeout=self._poll_sec)
+
+    def _poll_once(self) -> Optional[dict]:
+        """Run one `docker exec ... rostopic echo -n 1 /bms_fb` and parse it."""
+        cmd = [
+            "docker", "exec", "-i", self._container, "bash", "-c",
+            f"source {self._ros_setup} && source {self._ws_setup} && "
+            f"rostopic echo -n 1 {self._topic}",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self._cmd_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            log("sensors", f"Battery: rostopic echo timed out after {self._cmd_timeout}s")
+            return None
+        except Exception as exc:
+            log("sensors", f"Battery: docker exec failed: {exc}")
+            return None
+
+        if result.returncode != 0:
+            # Container stopped, topic not publishing yet, etc. Don't spam
+            # the log every poll — only at most once per backoff cycle.
+            log("sensors", f"Battery: rostopic echo failed (rc={result.returncode})")
+            return None
+
+        return self._parse(result.stdout)
+
+    def _parse(self, text: str) -> Optional[dict]:
+        upd: dict = {}
+        for line in text.splitlines():
+            m = _BMS_FIELD_RE.match(line)
+            if not m:
+                continue
+            field, raw = m.group(1), m.group(2)
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+
+            if field == "bat_charging":
+                upd["bat_charging"] = value > 0.5
+            elif field == "bat_soc":
+                upd["bat_soc"] = value
+            elif field == "bat_vol":
+                upd["bat_vol"] = value
+            elif field == "bat_current":
+                upd["bat_current"] = value
+            elif field == "bat_temp":
+                upd["bat_temp"] = value
+
+        return upd if upd else None
