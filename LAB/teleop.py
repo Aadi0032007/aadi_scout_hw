@@ -428,7 +428,39 @@ def main() -> None:
     )
     motion.start()
 
+    audio = AudioController(
+        piper_model=cfg.piper_model,
+        music_dir=cfg.music_dir,
+        music_tracks=cfg.music_tracks,
+        startup_volume_pct=cfg.startup_volume_pct,
+        preferred_sink_patterns=cfg.preferred_sink_patterns,
+        preferred_source_patterns=cfg.preferred_source_patterns,
+        piper_speaker_id=cfg.piper_speaker_id,
+    )
+    audio.start()
 
+    lights = LightsController(
+        blink_period_sec=cfg.blink_period_sec,
+        signal_timeout_sec=cfg.signal_timeout_sec,
+        talk_default_duration=cfg.talk_default_duration,
+        all_lights_cooldown_sec=cfg.all_lights_cooldown_sec,
+        all_lights_blink_sec=cfg.all_lights_blink_sec,
+    )
+    lights.start()
+
+    ptz = PtzController(
+        ip=cfg.ptz_ip,
+        port=cfg.ptz_port,
+        user=cfg.ptz_user,
+        password=cfg.ptz_password or "",
+        pan_speed=cfg.ptz_pan_speed,
+        tilt_speed=cfg.ptz_tilt_speed,
+        loop_hz=cfg.ptz_loop_hz,
+        deadband_sec=cfg.ptz_deadband_sec,
+        stop_after_sec=cfg.ptz_stop_after_sec,
+    )
+    ptz.start()
+    ptz.set_ptz_unlock_state(True)
 
     # ── Stream factory ───────────────────────────────────────────────────────
 
@@ -538,6 +570,7 @@ def main() -> None:
 
         motion.command(lin, ang, locked, brake)
 
+        lights.set_robot_lock(locked)
         session_stream_manager.set_stream_robot_lock(locked)
 
         if lock_present:
@@ -547,6 +580,16 @@ def main() -> None:
         if cam:
             session_stream_manager.switch_source(str(cam))
 
+        head = pkt.get("head")
+        if head:
+            ptz.command(str(head))
+
+        speed_label = pkt.get("speed")
+        if speed_label and speed_label != prev_state["speed_label"]:
+            if prev_state["speed_label"] is not None:
+                ptz.capture_home()
+            prev_state["speed_label"] = speed_label
+
         a_pressed = truthy(pkt.get("a", False)) or pkt.get("button") == 1
         b_pressed = truthy(pkt.get("b", False)) or pkt.get("button") == 2
         button_8 = pkt.get("button") == cfg.ptz_home_button
@@ -554,11 +597,39 @@ def main() -> None:
         ab_combo = a_pressed and b_pressed
         prev_ab = prev_state["a_pressed"] and prev_state["b_pressed"]
 
+        if ab_combo and not prev_ab:
+            ptz.capture_home()
+
+        if button_8 and not prev_state["button_8"]:
+            ptz.goto_home()
 
         prev_state["a_pressed"] = a_pressed
         prev_state["b_pressed"] = b_pressed
         prev_state["button_8"] = button_8
 
+    def on_events_packet(pkt: dict, addr, port: int) -> None:
+        event = (pkt.get("event") or "").strip().lower()
+
+        if event in ("lights", "signals", "talk"):
+            lights.command(pkt)
+
+        if event == "audio":
+            vol = pkt.get("volume_pct")
+            if vol is not None:
+                audio.set_volume(int(vol))
+
+        if event == "music":
+            action = (pkt.get("action") or "").strip().lower()
+            if action in ("play", "pla2"):
+                track = pkt.get("track")
+                if track is not None:
+                    audio.play_music(int(track))
+
+    def on_tts_packet(pkt: dict, addr, port: int) -> None:
+        if pkt.get("type") == "stt":
+            text = pkt.get("text", "")
+            if text:
+                audio.speak(str(text))
 
     # ── UDP listeners ────────────────────────────────────────────────────────
 
@@ -568,16 +639,29 @@ def main() -> None:
         "motion",
         on_motion_packet,
     )
+    udp_events = UdpListener(
+        cfg.udp_listen_ip,
+        cfg.udp_events_port,
+        "events",
+        on_events_packet,
+    )
+    udp_tts = UdpListener(
+        cfg.udp_listen_ip,
+        cfg.udp_tts_port,
+        "tts",
+        on_tts_packet,
+    )
 
     udp_motion.start()
-
+    udp_events.start()
+    udp_tts.start()
 
     # ── Local gamepad always on ──────────────────────────────────────────────
 
     local = LocalGamepad(
         on_motion=on_motion_packet,
-        on_events=None,
-        on_tts=None,
+        on_events=on_events_packet,
+        on_tts=on_tts_packet,
         initial_robot_lock=True,
         priority_value=cfg.local_dongle_priority,
     )
@@ -617,9 +701,12 @@ def main() -> None:
 
     for sub_name, sub in [
         ("udp_motion", udp_motion),
-        ("udp_events", None),
-        ("udp_tts", None),
+        ("udp_events", udp_events),
+        ("udp_tts", udp_tts),
         ("local", local),
+        ("ptz", ptz),
+        ("lights", lights),
+        ("audio", audio),
         ("motion", motion),
         # ("imu", imu),
         ("gps", gps),
