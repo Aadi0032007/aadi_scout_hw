@@ -22,6 +22,12 @@ fi
 
 # ── Config ───────────────────────────────────────────────────────────────────
 LAB_DIR="${LAB_DIR:-$HOME/aditya/aadi_scout_hw}"
+ENV_FILE="${ENV_FILE:-${LAB_DIR}/LAB/.env}"
+if [ -f "${ENV_FILE}" ]; then
+  set -a
+  source "${ENV_FILE}"
+  set +a
+fi
 GPS_MUX_PY="${LAB_DIR}/LAB/utils/gps_mux.py"
 PTY_PATH="${PTY_PATH:-/tmp/scoutlab_gps_pty}"
 PYTHON="${PYTHON:-/usr/bin/python3}"
