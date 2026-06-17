@@ -92,8 +92,7 @@ configure_serial() {
   local host_dev="$1"
   local container_dev="/dev/$(basename "$host_dev")"
 
-  log "Configuring serial: host=${host_dev} baud=${TTY_BAUD}"
-  sudo stty -F "$host_dev" "$TTY_BAUD" raw -echo
+  log "Configuring serial: ${container_dev} (inside container, runs as root — no sudo needed)"
 
   log_inline "Symlinking ${container_dev} -> /dev/rpserialport inside container..."
   docker exec -i "$CONTAINER" bash -lc "
