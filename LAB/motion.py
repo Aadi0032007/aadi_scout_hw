@@ -51,7 +51,7 @@ import json
 import socket
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from .common import log
 
@@ -64,12 +64,19 @@ class MotionController:
         publish_hz:       int   = 50,
         watchdog_sec:     float = 0.30,
         ang_z_scale:      float = 0.20,
+        lidar_block_fn:   Optional[Callable[[float], bool]] = None,
     ) -> None:
         self._docker_host   = docker_host
         self._docker_port   = docker_port
         self._publish_hz    = max(1, publish_hz)
         self._watchdog      = watchdog_sec
         self._ang_z_scale   = ang_z_scale
+        # Optional safety hook: called every publish tick with the current
+        # commanded lin_x. If it returns True, we zero output for this tick.
+        # Intended use: LidarReader.is_blocked_forward, which only fires when
+        # commanded forward AND the front bubble is tripped on a fresh scan.
+        # None disables the gate entirely.
+        self._lidar_block_fn = lidar_block_fn
 
         # State (protected by _lock)
         self._lock          = threading.Lock()
@@ -192,6 +199,19 @@ class MotionController:
 
         if not watchdog_ok or locked or braking:
             return 0.0, 0.0
+
+        # Lidar safety gate — checked outside the lock so the lidar reader's
+        # internal lock can't deadlock with ours. The fn must be cheap and
+        # non-blocking (LidarReader.is_blocked_forward just copies a dict).
+        if self._lidar_block_fn is not None:
+            try:
+                if self._lidar_block_fn(lin_x):
+                    return 0.0, 0.0
+            except Exception as exc:
+                # Don't let a misbehaving safety hook brick motion — log
+                # once-ish and fall through. (log() itself is cheap.)
+                log("motion", f"lidar_block_fn error: {exc}")
+
         return lin_x, ang_z
 
     def _send_twist(self, lin: float, ang: float) -> None:

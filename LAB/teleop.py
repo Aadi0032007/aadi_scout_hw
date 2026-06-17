@@ -50,7 +50,7 @@ from LAB.config        import LabConfig
 from LAB.local_gamepad import LocalGamepad
 from LAB.motion        import MotionController
 from LAB.record        import SessionRecorder
-from LAB.sensors       import GpsReader, ImuReader
+from LAB.sensors       import GpsReader, ImuReader, LidarReader
 from LAB.stream        import DailyStream
 
 
@@ -353,12 +353,49 @@ def main() -> None:
     gps = GpsReader(udp_host=cfg.gps_udp_host, udp_port=cfg.gps_udp_port)
     gps.start()
 
+    # ── Lidar ────────────────────────────────────────────────────────────────
+    # Constructed before MotionController so we can wire its block_fn in as
+    # a safety gate evaluated every publish tick (50 Hz).
+    if cfg.lidar_enabled:
+        lidar = LidarReader(
+            port=cfg.lidar_port,
+            symlink=cfg.lidar_symlink,
+            usb_serial=cfg.lidar_usb_serial,
+            baud=cfg.lidar_baud,
+            poll_hz=cfg.lidar_poll_hz,
+            scan_timeout_sec=cfg.lidar_scan_timeout_sec,
+            range_min=cfg.lidar_range_min_m,
+            range_max=cfg.lidar_range_max_m,
+            min_quality=cfg.lidar_min_quality,
+            front_min_deg=cfg.lidar_front_min_deg,
+            front_max_deg=cfg.lidar_front_max_deg,
+            left_min_deg=cfg.lidar_left_min_deg,
+            left_max_deg=cfg.lidar_left_max_deg,
+            right_min_deg=cfg.lidar_right_min_deg,
+            right_max_deg=cfg.lidar_right_max_deg,
+            bubble_front_m=cfg.lidar_bubble_front_m,
+            bubble_left_m=cfg.lidar_bubble_left_m,
+            bubble_right_m=cfg.lidar_bubble_right_m,
+            stale_after_sec=cfg.lidar_stale_after_sec,
+        )
+        lidar.start()
+    else:
+        lidar = None
+
+    # Block fn passed into MotionController. None disables the gate.
+    lidar_block_fn = (
+        lidar.is_blocked_forward
+        if (lidar is not None and cfg.lidar_safety_brake)
+        else None
+    )
+
     motion = MotionController(
         docker_host=cfg.docker_motion_host,
         docker_port=cfg.docker_motion_port,
         publish_hz=cfg.motion_publish_hz,
         watchdog_sec=cfg.motion_watchdog_sec,
         ang_z_scale=cfg.ang_z_scale,
+        lidar_block_fn=lidar_block_fn,
     )
     motion.start()
 
@@ -638,6 +675,7 @@ def main() -> None:
         ("motion",     motion),
         # ("imu",      imu),
         ("gps",        gps),
+        ("lidar",      lidar),
         ("cameras",    cameras),
     ]:
         if sub is None:

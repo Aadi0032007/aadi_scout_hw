@@ -33,6 +33,11 @@ try:
 except ImportError:
     _HAS_SERIAL = False
 
+# Re-export LidarReader so callers can stay symmetric with ImuReader/GpsReader.
+# The implementation lives in lidar.py because the Slamtec protocol driver is
+# substantial enough to deserve its own module.
+from .lidar import LidarReader  # noqa: E402,F401
+
 
 # ═══ IMU ══════════════════════════════════════════════════════════════════════
 

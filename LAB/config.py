@@ -244,6 +244,38 @@ class LabConfig:
     gps_udp_host:           str   = "127.0.0.1"
     gps_udp_port:           int   = 57002
 
+    # ── Lidar (RPLIDAR S2/S2L over UART) ──────────────────────────────────────
+    # Replaces util_lidar_driver.env — everything that used to live there now
+    # lives here. The lidar runs in-process as a background thread (see
+    # LAB/lidar.py), so no extra service or env file is needed.
+    lidar_enabled:          bool  = True
+    lidar_symlink:          str   = "/dev/rplidar_s2"     # udev symlink (preferred)
+    lidar_usb_serial:       str   = "4afc166e056ff011aec34b9b1045c30f"
+    lidar_port:             str   = ""                    # explicit /dev/ttyUSBn fallback
+    lidar_baud:             int   = 1_000_000
+    lidar_poll_hz:          float = 2.0
+    lidar_scan_timeout_sec: float = 3.0
+    lidar_range_min_m:      float = 0.05
+    lidar_range_max_m:      float = 18.0
+    lidar_min_quality:      int   = 0
+    # Sectors in degrees (robot forward = 0°, CCW positive)
+    lidar_front_min_deg:    float = -45.0
+    lidar_front_max_deg:    float = 45.0
+    lidar_left_min_deg:     float = 45.0
+    lidar_left_max_deg:     float = 135.0
+    lidar_right_min_deg:    float = -135.0
+    lidar_right_max_deg:    float = -45.0
+    # Minimum clearance per sector — below this triggers "blocked"
+    lidar_bubble_front_m:   float = 0.10
+    lidar_bubble_left_m:    float = 0.10
+    lidar_bubble_right_m:   float = 0.10
+    # Treat scans older than this as unusable (no-op for safety logic)
+    lidar_stale_after_sec:  float = 2.0
+    # If True, a fresh front-bubble hit forces brake=True when commanded
+    # forward (lin_x > 0). Keeps reverse/turning unaffected. Default OFF —
+    # flip to True once you've sanity-checked sector geometry on the robot.
+    lidar_safety_brake:     bool  = False
+
     # ── Recording ─────────────────────────────────────────────────────────────
     cache_dir:              str   = os.path.expanduser("~/.cache/scout/lab")
     record_camera_name:     str   = "ai"       # which camera goes into the MP4
