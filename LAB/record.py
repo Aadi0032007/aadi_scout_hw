@@ -733,11 +733,13 @@ class SessionRecorder:
         rel_t = round(now_unix - self._start_unix, 4) if self._start_unix else 0.0
 
         lin_x = ang_z = 0.0
-        locked = braking = False
 
         if self._motion_state is not None:
             try:
-                lin_x, ang_z, locked, braking = self._motion_state()
+                result = self._motion_state()
+                # support both published_state() -> (lin, ang)
+                # and state() -> (lin, ang, locked, braking)
+                lin_x, ang_z = result[0], result[1]
             except Exception:
                 pass
 
