@@ -7,7 +7,7 @@ Created on Wed Jun  3 20:04:03 2026
 from __future__ import annotations
 
 """
-GPS mux — single owner of /dev/ttyCH341USB2.
+GPS mux — single owner of /dev/um982_gps.
 
 Exposes two consumers from one physical port:
     1. PTY symlinked at /tmp/scoutlab_gps_pty  (bidirectional — Polaris talks here)
@@ -23,7 +23,7 @@ to the real receiver.
 Reconnects on USB drop. PTY symlink stays valid across reconnects.
 
 Env overrides:
-    GPS_REAL_PORT  (default /dev/ttyCH341USB2)
+    GPS_REAL_PORT  (default /dev/um982_gps)
     GPS_REAL_BAUD  (default 115200)
     GPS_PTY_PATH   (default /tmp/scoutlab_gps_pty)
     GPS_UDP_HOST   (default 127.0.0.1)
@@ -45,7 +45,7 @@ import tty
 import serial
 
 
-REAL_PORT   = os.environ.get("GPS_REAL_PORT", "/dev/ttyCH341USB2")
+REAL_PORT   = os.environ.get("GPS_REAL_PORT", "/dev/um982_gps")
 REAL_BAUD   = int(os.environ.get("GPS_REAL_BAUD", "115200"))
 PTY_SYMLINK = os.environ.get("GPS_PTY_PATH",   "/tmp/scoutlab_gps_pty")
 UDP_HOST    = os.environ.get("GPS_UDP_HOST",   "127.0.0.1")

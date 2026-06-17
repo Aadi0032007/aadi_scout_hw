@@ -2,7 +2,7 @@
 # gps_rtk.sh
 # Combined supervisor for LAB/utils/gps_mux.py + Point One RTK client.
 #
-# gps_mux owns /dev/ttyCH341USB2 and exposes:
+# gps_mux owns /dev/um982_gps and exposes:
 #   • a PTY at /tmp/scoutlab_gps_pty   → Polaris talks here
 #   • UDP   127.0.0.1:57002             → teleop GpsReader listens here
 #
@@ -22,16 +22,6 @@ fi
 
 # ── Config ───────────────────────────────────────────────────────────────────
 LAB_DIR="${LAB_DIR:-$HOME/aditya/aadi_scout_hw}"
-
-ENV_FILE="${ENV_FILE:-${LAB_DIR}/LAB/.env}"
-if [ -f "${ENV_FILE}" ]; then
-  set -a
-  source "${ENV_FILE}"
-  set +a
-else
-  echo "[gps_rtk] warning: env file not found: ${ENV_FILE}"
-fi
-
 GPS_MUX_PY="${LAB_DIR}/LAB/utils/gps_mux.py"
 PTY_PATH="${PTY_PATH:-/tmp/scoutlab_gps_pty}"
 PYTHON="${PYTHON:-/usr/bin/python3}"
