@@ -162,7 +162,6 @@ class MotionController:
         Pass THIS to the recorder, not state().
         """
         with self._lock:
-            print(self._last_pub_lin, self._last_pub_ang)
             return self._last_pub_lin, self._last_pub_ang
 
     # ── publisher loop ────────────────────────────────────────────────────────
@@ -200,6 +199,7 @@ class MotionController:
         if self._sock is None:
             return
         try:
+            print(f"sending {lin},{ang}")
             payload = json.dumps({"lin_x": lin, "ang_z": ang}).encode()
             self._sock.sendto(payload, (self._docker_host, self._docker_port))
         except Exception:
