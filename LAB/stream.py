@@ -76,6 +76,11 @@ class DailyStream:
         mic_channels:      int,
         mic_frame_ms:      int,
         motion_state_fn:   Optional[Callable[[], tuple]] = None,
+        temphum_get_fn:    Optional[Callable[[], dict]] = None,
+        overlay_temphum:   bool = False,
+        temphum_temp_yellow_f: float = 70.0,
+        temphum_temp_red_f:    float = 90.0,
+        temphum_stale_after_sec: float = 10.0,
     ) -> None:
         self._api_key      = api_key
         self._room_url     = room_url
@@ -100,6 +105,13 @@ class DailyStream:
         self._show_speed_badge  = overlay_speed_badge
         self._show_cam_name     = overlay_camera_name
         self._show_timestamp    = overlay_timestamp
+
+        # TempHum overlay
+        self._temphum_get_fn     = temphum_get_fn
+        self._show_temphum       = overlay_temphum and (temphum_get_fn is not None)
+        self._temphum_yellow_f   = float(temphum_temp_yellow_f)
+        self._temphum_red_f      = float(temphum_temp_red_f)
+        self._temphum_stale_sec  = float(temphum_stale_after_sec)
 
         # Mic
         self._mic_rtsp_url       = mic_rtsp_url
@@ -306,6 +318,12 @@ class DailyStream:
             except Exception:
                 pass
 
+        if self._show_temphum:
+            try:
+                self._overlay_temphum(frame, self._temphum_get_fn())
+            except Exception:
+                pass
+
         if self._show_timestamp:
             self._overlay_timestamp(frame)
 
@@ -376,6 +394,52 @@ class DailyStream:
             frame, ts, (10, 58),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA,
         )
+
+    def _overlay_temphum(self, frame: np.ndarray, snap: dict) -> None:
+        """Temp + humidity in the bottom-right corner.
+
+        Temperature color (BGR): green < yellow_f, yellow < red_f, else red.
+        Humidity color: dark blue. Stale readings render dim gray.
+        """
+        if not snap or "temp_f" not in snap or "humidity_pct" not in snap:
+            return
+
+        t_f = float(snap["temp_f"])
+        rh  = float(snap["humidity_pct"])
+        age = float(snap.get("age_sec", 0.0))
+        stale = age > self._temphum_stale_sec
+
+        if stale:
+            t_color  = (160, 160, 160)
+            rh_color = (160, 160, 160)
+        else:
+            if   t_f <= self._temphum_yellow_f: t_color = (0, 200,   0)  # green
+            elif t_f <= self._temphum_red_f:    t_color = (0, 255, 255)  # yellow
+            else:                               t_color = (0,   0, 255)  # red
+            rh_color = (139, 0, 0)  # dark blue (BGR)
+
+        t_text  = f"T:{t_f:.1f}F"
+        rh_text = f"H:{rh:.0f}%"
+
+        font  = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.65
+        thick = 2
+
+        H, W = frame.shape[:2]
+        (tw, th), _ = cv2.getTextSize(t_text,  font, scale, thick)
+        (hw, hh), _ = cv2.getTextSize(rh_text, font, scale, thick)
+        right_pad = 10
+        bottom_pad = 14
+        gap = 6
+
+        # Right-aligned, stacked bottom-up: humidity below temperature.
+        x_h = W - hw - right_pad
+        y_h = H - bottom_pad
+        x_t = W - tw - right_pad
+        y_t = y_h - hh - gap
+
+        cv2.putText(frame, t_text,  (x_t, y_t), font, scale, t_color,  thick, cv2.LINE_AA)
+        cv2.putText(frame, rh_text, (x_h, y_h), font, scale, rh_color, thick, cv2.LINE_AA)
 
     # ── Daily token + mic ─────────────────────────────────────────────────────
 

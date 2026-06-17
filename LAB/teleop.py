@@ -50,7 +50,7 @@ from LAB.config        import LabConfig
 from LAB.local_gamepad import LocalGamepad
 from LAB.motion        import MotionController
 from LAB.record        import SessionRecorder
-from LAB.sensors       import GpsReader, ImuReader, LidarReader
+from LAB.sensors       import GpsReader, ImuReader, LidarReader, TempHumReader
 from LAB.stream        import DailyStream
 
 
@@ -353,6 +353,17 @@ def main() -> None:
     gps = GpsReader(udp_host=cfg.gps_udp_host, udp_port=cfg.gps_udp_port)
     gps.start()
 
+    # ── TempHum (USB HID) ────────────────────────────────────────────────────
+    if cfg.temphum_enabled:
+        temphum = TempHumReader(
+            vid=cfg.temphum_vid,
+            pid=cfg.temphum_pid,
+            poll_sec=cfg.temphum_poll_sec,
+        )
+        temphum.start()
+    else:
+        temphum = None
+
     # ── Lidar ────────────────────────────────────────────────────────────────
     # Constructed before MotionController so we can wire its block_fn in as
     # a safety gate evaluated every publish tick (50 Hz).
@@ -470,6 +481,11 @@ def main() -> None:
             mic_channels=cfg.mic_channels,
             mic_frame_ms=cfg.mic_frame_ms,
             motion_state_fn=motion.state,
+            temphum_get_fn=(temphum.get if temphum is not None else None),
+            overlay_temphum=cfg.overlay_temphum,
+            temphum_temp_yellow_f=cfg.temphum_temp_yellow_f,
+            temphum_temp_red_f=cfg.temphum_temp_red_f,
+            temphum_stale_after_sec=cfg.temphum_stale_after_sec,
         )
 
     # ── Recorder ─────────────────────────────────────────────────────────────
@@ -675,6 +691,7 @@ def main() -> None:
         ("motion",     motion),
         # ("imu",      imu),
         ("gps",        gps),
+        ("temphum",    temphum),
         ("lidar",      lidar),
         ("cameras",    cameras),
     ]:

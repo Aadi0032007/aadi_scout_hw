@@ -18,7 +18,13 @@ IMU frames are 11 bytes: 0x55, frame_id, 8 payload, checksum.
 GPS sentences are standard NMEA + Unicore UM982 #ADRNAVA extensions.
 """
 
+import errno
+import glob
 import math
+import os
+import pathlib
+import re
+import struct
 import threading
 import time
 from typing import Optional
@@ -358,3 +364,173 @@ class GpsReader:
             # Only use COG for orientation if we DON'T have a True Heading yet.
             if "heading_deg_true" not in self._data:
                 self._data[key] = value
+
+# ═══ TEMPerHUM (PCsensor USB HID) ═════════════════════════════════════════════
+#
+# Reads temperature and humidity from a PCsensor TEMPerHUM (VID:PID 3553:A001
+# by default) via raw hidraw. Discovery is by VID/PID in sysfs so it survives
+# /dev/hidrawN renumbering across reboots / replugs.
+
+_THUM_QUERY = bytes([0x01, 0x80, 0x33, 0x01, 0x00, 0x00, 0x00, 0x00])
+_THUM_HID_ID_RE = re.compile(
+    r"^HID_ID=[0-9A-Fa-f]+:0*([0-9A-Fa-f]+):0*([0-9A-Fa-f]+)", re.M
+)
+
+# Plausibility bounds — anything outside means wrong interface or garbage frame.
+_THUM_TEMP_C_MIN, _THUM_TEMP_C_MAX = -40.0, 125.0
+_THUM_RH_MIN,     _THUM_RH_MAX     = 0.0, 100.0
+
+
+def _thum_candidates(vid: str, pid: str):
+    """Yield (hidraw_path, interface_number) for every hidraw matching VID:PID."""
+    want = (vid.upper(), pid.upper())
+    for hr in sorted(glob.glob("/dev/hidraw*")):
+        name = hr.rsplit("/", 1)[1]
+        sysdev = pathlib.Path(f"/sys/class/hidraw/{name}/device")
+        try:
+            uevent = (sysdev / "uevent").read_text()
+        except OSError:
+            continue
+        m = _THUM_HID_ID_RE.search(uevent)
+        if not m:
+            continue
+        if (m.group(1).upper(), m.group(2).upper()) != want:
+            continue
+        # Parent dir is the USB interface, e.g. "1-2.4.3.1:1.1" — trailing ".N"
+        # after the colon is bInterfaceNumber.
+        try:
+            iface_dir = sysdev.resolve().parent.name
+            iface_num = int(iface_dir.rsplit(".", 1)[1])
+        except (ValueError, IndexError):
+            iface_num = -1
+        yield hr, iface_num
+
+
+def _thum_try_read(dev_path: str, timeout: float = 0.3):
+    """Send query, read 8 bytes, return (temp_c, rh) or None."""
+    try:
+        fd = os.open(dev_path, os.O_RDWR | os.O_NONBLOCK)
+    except OSError as e:
+        if e.errno in (errno.EACCES, errno.EPERM):
+            raise PermissionError(f"no permission on {dev_path}") from e
+        return None
+    try:
+        try:
+            os.write(fd, _THUM_QUERY)
+        except OSError:
+            return None
+        deadline = time.monotonic() + timeout
+        buf = b""
+        while time.monotonic() < deadline and len(buf) < 8:
+            try:
+                chunk = os.read(fd, 8 - len(buf))
+                if chunk:
+                    buf += chunk
+            except BlockingIOError:
+                time.sleep(0.01)
+        if len(buf) < 8:
+            return None
+        temp_c = struct.unpack(">h", buf[2:4])[0] / 100.0
+        rh     = struct.unpack(">H", buf[4:6])[0] / 100.0
+        if not (_THUM_TEMP_C_MIN <= temp_c <= _THUM_TEMP_C_MAX): return None
+        if not (_THUM_RH_MIN     <= rh     <= _THUM_RH_MAX):     return None
+        return temp_c, rh
+    finally:
+        os.close(fd)
+
+
+class TempHumReader:
+    """
+    Reads temperature (°F) and humidity (%) from a PCsensor TEMPerHUM via hidraw.
+
+    Discovers the sensor by VID:PID at startup and re-discovers automatically
+    if the device disappears (replug). Exposes a snapshot via get() returning
+    {"temp_f": float, "humidity_pct": float, "age_sec": float} — same get()
+    pattern as ImuReader / GpsReader.
+    """
+
+    def __init__(
+        self,
+        vid: str = "3553",
+        pid: str = "A001",
+        poll_sec: float = 2.0,
+    ) -> None:
+        self._vid = vid
+        self._pid = pid
+        self._poll_sec = max(0.5, float(poll_sec))
+        self._dev_path: Optional[str] = None
+        self._data: dict = {}
+        self._last_update: float = 0.0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="temphum-reader")
+
+    def start(self) -> None:
+        self._thread.start()
+        log("sensors", f"TempHum reader started (VID:PID {self._vid}:{self._pid})")
+
+    def get(self) -> dict:
+        with self._lock:
+            d = dict(self._data)
+        if self._last_update > 0:
+            d["age_sec"] = time.monotonic() - self._last_update
+        return d
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _discover(self) -> Optional[str]:
+        """Find the sensor interface (interface 1 preferred) and validate it reads."""
+        candidates = list(_thum_candidates(self._vid, self._pid))
+        if not candidates:
+            return None
+        # Interface 1 holds the sensor on this firmware; try it first.
+        candidates.sort(key=lambda c: (c[1] != 1, c[1]))
+        for path, _iface in candidates:
+            try:
+                if _thum_try_read(path) is not None:
+                    return path
+            except PermissionError as e:
+                log("sensors", f"TempHum: {e} (add udev rule or run as root)")
+                return None
+        return None
+
+    def _run(self) -> None:
+        backoff = 1.0
+        while not self._stop.is_set():
+            if self._dev_path is None:
+                self._dev_path = self._discover()
+                if self._dev_path is None:
+                    log("sensors",
+                        f"TempHum: no device {self._vid}:{self._pid} — retrying")
+                    self._stop.wait(timeout=backoff)
+                    backoff = min(backoff * 2, 30.0)
+                    continue
+                log("sensors", f"TempHum: using {self._dev_path}")
+                backoff = 1.0
+
+            try:
+                result = _thum_try_read(self._dev_path)
+            except PermissionError:
+                self._dev_path = None
+                self._stop.wait(timeout=5.0)
+                continue
+            except OSError:
+                result = None
+
+            if result is None:
+                # Probably unplugged; force rediscovery.
+                self._dev_path = None
+                self._stop.wait(timeout=2.0)
+                continue
+
+            temp_c, rh = result
+            with self._lock:
+                self._data["temp_f"]       = temp_c * 9.0 / 5.0 + 32.0
+                self._data["temp_c"]       = temp_c
+                self._data["humidity_pct"] = rh
+                self._last_update = time.monotonic()
+
+            self._stop.wait(timeout=self._poll_sec)

@@ -244,6 +244,19 @@ class LabConfig:
     gps_udp_host:           str   = "127.0.0.1"
     gps_udp_port:           int   = 57002
 
+    # ── TEMPerHUM (PCsensor USB HID, discovered by VID:PID over hidraw) ──────
+    temphum_enabled:        bool  = True
+    temphum_vid:            str   = "3553"
+    temphum_pid:            str   = "A001"
+    temphum_poll_sec:       float = 2.0
+    # Overlay thresholds (°F). At/below `temp_yellow_f` → green, at/below
+    # `temp_red_f` → yellow, above → red. Humidity overlay is fixed dark blue.
+    temphum_temp_yellow_f:  float = 70.0
+    temphum_temp_red_f:     float = 90.0
+    # Treat readings older than this as stale (overlay dims to gray).
+    temphum_stale_after_sec: float = 10.0
+    overlay_temphum:        bool  = True
+
     # ── Lidar (RPLIDAR S2/S2L over UART) ──────────────────────────────────────
     # Replaces util_lidar_driver.env — everything that used to live there now
     # lives here. The lidar runs in-process as a background thread (see
