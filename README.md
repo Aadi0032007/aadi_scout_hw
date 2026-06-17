@@ -1,1140 +1,875 @@
-# REVO Scout LAB
+# REVO Scout LAB — Teleop, Recording, and Inference Stack
 
-A single-process Python controller that turns a Jetson-based AGV into a
-remotely operated telepresence robot. Replaces a sprawl of separate
-`systemd`/ROS services with one orchestrator that ingests gamepad input
-(local USB *or* remote UDP), drives `/cmd_vel`, controls a 4-channel light
-relay and ONVIF PTZ, plays TTS and music, streams a composed
-multi-camera view + microphone audio to a Daily.co room, and records a
-synchronised MP4 + JSONL telemetry dataset every time the robot is
-unlocked.
+A unified controller for the REVO Scout AGV (and Elephant-profile gear).
+One process (`teleop.py`) owns every host-side subsystem — cameras, motion
+forwarding, GPS, IMU, lidar, temp/hum, lights, audio, PTZ, Daily.co
+streaming, and on-the-fly MP4+JSONL recording. A second, independent
+process (`lab_inference.py`) runs the trained ACT policy and drives the
+robot through the same `MotionController` path teleop uses.
 
-Everything below is current as of the last code revision. If something on
-the physical robot doesn't match what's described here, the README is
-wrong — please update it.
+The drivetrain itself lives in a separate Docker container
+(`segway_ros1`) which runs ROS1 Noetic, the Segway SmartCar node, and a
+UDP→`/cmd_vel` keepalive bridge. Host-side code never imports ROS1 — it
+just throws JSON over a UDP socket and lets the container do the
+ROS-side work.
 
 ---
 
 ## Table of contents
 
-1. [System architecture](#system-architecture)
-2. [Repository layout](#repository-layout)
-3. [Hardware inventory](#hardware-inventory)
-4. [Prerequisites](#prerequisites)
-5. [Configuration: `config.py` vs `.env`](#configuration-configpy-vs-env)
-6. [Filesystem paths](#filesystem-paths)
-7. [Pipelines](#pipelines)
-   - [Motion](#motion-pipeline)
-   - [Cameras](#camera-pipeline)
-   - [Streaming](#streaming-pipeline)
-   - [Recording](#recording-pipeline)
-   - [Lights, signals, talk](#lights-signals-talk)
-   - [PTZ](#ptz-pipeline)
-   - [Audio (TTS / music / volume)](#audio-pipeline)
-   - [Sensors (IMU + GPS + RTK)](#sensors-pipeline)
-8. [Source arbitration & priorities](#source-arbitration--priorities)
-9. [Gamepad controls](#gamepad-controls)
-10. [Running the system](#running-the-system)
-11. [Replicating to a new robot](#replicating-to-a-new-robot)
-12. [Troubleshooting](#troubleshooting)
+1. [Top-level architecture](#top-level-architecture)
+2. [Teleoperation flow](#teleoperation-flow)
+3. [Recording flow](#recording-flow)
+4. [Inference flow](#inference-flow)
+5. [Cameras and the frame bus](#cameras-and-the-frame-bus)
+6. [Motion path (Host → Docker → SmartCar)](#motion-path)
+7. [Sensors](#sensors)
+8. [GPS + RTK (Polaris) pipeline](#gps--rtk-polaris-pipeline)
+9. [PTZ camera control](#ptz-camera-control)
+10. [Lights subsystem](#lights-subsystem)
+11. [Audio subsystem (Piper TTS + music + PulseAudio)](#audio-subsystem)
+12. [Source arbitration (local vs remote gamepad)](#source-arbitration)
+13. [Daily.co streaming + overlays](#dailyco-streaming--overlays)
+14. [systemd services / startup scripts](#systemd-services--startup-scripts)
+15. [Hardware inventory](#hardware-inventory)
+16. [Network / IP map](#network--ip-map)
+17. [UDP port map](#udp-port-map)
+18. [USB device map](#usb-device-map)
+19. [Software prerequisites](#software-prerequisites)
+20. [Re-enabling commented-out subsystems](#re-enabling-commented-out-subsystems)
 
 ---
 
-## System architecture
+## Top-level architecture
 
 ```
-                         ┌──────────────────────────────────────────┐
-                         │            Jetson (this code)            │
-                         │                                          │
-  ╔═══ Local USB ═════╗  │  ┌───────────────┐                       │
-  ║  8BitDo Ultimate  ║──┼─▶│ local_gamepad │──┐                    │
-  ╚═══════════════════╝  │  └───────────────┘  │                    │
-                         │                     ▼                    │
-                         │              ┌──────────────┐            │
-                         │              │SourceArbiter │            │
-                         │      ┌──────▶│ local prio   │            │
-                         │      │       │      <       │            │
-                         │      │  ┌───▶│ remote prio  │            │
-                         │      │  │    └──────┬───────┘            │
-                         │  UDP │  │           │                    │
-  ╔═══ Tailscale ═════╗  │ 55999│  │           ▼                    │
-  ║  Operator PC      ║──┼──────┘  │     ┌─────────┐                │
-  ║  (pygame teleop)  ║  │  UDP 57000    │ motion  │──── /cmd_vel ──┼──▶ ROS2
-  ╚═══════════════════╝──┼─────────┘     │   ptz   │──── ONVIF ─────┼──▶ camera
-                         │               │ lights  │──── USB HID ───┼──▶ relay
-                         │               │  audio  │──── PA / Piper │
-                         │               │ stream  │──── WebRTC ────┼──▶ Daily
-                         │               │ record  │──── ffmpeg ────┼──▶ ~/.cache
-                         │               └────┬────┘                │
-                         │                    ▲                     │
-                         │             ┌──────┴──────┐              │
-                         │  cameras ──▶│             │◀── sensors   │
-                         │             │  in-process │   imu, gps   │
-                         │             │  dispatch   │              │
-                         │             └─────────────┘              │
-                         └──────────────────────────────────────────┘
+                ┌─────────────────────────────────────────────────────────┐
+                │                    REMOTE OPERATOR                       │
+                │  (gamepad UI sends JSON UDP packets to robot's host)     │
+                └──────────────────────────┬──────────────────────────────┘
+                                           │ UDP :55999 :57000 :57001
+                                           ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          JETSON ORIN NX (HOST)                            │
+│                                                                           │
+│   ┌──────────────┐   ┌──────────────────────────────────────────────┐    │
+│   │ local        │   │              teleop.py                        │    │
+│   │ gamepad      │──▶│  ┌───────────┐  ┌──────────┐  ┌──────────┐   │    │
+│   │ (evdev,      │   │  │ UDP       │  │ source   │  │ session/ │   │    │
+│   │  8BitDo USB) │   │  │ listeners │─▶│ arbiter  │─▶│ stream   │   │    │
+│   └──────────────┘   │  │ x3        │  │ (lock)   │  │ manager  │   │    │
+│                      │  └─────┬─────┘  └──────────┘  └────┬─────┘   │    │
+│                      │        ▼                            │         │    │
+│                      │   ┌─────────────────────────────┐   │         │    │
+│                      │   │  MotionController            │   │         │    │
+│                      │   │  • watchdog 300 ms           │   │         │    │
+│                      │   │  • ang_z_scale 0.20          │   │         │    │
+│                      │   │  • optional lidar gate       │   │         │    │
+│                      │   └────────────┬─────────────────┘   │         │    │
+│                      │                │ UDP :56000           │         │    │
+│                      │                ▼                      ▼         │    │
+│                      │  ┌────────────────────────┐   ┌─────────────┐  │    │
+│                      │  │  Cameras (V4L2/RTSP)   │──▶│ Stream      │  │    │
+│                      │  │  • per-cam threads     │   │ (Daily.co)  │  │    │
+│                      │  │  • /dev/shm frame bus  │   └─────────────┘  │    │
+│                      │  └───────────┬────────────┘   ┌─────────────┐  │    │
+│                      │              └───────────────▶│ Recorder    │  │    │
+│                      │                               │ MP4 + JSONL │  │    │
+│                      │  ┌───────┐ ┌─────┐ ┌────────┐ └─────────────┘  │    │
+│                      │  │ Lidar │ │ IMU │ │ TempHum│                  │    │
+│                      │  └───────┘ └─────┘ └────────┘                  │    │
+│                      │  ┌───────────────────────────┐                  │    │
+│                      │  │ GpsReader  (udp :57002)   │                  │    │
+│                      │  └───────────────────────────┘                  │    │
+│                      │                                                  │    │
+│                      │  (re-enable: lights, audio, PTZ controllers)    │    │
+│                      └──────────────────────────────────────────────────┘    │
+│                                                                           │
+│   ┌────────────────────┐  ┌────────────────────────────────────────┐    │
+│   │  gps_mux.py        │  │  Docker container: segway_ros1          │    │
+│   │  /dev/um982_gps →  │  │  roscore + SmartCar node + Python       │    │
+│   │  /tmp/...pty       │  │  UDP→/cmd_vel keepalive bridge          │    │
+│   │  udp :57002        │  │  (container :55999 ← host :56000)       │    │
+│   └─────────┬──────────┘  └────────────────────────────────────────┘    │
+│             │                                                             │
+│   ┌─────────▼──────────┐                                                  │
+│   │ Polaris RTK client │                                                  │
+│   │ (Point One Nav)    │                                                  │
+│   └────────────────────┘                                                  │
+│                                                                           │
+│   ┌────────────────────┐                                                  │
+│   │ lab_inference.py   │  ← parallel process; reads cameras via the       │
+│   │ (ACT policy)       │     frame bus, drives via MotionController       │
+│   └────────────────────┘                                                  │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
-
-**One process, three UDP ports.** `teleop.py` is the foreground process.
-It binds three UDP ports and starts every subsystem as a daemon thread.
-The wire format is unchanged from the original operator script, so
-deploying this on top of an existing fleet doesn't require any operator
-side changes.
-
-| Port    | Direction | Carries                                    |
-|---------|-----------|--------------------------------------------|
-| 55999   | inbound   | motion (`lin_x`, `ang_z`), `robot_lock`, `head`, `camera`, `button`, `speed` |
-| 57000   | inbound   | events: `lights`, `signals`, `talk`, `audio`, `music` |
-| 57001   | inbound   | TTS: `{"type":"stt","text":"..."}`          |
-| 57002   | inbound   | NMEA fan-out from `gps_mux.py` (loopback only) |
-
-**One ROS2 user.** Only `motion.py` calls `rclpy`. The orchestrator runs
-`rclpy.init()` exactly once at startup and shares the global context
-with the motion node. Every other subsystem talks directly to its
-hardware. This keeps the dependency surface small and means the ROS2
-graph only contains `lab_motion` publishing `geometry_msgs/Twist` to
-`/cmd_vel`.
-
-**Subsystem startup order** (in `teleop.main()`):
-
-1. `LabConfig.load_secrets()` reads `LAB/.env`
-2. `rclpy.init()` (if available)
-3. `MultiCameraCapture` — one thread per RTSP/USB camera, 1-slot latest-frame buffer
-4. `ImuReader` — UART, background thread, in-memory latest snapshot
-5. `GpsReader` — UDP listener on 57002, fed by the `gps_mux` service
-6. `MotionController` — creates the rclpy node, publishes at 50 Hz
-7. `AudioController` — picks PulseAudio defaults, loads Piper model
-8. `LightsController` — opens the HID relay, starts blink thread
-9. `PtzController` — connects to ONVIF, starts pan/tilt loop
-10. `DailyStream` — composes frames + audio, joins the room
-11. `SessionRecorder` — constructed (does not start until robot unlocks)
-12. Three `UdpListener`s bound
-13. `LocalGamepad` started if `cfg.local_dongle_enabled`
-
-Shutdown reverses this and runs unconditionally on `SIGINT`/`SIGTERM`.
-Recording is finalised first, while cameras and sensors are still alive,
-so the closing `session.json` row reflects real values.
 
 ---
 
-## Repository layout
+## Teleoperation flow
 
 ```
-~/Revobots/aditya/aadi_scout/
-├── LAB/
-│   ├── __init__.py
-│   ├── teleop.py            ← orchestrator, foreground process
-│   ├── local_gamepad.py     ← local pygame controller (mirrors operator)
-│   ├── config.py            ← every tunable + camera list + secrets loader
-│   ├── common.py            ← log(), truthy(), first_float(), time helpers
-│   ├── motion.py            ← UDP → /cmd_vel via rclpy
-│   ├── cameras.py           ← MultiCameraCapture (RTSP + V4L2)
-│   ├── stream.py            ← Daily.co virtual cam + virtual mic
-│   ├── record.py            ← ffmpeg + JSONL session recorder
-│   ├── ptz.py               ← ONVIF pan/tilt + dead-reckoned home
-│   ├── lights.py            ← 4-channel USB HID relay
-│   ├── audio.py             ← PulseAudio + Piper TTS + music
-│   ├── sensors.py           ← IMU (WIT) + GPS (NMEA over UDP)
-│   ├── .env                 ← secrets (never committed)
-│   ├── .env.example         ← template
-│   └── utils/
-│       ├── gps_mux.py       ← single-owner GPS serial → PTY + UDP fan-out
-│       └── (other helpers)
-├── gps_rtk.sh               ← supervises gps_mux.py + Polaris RTK client
-├── ros_start.sh             ← sources ROS2, launches agv_pro_bringup, runs teleop
-└── README.md                ← this file
+ ┌─────────────────┐                              ┌─────────────────┐
+ │ Local 8BitDo    │                              │ Remote operator │
+ │ over USB dongle │                              │  (gamepad UI)   │
+ └────────┬────────┘                              └────────┬────────┘
+          │ evdev events                                   │ JSON / UDP
+          │ on_motion / on_events / on_tts                 │
+          ▼                                                ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │  teleop.py — three UDP listeners                              │
+   │  :55999 motion   :57000 events   :57001 tts                   │
+   └──────────┬───────────────┬────────────────┬──────────────────┘
+              │               │                │
+              ▼               ▼                ▼
+        on_motion_packet  on_events_packet  on_tts_packet
+              │
+              ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │ SourceArbiter — local=100 wins over remote=200                │
+   │ if quiet > 1.0 s, the other source takes over                 │
+   └──────────┬───────────────────────────────────────────────────┘
+              │
+              ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │ parse_lock_state  →  (locked, lock_present)                   │
+   │ first_float(pkt, lin_x|ang_z)                                 │
+   │ brake = first_float(pkt, "brake") > brake_threshold (0.20)    │
+   │ camera switch?  PTZ head?  A+B combo?  button 8 home?         │
+   └──────────┬───────────────────────────────────────────────────┘
+              │
+       ┌──────┼──────────────────────────────────────────────────┐
+       │      │                                                   │
+       ▼      ▼                                                   ▼
+  motion.command(lin, ang, locked, brake)        session_stream_manager
+       │                                          • debounced 750 ms
+       ▼                                          • unlock → start stream + recorder
+  publish loop @ 50 Hz                            • lock   → stop stream + recorder
+   • watchdog (300 ms)
+   • robot_lock=True → zero out
+   • brake=True     → zero out
+   • lidar_block_fn → zero out (optional)
+   • ang_z *= 0.20
+       │
+       ▼
+  UDP JSON  {"lin_x":..., "ang_z":...}  →  127.0.0.1:56000  (Docker bridge)
 ```
 
-`gps_rtk.sh` and `ros_start.sh` live at the repo root. The two systemd
-services (`aadi_gps_rtk.service`, `aadi_ros_start_teleop.service`) point
-at them.
+**Key behaviors**
+
+- The local gamepad is always on. A→B unlocks; B→A locks.
+- Source arbitration is by priority *and* recency — whoever sent a packet
+  most recently within `source_activity_timeout_sec` (1.0 s) and has the
+  lowest priority wins. Local (100) outranks remote (200).
+- Lock edges are debounced 750 ms in `SessionAndStreamManager` so a
+  bouncy lock packet doesn't thrash the stream / recorder.
+- `motion.command()` updates a state struct; the actual publish happens
+  in a background loop at `motion_publish_hz=50`. If commands stop
+  arriving, the watchdog (`motion_watchdog_sec=0.30`) zeros the output
+  automatically — the robot won't run away if the operator drops.
+
+---
+
+## Recording flow
+
+```
+ unlock edge (stable for 750 ms)
+       │
+       ▼
+ SessionRecorder.start()
+       │
+       ▼
+ ~/.cache/scout/lab/session_YYYYMMDD_HHMMSS/
+       │
+       ├── opens encoder (gst_nvenc first, libx264 fallback)
+       │
+       ├── starts rec-tick thread @ record_fps (15 Hz)
+       │     │
+       │     ├── pull latest frame from cameras["ai"]   ──┐
+       │     ├── motion.published_state()  → lin, ang  ──┤
+       │     ├── gps.get() → fix, lat, lon, heading    ──┤
+       │     │  (imu.get() commented out today)        ──┤
+       │     │                                            │
+       │     └─► write video frame  → video.mp4         ──┤
+       │         write json line    → data.jsonl ◄───────┘
+       │         { "t": ..., "frame": N,
+       │           "lin_x": ..., "ang_z": ...,
+       │           "gps": {...} }
+       │
+       ▼
+ lock edge → recorder.stop()
+       │
+       ▼
+ session.json finalised (start, end, frame count, encoder used)
+```
+
+**Notes**
+
+- The recorder takes `motion.published_state()` (post-gate, post-scale)
+  rather than `motion.state()` — what got *sent* to the robot, not what
+  the operator *requested*. This is what made the ACT training data
+  consistent with inference-time observations.
+- `record_camera_name` defaults to `"ai"` so the IL dataset is built on
+  the front USB camera, not the PTZ.
+- Two encoders are probed at startup: GStreamer `nvv4l2h264enc` (Jetson
+  hardware NVENC) is preferred; if `gst_nvenc` doesn't open, ffmpeg
+  `libx264` (CPU) takes over. NVIDIA's L4T ffmpeg does *not* ship a
+  working `h264_v4l2m2m` encoder, so the only HW path is via GStreamer.
+
+---
+
+## Inference flow
+
+```
+ lab_inference.py --policy-path .../checkpoints/080000/pretrained_model \
+                  --dataset-repo-id Aadi/scout_dataset_03 \
+                  --device cuda --send --temporal-ensemble-coeff 0.01 \
+                  --ang-deadband 0.15
+
+ ┌────────────────────────────────────────────────────────────────┐
+ │  build_policy_pipeline()                                       │
+ │   • PreTrainedConfig.from_pretrained(policy_path)             │
+ │   • LeRobotDatasetMetadata(dataset_repo_id)                   │
+ │   • make_policy, make_pre_post_processors                     │
+ │   • make_default_processors  (symmetry with training)         │
+ └────────────────────────────┬──────────────────────────────────┘
+                              │
+                              ▼
+ ┌────────────────────────────────────────────────────────────────┐
+ │  LabInference loop @ stream_fps (15 Hz)                        │
+ │                                                                 │
+ │   read frame from cameras["ai"]                                │
+ │      • prefer FrameBusReader  ──▶  /dev/shm/lab_ai             │
+ │      • fall back to direct V4L2 (only if teleop is OFF)        │
+ │                                                                 │
+ │   FrameValidator(640, 480, BGR)                                │
+ │      │                                                          │
+ │      ▼                                                          │
+ │   build_dataset_frame  →  obs dict                             │
+ │      │                                                          │
+ │      ▼                                                          │
+ │   predict_action(obs)  →  raw policy action                    │
+ │      │                                                          │
+ │      ▼                                                          │
+ │   postprocessor + temporal ensemble (coeff 0.01)               │
+ │      │                                                          │
+ │      ▼                                                          │
+ │   (lin_x, ang_z_raw)                                            │
+ │      │                                                          │
+ │      ▼                                                          │
+ │   ang_deadband filter  (|ang_z_raw| < 0.15 → 0)                │
+ │      │                                                          │
+ │      ▼                                                          │
+ │   motion.command(lin_x, ang_z_raw, locked=False, braking=False)│
+ │      │                                                          │
+ │      ▼                                                          │
+ │   MotionController publish loop                                │
+ │      • applies ang_z *= 0.20  (same as teleop)                 │
+ │      • UDP → 127.0.0.1:56000 → Docker → /cmd_vel               │
+ └────────────────────────────────────────────────────────────────┘
+```
+
+**Why the frame bus matters here**
+
+A V4L2 USB camera can be opened by exactly **one** process. Without the
+frame bus, you'd have to stop teleop to run inference, which means no
+overlay/safety/recording during evaluation. With `publish_frames=True`
+on the AI camera, teleop is the sole V4L2 owner and inference attaches
+read-only via `/dev/shm/lab_ai`. One memcpy (~100 µs per frame) for full
+parallelism.
+
+**Inference deployment caveat**
+
+Inference at ~1 Hz on CPU is unusable (policy expects 15 Hz). GPU
+deployment on the Orin NX is a hard blocker for live inference — the
+Orin NX migration with the `libcudss` symlink fix is what makes
+`--device cuda` actually work.
+
+---
+
+## Cameras and the frame bus
+
+Each camera lives in its own daemon thread with a **1-slot latest-frame
+buffer**. Readers are always non-blocking — they get the freshest frame
+or `(None, None)`. There's no queue, no backpressure, no stale frames
+ever sitting around.
+
+```
+                   ┌─────────────────────────────────────────┐
+                   │           MultiCameraCapture             │
+                   ├─────────────────────────────────────────┤
+                   │ "ai"      (V4L2 /dev/video2, YUYV, hw)  │
+                   │ "orbital" (RTSP, NVDEC, hw)             │ ← uncomment
+                   │ "rear"    (RTSP, NVDEC, hw)             │ ← uncomment
+                   │ "driver"  (RTSP, NVDEC, hw)             │ ← uncomment
+                   └────────┬──────────────────┬─────────────┘
+                            │                  │
+                ┌───────────┘                  └─────────────────┐
+                ▼                                                ▼
+        cam.read_latest()                              capture thread (per cam)
+        (None blocking)                                   │
+                                                          │  hw_decode=True
+                                                          ▼
+                                            ┌───────────────────────────┐
+                                            │ GStreamer pipeline         │
+                                            │ • RTSP H.264 → NVDEC →    │
+                                            │   nvvidconv → BGR appsink │
+                                            │ • USB YUYV → nvvidconv →  │
+                                            │   BGR appsink             │
+                                            │ • USB MJPG → nvv4l2dec    │
+                                            │   mjpeg=1 → nvvidconv     │
+                                            └────────┬──────────────────┘
+                                                     │
+                                                     │ publish_frames=True
+                                                     ▼
+                                         ┌─────────────────────────────┐
+                                         │  FrameBusPublisher           │
+                                         │  /dev/shm/lab_<name>         │
+                                         │  64-byte header + payload    │
+                                         │  seqlock (odd = writing)     │
+                                         └────────┬────────────────────┘
+                                                  │
+                                  ┌───────────────┼───────────────┐
+                                  ▼               ▼               ▼
+                          FrameBusReader   FrameBusReader   FrameBusReader
+                          (inference)      (debug viewer)   (analytics)
+```
+
+**Backoff & reconnect**: RTSP drop → exponential backoff up to 10 s,
+then reattempt. Cameras that fail to open at startup are simply absent
+from the collection — the rest of the system carries on.
+
+**Available cameras (after un-commenting in `config.py`)**
+
+| Internal name | Source                                                              | Transport | Notes                                  |
+|---------------|---------------------------------------------------------------------|-----------|----------------------------------------|
+| `ai`          | `/dev/video2` (USB)                                                 | YUYV, hw  | Frame-bus publisher. Used for recording + inference. |
+| `orbital`     | `rtsp://admin:***@192.168.10.52:554/cam/realmonitor?channel=1&subtype=1` | TCP, hw   | Pilot view (PiP left)                  |
+| `rear`        | `rtsp://admin:***@192.168.10.51:554/cam/realmonitor?channel=1&subtype=1` | UDP, hw   | Rear (PiP right)                       |
+| `driver`      | `rtsp://admin:***@192.168.10.50:554/cam/realmonitor?channel=1&subtype=1` | UDP, hw   | Driver-cam view (optional)             |
+
+**Operator name aliases**: `pilot`→`orbital`, `front`/`ai-front`/`aifront`→`ai`,
+`back`→`rear`. The gamepad UI's camera names are mapped before any internal
+lookup.
+
+---
+
+## Motion path
+
+```
+ operator / inference                     teleop.py                          Docker container
+ ─────────────────────                     ─────────                          ────────────────
+  motion.command(lin, ang,                 MotionController                    segway_ros1
+   locked, brake)        ───────────┐         │                                ┌─────────────┐
+                                    │         │   publish loop @ 50 Hz         │ roscore     │
+                                    │         │   gates: watchdog 300 ms,      │             │
+                                    │         │   locked, brake, lidar,        │ SmartCar    │
+                                    │         │   ang_z *= 0.20                │ node        │
+                                    │         │                                │             │
+                                    │         ▼                                │ revo_docker │
+                                    │   {"lin_x":..,"ang_z":..}                │ _udp_motion │
+                                    │   ─────── UDP ───────►  :56000  ────────▶│ _keepalive  │
+                                    │                                          │ .py         │
+                                    │                                          │   :55999    │
+                                    │                                          │             │
+                                    │                                          │ publishes   │
+                                    │                                          │ /cmd_vel    │
+                                    │                                          │ @ 50 Hz     │
+                                    │                                          │ HOLD_LAST_  │
+                                    │                                          │ CMD_S=0.40  │
+                                    │                                          └─────────────┘
+                                    │
+                          state() ──┘  (raw — for stream overlay only)
+                  published_state()    (post-gate — for recorder)
+```
+
+**Two snapshot APIs on `MotionController` exist for a reason:**
+
+| API                  | What it returns                | Used by               |
+|----------------------|--------------------------------|-----------------------|
+| `state()`            | Raw `(lin_x, ang_z, locked, brake)` operator intent | Stream overlay (speed badge) |
+| `published_state()`  | Post-watchdog, post-scale, post-lock `(lin, ang)` actually sent | Recorder (so IL data matches deployment-time observation) |
+
+This separation is what allowed the ACT-based imitation learning
+dataset to be consistent with inference-time control — training data
+captures *what the robot got*, not *what the operator pushed*.
+
+**Why UDP-to-Docker instead of rclpy?** The Segway SmartCar SDK is
+ROS1 Noetic; the host runs ROS2 (or no ROS at all, post-migration).
+Rather than try to bridge ROS1↔ROS2 with `ros1_bridge`, the SDK got
+boxed up into a Docker container with its own roscore. Host code stays
+ROS-free, the container handles all ROS-side concerns, and the
+interface is a stupid-simple JSON UDP socket.
+
+---
+
+## Sensors
+
+Each sensor is a daemon thread + snapshot-via-`get()`. Identical pattern
+across IMU, GPS, lidar, and temp/humidity. Nothing blocks the
+command loop.
+
+### IMU (`ImuReader`)
+- **Hardware**: WIT / JY901 over UART, typically `/dev/ttyCH341USB3` @ 9600.
+- **Protocol**: 11-byte binary frames `0x55 <id> <8 bytes payload> <chk>`.
+  Frame IDs: 0x51 accel, 0x52 gyro, 0x53 RPY, 0x54 mag, 0x59 quat.
+- **Status**: instantiation commented in `teleop.py:351`. Re-enable when
+  the IMU is physically connected.
+- Snapshot: `imu.get()` → `{accel:{x,y,z}, gyro:{...}, rpy:{...}, ...}`
+
+### GPS (`GpsReader`)
+- **Input**: UDP `:57002` (NOT serial — gps_mux is the producer).
+- **Sentences parsed**: `$GxRMC`, `$GxGGA`, `$GxGSA`, `$GxHDT`, plus
+  Unicore UM982 `#ADRNAVA` for heading.
+- **Snapshot fields**: `fix`, `fix_label`, `lat`, `lon`, `alt`, `speed_kn`,
+  `heading_true`, `sats`, `hdop`, `pdop`, `t_unix`.
+
+### Temp/Hum (`TempHumReader`)
+- **Hardware**: PCsensor TEMPerHUM, VID `3553`, PID `A001` over hidraw.
+- Polled every `temphum_poll_sec` (2 s default).
+- Snapshot: `{temp_c, temp_f, humidity, t}`.
+- Drives a color-coded overlay on the stream
+  (green ≤ 70 °F, yellow ≤ 90 °F, red above; dim-gray after 10 s stale).
+
+### Lidar (`LidarReader`)
+- **Hardware**: RPLIDAR S2 / S2L over UART, 1 Mbps, preferred symlink
+  `/dev/rplidar_s2` (else `lidar_usb_serial` → udevadm lookup → any
+  `/dev/ttyUSBn`).
+- **Sectors (deg, robot fwd = 0°, CCW positive)**:
+  front [−45, +45], left [+45, +135], right [−135, −45].
+- **Bubbles**: 10 cm front/left/right by default.
+- **Safety hook**: when `lidar_safety_brake=True`, the
+  `is_blocked_forward(lin_x)` method is wired into
+  `MotionController.lidar_block_fn`. It zeros output for one publish
+  tick when commanded forward AND the front bubble is tripped on a
+  fresh scan. Reverse and turning are untouched.
+
+---
+
+## GPS + RTK (Polaris) pipeline
+
+The UM982 receiver has one physical USB port but two consumers that
+both need full-duplex access:
+
+1. **Polaris** (Point One Nav RTK client) needs bidirectional access —
+   it reads the UM982's NMEA position so the cloud can compute the right
+   corrections, then writes RTCM back.
+2. **`GpsReader`** in teleop just needs to read the NMEA stream.
+
+`gps_mux.py` is the single owner of `/dev/um982_gps`:
+
+```
+                    ┌───────────────────────────────────────────────┐
+                    │                gps_mux.py                      │
+                    │                                                │
+   /dev/um982_gps   │   ┌─────────┐                                 │
+   (USB @ 115200) ◀─┼──▶│  serial │  NMEA  ┌──────────────┐        │
+                    │   │  port   │───────▶│ UDP fan-out  │ ───────┼──▶ 127.0.0.1:57002
+                    │   │         │        │              │        │     (GpsReader in teleop)
+                    │   │         │        └──────────────┘        │
+                    │   │         │                                 │
+                    │   │         │  NMEA  ┌──────────────┐        │
+                    │   │         │───────▶│   PTY        │        │
+                    │   │         │        │ master/slave │◀───────┼── /tmp/scoutlab_gps_pty
+                    │   │         │◀───────│              │        │   (symlink to PTY slave)
+                    │   │         │  RTCM  └──────────────┘        │           ▲
+                    │   └─────────┘                                 │           │
+                    └───────────────────────────────────────────────┘           │
+                                                                                 │
+                                                  ┌──────────────────────────┐ │
+                                                  │ Polaris serial_port_client│◀┘
+                                                  │ (Point One Nav)           │
+                                                  └──────────────────────────┘
+                                                              ▲
+                                                              │ HTTPS (POINTONE_API_KEY,
+                                                              │        POLARIS_UNIQUE_ID)
+                                                              │
+                                                       virtualrtk.pointonenav.com
+```
+
+NMEA is duplicated to both legs; RTCM only flows PTY→serial. Reconnects
+on USB drop. The PTY symlink stays valid across reconnects so Polaris
+doesn't need to be restarted.
+
+`gps_rtk.sh` is the supervisor: it launches `gps_mux.py`, waits for the
+PTY symlink, then starts Polaris with the right flags. `wait -n` blocks
+on either child; if either dies, the trap kills the other so systemd
+can restart a clean pair.
+
+---
+
+## PTZ camera control
+
+```
+ UDP "head" field (left/right/up/down/center) — every motion packet
+        │
+        ▼
+  PtzController.command(head)
+        │
+        ▼
+   loop @ ptz_loop_hz (25 Hz)
+        │
+        ├── stop_after_sec (0.15 s) reached → "center" mode
+        ├── _direction_to_velocity(desired) → (pan, tilt)
+        ├── deadband_sec (0.05 s) gate on ContinuousMove repeats
+        │
+        ▼
+   ONVIF ContinuousMove (Profile S, profile[0].token)
+        │
+        ▼
+   integrate (pan_vel × dt, tilt_vel × dt) into self._pan_pos, _tilt_pos
+                                            (dead-reckoning, ~good enough)
+
+ Independent triggers
+ ────────────────────
+ • set_ptz_unlock_state(True)  on first unlock      → capture_home()
+ • A+B combo on gamepad                              → capture_home()
+ • speed-cycle on gamepad                            → capture_home()
+ • button 8 (lights-ON) pressed                      → goto_home()
+       │
+       ▼
+   goto_home() drives back toward origin until within ptz_return_deadband
+   (0.02 rad). Once inside the deadband, snap to origin exactly.
+```
+
+PTZ motion is intentionally **independent** of the drivetrain
+`robot_lock` — the operator can still look around when the chassis is
+locked. PTZ has its own `_ptz_unlocked` flag.
+
+---
+
+## Lights subsystem
+
+USB HID 4-channel relay (VID `0x16c0`, PID `0x05df`).
+
+| Ch | Function on Elephant            |
+|----|---------------------------------|
+| 1  | Headlights                      |
+| 2  | Strobe                          |
+| 3  | Halo left + tail left           |
+| 4  | Halo right + tail right         |
+
+Three independent animation states that **don't fight each other**:
+
+1. **Steady** — headlights / strobe / halos-as-parking, always reapplied.
+2. **Turn signal** — left/right halo blink. Auto-cancels after
+   `signal_timeout_sec` (20 s). Headlights and strobe untouched.
+3. **All-blink** — used for talk events (blink for ~7 s) and the
+   all-lights-ON combo (blink 5 s, then latch all four ON).
+
+```
+ robot_lock=True ──▶ force everything off, ignore further commands
+ ─────────────────
+
+ event:"lights"   ──▶ _handle_lights_event
+   {headlights, parklights, strobe}     all three TRUE → ALL-ON combo (cooldown 5 s)
+                                        else apply individually + _apply_steady()
+
+ event:"signals" ──▶ _handle_signals_event
+   {left, right}                        sets _left_until / _right_until
+
+ event:"talk"    ──▶ _handle_talk_event
+   {duration}                           sets _all_blink_until (no latch)
+
+                          ┌──────────────────────────┐
+                          │   blink loop @ 2.5 Hz    │
+                          │   (period 0.40 s)        │
+                          │                          │
+                          │ precedence:              │
+                          │   all-blink > signal     │
+                          │              > steady    │
+                          └──────────────────────────┘
+```
+
+HID auto-reconnect on `EIO` / "no such device" / "broken pipe", logged
+at most once per second.
+
+---
+
+## Audio subsystem
+
+```
+        ┌────────────────────────────────────────────────────┐
+        │            AudioController (background)             │
+        └────┬──────────────────────┬───────────────────────┬─┘
+             │                      │                       │
+             ▼                      ▼                       ▼
+  PulseAudio sink/source     Piper TTS worker        Music subprocess
+  auto-selection             ───────────────         ──────────────
+  ────────────────           queue (size 4)          1 process at a time
+  pattern match on:          drop-on-full            kill old before new
+  • ugreen / u_green         load voice once         player preference:
+  • emeet                    synth → in-mem WAV       paplay → pw-play
+  • usb_audio                temp file → player       → ffplay → aplay
+  • alsa_output.usb-         (paplay → pw-play
+                              → aplay)
+
+ set-default-sink ▲                     ▲                          ▲
+ set-default-source│                     │                          │
+ unmute, vol=100% │      speak(text)     │       play_music(track_num)
+                  │                      │
+                  │       UDP :57001     │       UDP :57000
+                  │     {type:"stt",     │     {event:"music",
+                  │      text:"..."}     │      action:"play",
+                  │                      │      track:1}
+                  │
+                  │       UDP :57000  {event:"audio", volume_pct:75}
+                  │       set_volume()
+```
+
+Status: instantiation commented in `teleop.py:414`. Re-enable when the
+USB audio device + speaker are wired up. The dispatch in
+`on_events_packet` already guards with `if audio is not None`, so
+nothing else needs to change.
+
+Music tracks (from `config.py`):
+
+| Slot | File                          |
+|------|-------------------------------|
+| 1    | REVOBOTS_Anthem_v1.wav        |
+| 2    | REVO_Track_old1.wav           |
+| 3    | REVO_Track_old2.wav           |
+
+---
+
+## Source arbitration
+
+Local dongle and remote operator can both be active. Resolution:
+
+```
+                priority    quiet timeout (1 s)
+  local           100      ────────┐
+                                   │
+                                   ▼
+                          SourceArbiter._update_active_locked()
+                                   │
+                                   │  pick lowest priority that's been
+                                   │  active within timeout
+                                   ▼
+                              active source
+  remote          200      ────────┘
+```
+
+If the active source goes quiet for 1 s, the other takes over. If both
+are quiet, nothing wins and motion times out (watchdog → zero output).
+
+A→B unlock / B→A lock from the local gamepad is enforced *locally* —
+the LocalGamepad thread injects packets with `_local=True` so
+`on_motion_packet` tags them as `"local"`.
+
+---
+
+## Daily.co streaming + overlays
+
+```
+ ┌──────────────────────────────────────────────────────────────┐
+ │                       DailyStream                              │
+ │                                                                │
+ │   ┌──────────────────┐                                        │
+ │   │ encode loop      │ ── pull cam[main] frame                │
+ │   │ @ stream_fps 15  │ ── pull cam[pip_left]  (orbital)       │
+ │   │                  │ ── pull cam[pip_right] (rear)          │
+ │   │                  │ ── composite PiP overlays              │
+ │   │                  │ ── draw speed badge   (motion.state)   │
+ │   │                  │ ── draw camera name                    │
+ │   │                  │ ── draw temp/hum chip (temphum.get)    │
+ │   │                  │ ── BGR → RGB                           │
+ │   │                  │ ── daily.write_frame()                 │
+ │   └────────┬─────────┘                                        │
+ │            │                                                   │
+ │            ▼                                                   │
+ │     virtual camera ────────────────────────────► Daily.co room │
+ │     virtual mic   ◀── RTSP audio from orbital (16 kHz mono)   │
+ │                                                                │
+ │   robot_lock=True ──▶ stop publishing (operator sees frozen   │
+ │                       frame as visual lock confirmation)      │
+ └──────────────────────────────────────────────────────────────┘
+```
+
+PiP, speed badge, camera-name badge, and temp/hum overlay are all
+toggleable in `config.py` (`pip_enabled`, `overlay_speed_badge`,
+`overlay_camera_name`, `overlay_temphum`).
+
+---
+
+## systemd services / startup scripts
+
+Two bash scripts wrap the stack and are both intended to run under
+systemd as `Restart=always` services.
+
+### `ros_start.sh` — `aadi_ros_start_teleop.service`
+Brings up the Segway ROS1 Docker stack and then runs `teleop.py` in the
+foreground. On exit (Ctrl-C, SIGTERM from systemd, or `teleop.py`
+dying), an EXIT trap tears the stack down cleanly:
+
+```
+ Start:
+   1. wait for serial device (/dev/ttyUSB0 / ttyACM0 / rpserialport)
+   2. docker start segway_ros1   (if not running)
+   3. configure serial:
+        sudo stty -F <dev> 921600 raw -echo
+        ln -sf <dev> /dev/rpserialport   (inside container)
+   4. roscore --port 11311           (background, in container)
+   5. rosrun segwayrmp SmartCar _segwaySmartCarSerial:=<dev>   (background)
+   6. python3 revo_docker_udp_motion_keepalive.py              (background)
+   7. wait for /ros_set_chassis_enable_cmd_srv
+   8. rosservice call /ros_set_chassis_enable_cmd_srv \
+        "ros_set_chassis_enable_cmd: true"
+   9. cd $LAB_DIR && python3 teleop.py   (foreground, $TELEOP_PID)
+       wait $TELEOP_PID
+
+ Stop / trap:
+   1. SIGTERM teleop.py → wait
+   2. rosservice call ... false   (safe disable)
+   3. pkill keepalive / SmartCar / roscore
+   4. docker stop segway_ros1
+```
+
+### `gps_rtk.sh` — `aadi_gps_rtk.service`
+Supervises `gps_mux.py` + Polaris RTK client as a pair. If either dies,
+the trap kills the survivor so systemd brings up a known-good pair on
+restart. Single instance enforced via `flock` on
+`/tmp/scoutlab_gps_rtk.lock`.
+
+Required env (loaded from `LAB/.env`):
+- `POINTONE_API_KEY`
+- `POLARIS_UNIQUE_ID`
+- `POLARIS_HOSTNAME` (default `virtualrtk.pointonenav.com`)
+- `RECEIVER_SERIAL_BAUD` (default 115200)
+- `POLARIS_BIN` (default `~/Revobots/polaris/build/examples/serial_port_client`)
 
 ---
 
 ## Hardware inventory
 
-| Device | Connection | Why the code needs it |
-|---|---|---|
-| AGV chassis (agv_pro) | ROS2 + Motor UART | `motion.py` publishes `/cmd_vel`; `agv_pro_bringup` translates to motor commands |
-| WIT/JY901 IMU | UART (`/dev/ttyCH341USB3`) | `sensors.py` decodes 11-byte WIT frames |
-| Unicore UM982 GPS | UART (`/dev/ttyCH341USB2`) | `gps_mux.py` reads NMEA + `#ADRNAVA` and fans out to PTY (for Polaris RTK) and UDP (for the rest of the robot) |
-| Orbital PTZ camera | Ethernet, RTSP + ONVIF | Source of pilot video and the microphone audio stream |
-| Front + rear AI cameras | USB (V4L2) | Side cameras for navigation; one of them is the recorded camera |
-| Floor camera | USB (V4L2), symlinked at `/dev/floor_cam` | Close-up workspace cam |
-| 4-channel USB HID relay (vid 0x16c0, pid 0x05df) | USB | `lights.py` toggles channels: 1=headlights, 2=strobe, 3=halo-L, 4=halo-R |
-| USB audio (UGREEN or EMEET) | USB | `audio.py` selects this as the PulseAudio default sink/source |
-| Local 8BitDo Ultimate / Ultimate 2 controller | USB | Optional. Local pilot when on-site |
-| Operator PC | Same Tailscale network | Runs the unchanged `prod_revopilot_udp_...py` script |
+| Component                   | Interface           | Notes                                                |
+|-----------------------------|---------------------|------------------------------------------------------|
+| Jetson Orin NX (host)       | —                   | JetPack with OpenCV + GStreamer + CUDA               |
+| Segway SmartCar chassis     | UART → USB          | Inside `segway_ros1` Docker, baud 921600             |
+| RPLIDAR S2 / S2L            | UART → USB          | 1 Mbps, udev symlink `/dev/rplidar_s2`               |
+| Unicore UM982 GPS           | UART → USB          | 115200 baud, udev symlink `/dev/um982_gps`           |
+| WIT / JY901 IMU             | UART → USB          | 9600 baud, hint `/dev/ttyCH341USB3`                  |
+| PCsensor TEMPerHUM          | USB HID             | VID 3553, PID A001                                   |
+| 4-ch USB HID relay (lights) | USB HID             | VID 0x16c0, PID 0x05df                               |
+| UGREEN / EMEET USB audio    | USB                 | Selected by PulseAudio name pattern                  |
+| USB AI camera (front)       | USB / V4L2          | `/dev/video2`, YUYV 640×480@30, NVDEC via GStreamer  |
+| Hikvision orbital (pilot)   | RTSP over IP        | `192.168.10.52`, channel 1 subtype 1                 |
+| Hikvision rear              | RTSP over IP        | `192.168.10.51`, channel 1 subtype 1                 |
+| Hikvision driver            | RTSP over IP        | `192.168.10.50`, channel 1 subtype 1 (optional)      |
+| ONVIF PTZ camera            | IP                  | `192.168.10.50:8000`, user `revolabs`                |
+| 8BitDo Ultimate USB dongle  | USB HID (evdev)     | Local driving controller                             |
 
 ---
 
-## Prerequisites
+## Network / IP map
 
-### Operating system
-
-- Ubuntu 22.04 LTS (tested on Jetson L4T 35.x; should also work on x86_64 for development)
-- User account named `elephant` (or update the systemd units and `~` paths)
-
-### ROS2
-
-- ROS2 Humble installed at `/opt/ros/humble`
-- Local workspace at `~/agv_pro_ros2/` containing the `agv_pro_bringup` package
-  (`ros_start.sh` sources `install/local_setup.bash` from there)
-
-### Python packages
-
-```bash
-# Core
-pip install --break-system-packages \
-  pyserial pyaudio numpy opencv-python pygame hid \
-  onvif-zeep daily-python piper-tts
-
-# rclpy comes with ROS2 — don't pip-install it
-```
-
-### System packages
-
-```bash
-sudo apt install -y \
-  ffmpeg pulseaudio pulseaudio-utils alsa-utils \
-  libhidapi-libusb0 libhidapi-hidraw0 \
-  v4l-utils \
-  python3-dev build-essential
-```
-
-### Groups
-
-`elephant` must be in:
-
-- `dialout` — to open `/dev/ttyCH341USB*` for the IMU and GPS
-- `audio`   — to use PulseAudio
-- `plugdev` — to talk to the USB HID relay
-
-```bash
-sudo usermod -aG dialout,audio,plugdev elephant
-# log out + back in for the new groups to take effect
-```
-
-### udev rules (recommended)
-
-Create stable device paths so the code doesn't break when ports shuffle:
-
-```bash
-# /etc/udev/rules.d/99-revo-scout.rules
-KERNEL=="ttyCH341USB*", ATTRS{idVendor}=="1a86", MODE="0660", GROUP="dialout"
-SUBSYSTEM=="video4linux", ATTRS{idVendor}=="<vendor>", ATTRS{idProduct}=="<product>", SYMLINK+="floor_cam"
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="05df", MODE="0660", GROUP="plugdev"
-```
-
-After editing: `sudo udevadm control --reload-rules && sudo udevadm trigger`.
-
-### Linger (for PulseAudio at boot)
-
-`audio.py` talks to the per-user PulseAudio daemon. For the teleop
-service to find that daemon at boot — before any human logs in — enable
-linger:
-
-```bash
-sudo loginctl enable-linger elephant
-```
-
-This makes systemd start the user-bus session at boot. Without it the
-first `pactl` call after a reboot fails until you SSH in.
-
-### Piper TTS voices
-
-Download a voice model and place it where `config.py` points:
-
-```bash
-mkdir -p ~/Revobots/piper/voices
-cd ~/Revobots/piper/voices
-# example: northern English male
-wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/northern_english_male/medium/en_GB-northern_english_male-medium.onnx
-wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/northern_english_male/medium/en_GB-northern_english_male-medium.onnx.json
-```
-
-### Music tracks
-
-Place WAV files at `~/Revobots/Audio/`:
-
-```
-~/Revobots/Audio/
-├── REVOBOTS_Anthem_v1.wav      ← track 1
-├── REVO_Track_old1.wav          ← track 2
-└── REVO_Track_old2.wav          ← track 3
-```
-
-The mapping `{1: "filename.wav", ...}` lives in `LabConfig.music_tracks`.
-
-### Point One Polaris (RTK)
-
-```bash
-git clone https://github.com/PointOneNav/polaris ~/Revobots/polaris
-cd ~/Revobots/polaris && mkdir build && cd build
-cmake .. && make -j
-# The supervisor expects: ~/Revobots/polaris/build/examples/serial_port_client
-```
-
-### Daily.co room
-
-- Create a room at https://dashboard.daily.co (free tier works)
-- Note the room URL (e.g. `https://your-team.daily.co/room-name`)
-- Grab a Daily API key from the dashboard
-- Both go in `LAB/.env`
+| Host / device          | Address               | Service                                   |
+|------------------------|-----------------------|-------------------------------------------|
+| Jetson Orin NX         | (its LAN address)     | All UDP listeners, Daily streaming        |
+| PTZ camera             | `192.168.10.50:8000`  | ONVIF                                     |
+| Driver cam             | `192.168.10.50:554`   | RTSP (shares IP with PTZ, different port) |
+| Rear cam               | `192.168.10.51:554`   | RTSP                                      |
+| Orbital cam            | `192.168.10.52:554`   | RTSP                                      |
+| Point One Polaris      | `virtualrtk.pointonenav.com` | HTTPS (NTRIP-like)                  |
+| Daily.co room          | `https://revolabs.daily.co/iwu_scout_1_cam` | WebRTC                |
 
 ---
 
-## Configuration: `config.py` vs `.env`
+## UDP port map
 
-There are exactly two places where the robot is configured.
-
-### `LAB/config.py` — everything non-secret
-
-`LabConfig` is one dataclass with every tunable. Camera URLs, ports,
-audio file paths, FPS, blink periods, encoder preferences, the PTZ home
-button number — everything that defines what this robot is and how it
-behaves. **Edit this file to retune the robot.** It's not generated and
-not in `.env` because it benefits from being in version control: every
-robot's tuning history is visible in git.
-
-### `LAB/.env` — secrets only
-
-Four lines, never committed. Copy from `.env.example`:
-
-```
-DAILY_API_KEY=dk_xxxxxxxxxxxxxxxxxxxxx
-PTZ_PASSWORD=YourPtzPassword
-POINTONE_API_KEY=p1_xxxxxxxxxxxxxxxxxxxx
-POLARIS_UNIQUE_ID=robot-elephant-01
-```
-
-`LabConfig.load_secrets()` reads `DAILY_API_KEY` and `PTZ_PASSWORD` and
-splices them onto the config object. `POINTONE_API_KEY` and
-`POLARIS_UNIQUE_ID` are read by `gps_rtk.sh` directly via
-`set -a; source LAB/.env; set +a`.
+| Port  | Bound by              | Producer                                | Purpose                              |
+|-------|-----------------------|------------------------------------------|--------------------------------------|
+| 55999 | `teleop.py` UDP-motion listener | Remote operator + local gamepad | lin_x, ang_z, head, camera, button, robot_lock |
+| 57000 | `teleop.py` UDP-events listener | Operator                          | lights, signals, audio, talk, music  |
+| 57001 | `teleop.py` UDP-tts listener    | Operator                          | `{type:"stt", text:"..."}` for Piper |
+| 57002 | `GpsReader` (teleop)            | `gps_mux.py`                      | NMEA + #ADRNAVA fan-out              |
+| 56000 | (host-side, sent TO)            | `MotionController`                | Forward to Docker `:55999`           |
+| 55999 (in container) | `revo_docker_udp_motion_keepalive.py` | host `:56000` (port-mapped) | → /cmd_vel @ 50 Hz |
 
 ---
 
-## Filesystem paths
+## USB device map
 
-These are the paths the code reads from or writes to. Anything not
-listed is internal/scratch.
+| Path / udev symlink          | Device                  | Used by                            |
+|------------------------------|-------------------------|------------------------------------|
+| `/dev/video2`                | Front AI camera         | `cameras.py` (V4L2 + GStreamer)    |
+| `/dev/ttyUSB0` (or ACM0)     | Segway SmartCar UART    | Docker container (symlinked to `/dev/rpserialport`) |
+| `/dev/rplidar_s2`            | RPLIDAR S2/S2L          | `lidar.py`                         |
+| `/dev/um982_gps`             | Unicore UM982 GPS       | `gps_mux.py` (exclusive)           |
+| `/tmp/scoutlab_gps_pty`      | PTY slave (symlink)     | Polaris RTK client                 |
+| `/dev/ttyCH341USB3`          | WIT/JY901 IMU           | `sensors.py` (when re-enabled)     |
+| `/dev/hidraw*` (VID 3553)    | TEMPerHUM               | `sensors.TempHumReader`            |
+| `/dev/hidraw*` (VID 16c0)    | Lights relay            | `lights.py` (when re-enabled)      |
+| `/dev/hidraw*` (UGREEN/EMEET)| USB audio               | `audio.py` (when re-enabled)       |
+| 8BitDo evdev node            | Local driving controller | `local_gamepad.py`                |
 
-| Path | Direction | What's there |
-|------|-----------|--------------|
-| `~/.cache/scout/lab/` | write | Dataset root. One folder per recording session: `session_YYYYMMDD_HHMMSS_<rand>/` containing `video.mp4`, `data.jsonl`, `session.json` |
-| `~/Revobots/piper/voices/` | read | Piper voice `.onnx` + `.onnx.json` |
-| `~/Revobots/Audio/` | read | Music tracks (`.wav`) listed in `LabConfig.music_tracks` |
-| `~/Revobots/polaris/build/examples/serial_port_client` | read/exec | Point One RTK binary |
-| `~/Revobots/aditya/aadi_scout/LAB/.env` | read | Secrets |
-| `/tmp/scoutlab_gps_pty` | read/write (Polaris) | PTY symlink created by `gps_mux.py` so Polaris can talk RTCM corrections back to the GPS |
-| `/tmp/scoutlab_gps_rtk.lock` | write | flock guard preventing two RTK supervisors from running |
-| `/dev/ttyCH341USB2` | read/write | GPS UART (owned by `gps_mux.py`) |
-| `/dev/ttyCH341USB3` | read | IMU UART |
-| `/dev/floor_cam`, `/dev/video2`, `/dev/video8` | read | USB cameras |
-| `/dev/shm/fastrtps*` | wiped at startup | FastDDS shared memory locks (cleared by `ros_start.sh`) |
-
-### Session folder anatomy
+Recommended udev rules (excerpt — adjust serials to match your hardware):
 
 ```
-~/.cache/scout/lab/session_20260603_143012_abc/
-├── video.mp4          ← H.264, 640×480 @ 15 fps, ffmpeg-encoded
-├── data.jsonl         ← one row per recorded frame
-└── session.json       ← summary written on session close
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+    ATTRS{serial}=="UM982-SERIAL", SYMLINK+="um982_gps"
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+    ATTRS{serial}=="4afc166e056ff011aec34b9b1045c30f", SYMLINK+="rplidar_s2"
 ```
-
-`data.jsonl` rows look like:
-
-```json
-{"frame_index": 0, "t_unix": 1717420212.04, "t_mono": 18234.51,
- "lin_x": 0.0, "ang_z": 0.0, "locked": false, "braking": false,
- "imu": {"roll": -1.2, "pitch": 0.4, "yaw": 178.6, ...},
- "gps": {"gps_latitude": 51.5074, "gps_longitude": -0.1278,
-         "gps_fix": "RTK_FIXED", "gps_satellites": 18, ...}}
-```
-
-`session.json`:
-
-```json
-{"session_dir": "...",   "start_unix": 1717420212.0,
- "start_iso":   "2026-06-03T14:30:12",
- "fps": 15,              "frame_count": 4521,
- "duration_sec": 301.4,  "encoder": "libx264",
- "width": 640,           "height": 480,
- "video": "video.mp4",   "telemetry": "data.jsonl",
- "camera": "ai_front"}
-```
-
-`frame_index` in `data.jsonl` aligns 1:1 with frames in `video.mp4`, so
-you can decode frame *N* and pair it with telemetry row *N* without any
-timestamp matching.
 
 ---
 
-## Pipelines
+## Software prerequisites
 
-### Motion pipeline
+### On the host (Jetson Orin NX)
+- JetPack with CUDA 12.x and `libcudss` (the `libcudss0-cuda-12` apt
+  package plus a symlink into the linker path for PyTorch 2.6.0 wheels).
+- Python 3 with: `opencv-python` (built with GStreamer support — the
+  JetPack default has it), `pyserial`, `numpy`, `requests`, `hid`,
+  `piper-tts`, `onvif-zeep`, `daily-python`, `evdev`, `torch` (CUDA
+  build), `lerobot`.
+- GStreamer 1.0 + `nvv4l2decoder` + `nvv4l2h264enc` + `nvvidconv`
+  (`gstreamer1.0-plugins-nvvideo4linux2`, plus Python bindings
+  `python3-gi`).
+- PulseAudio (or pipewire-pulse) + `pactl` + at least one of
+  `paplay` / `pw-play` / `aplay` / `ffplay`.
+- `udevadm`, `ffmpeg`, `flock`, `pty` support, `stty`.
+- Polaris client binary at `~/Revobots/polaris/build/examples/serial_port_client`.
+- Piper voice ONNX at `~/Revobots/piper/voices/en_GB-northern_english_male-medium.onnx`.
+- Music WAVs at `~/Revobots/audio/`.
 
+### `LAB/.env` (not in git)
 ```
-UDP 55999 ─▶ on_motion_packet ─▶ SourceArbiter ─▶ MotionController.command()
-                                                          │
-                                                          ▼
-                                                  publish_loop @ 50 Hz
-                                                          │
-                                                          ▼
-                                              geometry_msgs/Twist → /cmd_vel
-```
-
-`MotionController` runs its own publisher loop at 50 Hz and applies
-three gates before publishing:
-
-1. **Watchdog** — if no `command()` arrived within `motion_watchdog_sec`
-   (300 ms), publish zero. Survives operator-side hangs and packet loss.
-2. **Robot lock** — `robot_lock=true` forces zero output.
-3. **Brake** — `brake > brake_threshold` forces zero output. (The
-   operator script signals "brake" by pressing both cruise buttons at
-   once.)
-
-`ang_z` is multiplied by `ang_z_scale` (default 0.20) so turning feels
-proportional to forward speed instead of pivoting the chassis. On
-shutdown three zeros are published 20 ms apart for safety.
-
-### Camera pipeline
-
-```
-RTSP / V4L2 source ─▶ CameraCapture thread ─▶ 1-slot latest-frame buffer
-                                                       │
-                                                       ▼
-                                  read_latest()  →  stream + record consumers
+DAILY_API_KEY=...
+PTZ_PASSWORD=...
+POINTONE_API_KEY=...
+POLARIS_UNIQUE_ID=...
 ```
 
-Each `CameraCapture` is one daemon thread. It reads as fast as the
-source produces frames, but only keeps the *latest* in memory — older
-frames are silently overwritten. Consumers (stream compositor,
-recorder) call `read_latest()` which is non-blocking and always returns
-immediately. This means producers and consumers run at independent
-rates and slow consumers never block fast producers.
-
-RTSP sources get FFmpeg low-latency options applied transiently via the
-`OPENCV_FFMPEG_CAPTURE_OPTIONS` environment variable. USB sources use
-the V4L2 backend with `CAP_PROP_BUFFERSIZE=1` to avoid kernel-side
-frame queuing.
-
-Reconnect is automatic with exponential backoff (1 s → 10 s capped).
-Cameras that fail their initial probe-open are simply absent from the
-collection — the orchestrator continues with whatever opened.
-
-### Streaming pipeline
-
-```
-cameras ──┬─▶ pick main ──┐
-          ├─▶ pick PiP-L ─┤
-          └─▶ pick PiP-R ─┤
-                          ▼
-                  compose 640×480 BGR frame
-                          │
-                  draw badges (speed/cam/timestamp)
-                          │
-                  BGR → RGB conversion
-                          │
-                  Daily virtual cam @ 15 fps
-                          ▼
-                   Daily.co room
-
-orbital RTSP audio ─▶ ffmpeg s16le 16k mono ─▶ Daily virtual mic
-```
-
-The main view is the camera selected via the operator's gamepad
-(`camera` field in the motion packet). Two PiP thumbnails sit in the
-upper corners — by default left = orbital (pilot), right = ai_back
-(rear). Camera name and current speed level are rendered as small
-badges at the bottom.
-
-Audio comes from the **orbital camera's RTSP stream**, not from a local
-microphone. `ffmpeg` decodes the AAC track to 16 kHz mono s16le and
-pipes it into `Daily.write_frames()`. This means the operator hears
-what's around the robot's head, not what's around the Jetson.
-
-When `robot_lock=True`, the stream freezes on the last video frame and
-drains-but-drops audio. Locking is a hard visual indicator that the
-robot is not responsive.
-
-### Recording pipeline
-
-```
-robot_lock False→True edge   ───▶  recorder.start()
-                                       │
-                                       ▼
-                            mkdir session_<timestamp>
-                                       │
-                            probe encoders, start ffmpeg
-                                       │
-                            open data.jsonl
-                                       │
-                                       ▼
-                               tick_loop @ record_fps
-                                       │
-                            ┌──────────┴──────────┐
-                            ▼                     ▼
-                       frame to ffmpeg     JSONL row with
-                                          motion + imu + gps
-
-robot_lock True→False edge   ───▶  recorder.stop()
-   OR SIGINT/SIGTERM                     │
-                                         ▼
-                          close ffmpeg stdin (finalises MP4)
-                                         │
-                                  close data.jsonl
-                                         │
-                                  write session.json
-                                         │
-                                  reset state, ready for next session
-```
-
-**Encoder probing**: `record.py` walks `cfg.record_encoder_preference`
-in order and uses the first one that successfully starts. The default
-list in `config.py` is `["libx264"]`. On Jetson with NVENC available
-you can prepend `"h264_nvenc"` or `"h264_v4l2m2m"` to offload encoding
-from the CPU.
-
-**Frame-index alignment**: each frame Index *N* written to ffmpeg gets
-exactly one row in `data.jsonl` with `"frame_index": N`. There is no
-timestamp matching at analysis time — frame N in the MP4 is row N in
-the JSONL, full stop.
-
-**Auto-start on unlock**: recording is gated entirely by `robot_lock`.
-There's no UI toggle, no keyboard shortcut. Unlock the robot, recording
-starts. Lock it, recording stops and `session.json` is written. Ctrl-C
-also stops cleanly because the recorder's `stop()` runs in the shutdown
-finally-block before cameras die.
-
-### Lights, signals, talk
-
-The 4-channel USB HID relay sees three independent animations that
-coexist without fighting each other:
-
-- **Steady state** — headlights, strobe, halos-as-parking-lights are
-  independent on/off flags set by `event:"lights"` packets.
-- **Turn signal** — `event:"signals"` with `left:true` or `right:true`
-  blinks one halo for `signal_timeout_sec` (20 s default) without
-  touching headlights or strobe.
-- **All-blink** — `event:"talk"` blinks all four channels together for
-  a configurable duration. The "all lights on" combo (`headlights:true,
-  parklights:true, strobe:true`) blinks for 5 s then latches everything
-  on.
-
-Precedence inside the blink thread is: all-blink > turn signal >
-steady. One thread, one tick — there's no race between animations.
-
-`robot_lock=True` forces every channel off and locks out further
-commands. HID auto-reconnects on USB transients.
-
-### PTZ pipeline
-
-ONVIF `ContinuousMove` with dead-reckoned position. The `head` field
-in motion packets drives pan/tilt:
-
-| `head` value | Action |
-|---|---|
-| `"left"` | pan negative at `pan_speed` |
-| `"right"` | pan positive at `pan_speed` |
-| `"up"` | tilt positive at `tilt_speed` |
-| `"down"` | tilt negative at `tilt_speed` |
-| `"center"` | stop |
-
-Position is integrated as `velocity * dt` each tick. That's accurate
-enough for "look around then return roughly to where I started", not
-for precision pointing.
-
-**Home capture triggers**:
-
-- First unlock — first time the robot transitions to unlocked
-- Speed-level cycle (A→B while already unlocked)
-- A+B button combo
-- Explicit `ptz.capture_home()` call
-
-**Home return**: button 8 (lights-on button on the gamepad) calls
-`ptz.goto_home()` which drives back toward stored origin until inside
-the deadband.
-
-**Important**: PTZ has its own independent lock state. The drivetrain
-`robot_lock` does **not** stop the PTZ, so the operator can still look
-around while the robot is locked. This is intentional — you often want
-to assess surroundings before unlocking.
-
-### Audio pipeline
-
-Three independent capabilities sharing one `AudioController`.
-
-**PulseAudio setup at startup**:
-
-1. List sinks/sources via `pactl list short`
-2. Find first whose name contains any of `cfg.preferred_sink_patterns`
-   (`ugreen`, `u_green`, `emeet`, `alsa_output.usb-`, …)
-3. Set it as default, unmute it, set volume to `cfg.startup_volume_pct`
-4. Same for the source (microphone)
-
-**Piper TTS**:
-
-- Voice model loaded once at startup (~250 MB RAM, ~2 s)
-- `speak(text)` queues to a 4-slot bounded queue (drops on overflow)
-- Background worker synthesises to in-memory WAV, writes to temp file,
-  plays via the first available of `paplay` / `pw-play` / `aplay`
-
-**Music**:
-
-- `play_music(track_num)` looks up `cfg.music_tracks[track_num]`,
-  replaces any currently playing track, plays via the same player
-  preference chain
-- `stop_music()` terminates the player subprocess
-
-**Volume**:
-
-- `set_volume(pct)` accepts 0–150 (PulseAudio supports up to 150% via
-  software boost) and applies to `@DEFAULT_SINK@`
-
-All audio work happens on background threads — the UDP dispatcher
-never blocks waiting for synthesis or playback.
-
-### Sensors pipeline
-
-**IMU** (`ImuReader`):
-
-- Reads `/dev/ttyCH341USB3` at 9600 baud
-- WIT protocol: 11-byte frames `[0x55, frame_id, 8 bytes payload, checksum]`
-- Decodes frame IDs 0x51 (accel), 0x52 (gyro), 0x53 (RPY), 0x54 (mag),
-  0x59 (quaternion)
-- Background thread, in-memory dict, `get()` returns latest snapshot
-
-**GPS** (`GpsReader` + `gps_mux.py`):
-
-```
-/dev/ttyCH341USB2  (115200 baud)
-       │
-       ▼
-   gps_mux.py  (single owner)
-       ├──▶  /tmp/scoutlab_gps_pty  (Polaris reads/writes here)
-       │            │
-       │            ▼
-       │    Polaris RTK client  ──▶  RTCM corrections back to GPS
-       │
-       └──▶  UDP 127.0.0.1:57002  (NMEA fan-out)
-                    │
-                    ▼
-              GpsReader (in teleop process)
-                    │
-                    ▼
-              recorder + stream + telemetry
-```
-
-`gps_mux.py` owns the serial port and gives two consumers a view of it.
-This solves a real problem: only one process can hold the GPS UART, but
-both Polaris (for RTK corrections) and teleop (for position) need it.
-The mux is the single owner; everyone else gets a derivative.
-
-Fix labels (`gps_fix`): `NO_FIX`, `GPS_FIX`, `DGPS_FIX`, `RTK_FIXED`,
-`RTK_FLOAT`, `ESTIMATED`. `RTK_FIXED` is the gold standard — sub-cm
-position with RTK corrections successfully applied.
+### Docker (segway_ros1 container)
+- ROS1 Noetic
+- `segwayrmp` SmartCar package built into `/root/catkin_ws`
+- Python 3 venv at `/root/catkin_ws/venv` with `rospy`
+- `revo_docker_udp_motion_keepalive.py` at `/root/catkin_ws/`
+- Must be started with `-p 56000:55999/udp` to receive host forwards
+- Must have access to the chassis serial device (`--device` or
+  `-v /dev/ttyUSB0:/dev/ttyUSB0`).
 
 ---
 
-## Source arbitration & priorities
-
-Two command sources can be active simultaneously: the local USB
-gamepad and the remote operator over UDP.
-
-| Source | Priority value | Active when |
-|---|---|---|
-| Local (USB gamepad on Jetson) | **100** (lower = wins) | Sending motion packets within the last `source_activity_timeout_sec` (1.0 s default) |
-| Remote (UDP from operator PC) | **200** | Sending motion packets within the timeout |
-
-When both are active, **local wins** — the on-site operator overrides
-the remote one. If the local pilot puts the controller down for >1 s,
-the remote takes over automatically. No mode switch, no UI gesture.
-
-**Important: only motion packets are arbitrated.** Light, signal, talk,
-audio, music and TTS events fire from both sources unconditionally. So
-if you press the local lights button while the remote operator presses
-their lights button, both events arrive at `LightsController` — but
-since lights commands are idempotent, no harm done.
-
----
-
-## Gamepad controls
-
-These mappings apply to **both** the local USB controller and the
-remote operator PC. They're literally the same code — `local_gamepad.py`
-imports the same mapping tables that the operator script uses.
-
-### Sticks & axes
-
-| Control | 8BitDo Ultimate (PC) | 8BitDo Ultimate 2 | Action |
-|---|---|---|---|
-| Steering wheel | axis 0 | axis 0 | `ang_z` (turning) |
-| Indicator axis | axis 4 | axis 3 | Edge-trigger: ≤-30000 = left signal, ≥+30000 = right signal |
-| Sound axis | axis 3 | axis 4 | Edge-trigger: see below |
-| Head pan (L/R) | axis 6 | axis 6 | PTZ left/right |
-| Head tilt (U/D) | axis 7 | axis 7 | PTZ up/down |
-| Lift positive | axis 4 | axis 5 | Lift up |
-| Lift negative | axis 5 | axis 2 | Lift down |
-
-### Buttons
-
-| Action | 8BitDo Ultimate (PC) | 8BitDo Ultimate 2 |
-|---|---|---|
-| A | button 0 | button 0 |
-| B | button 1 | button 1 |
-| X | button 3 | button 2 |
-| Y | button 4 | button 3 |
-| Cruise up | button 7 | button 5 |
-| Cruise down | button 6 | button 4 |
-| Lights ON | button 11 | button 7 |
-| Lights OFF | button 10 | button 6 |
-
-The mapping table includes a third profile,
-`8bitdo_ultimate2_wireless_windows`, used when running the operator
-script on Windows. The Jetson never hits this branch.
-
-### Lock / unlock / speed sequences
-
-Multi-press sequences are detected within a 2-second window.
-
-| Sequence | Effect |
-|---|---|
-| **A → B** (while locked) | Unlock robot, set max speed = 1.0 m/s (slow). Captures PTZ home. |
-| **A → B** (while unlocked) | Cycle speed level: slow (1.0) → medium (2.0) → fast (3.0) → slow. Re-captures PTZ home. |
-| **B → A** | Lock robot. All motion goes to zero. Lights stay as they are. |
-
-The "captures PTZ home" part means the orbital camera's current
-pan/tilt position is stored — pressing the lights-ON button later
-returns to that pose.
-
-### Per-button actions
-
-| Button | Edge action |
-|---|---|
-| **Lights ON** | Send `{event:"lights", headlights:true, parklights:true, strobe:true}` 10× over UDP; also acts as the "PTZ home" button (returns orbital camera to stored home) |
-| **Lights OFF** | Send `{event:"lights", headlights:false, parklights:false, strobe:false}` 10× |
-| **X** (when not in a lock sequence) | Cycle camera forward: floor → orbital → ai_front → ai_back → floor … |
-| **Y** (when not in a lock sequence) | Cycle camera backward |
-| **Cruise up** | Bump cruise speed up one notch (13 levels, -1.0 to +1.0) |
-| **Cruise down** | Bump cruise speed down one notch |
-| **Both cruise pressed** | Hard brake — clamp `lin_x` to 0 and reset cruise to 0 |
-
-### Indicator axis (axis 3 or 4 depending on controller)
-
-| Direction | Action |
-|---|---|
-| Push left (axis < -30000) | Send `{event:"signals", left:true, right:false}` — left turn signal blinks |
-| Push right (axis > +30000) | Send `{event:"signals", left:false, right:true}` — right turn signal blinks |
-| Center | No-op (signals self-cancel after `signal_timeout_sec`) |
-
-### Sound axis (axis 4 or 3 depending on controller)
-
-| Action | Effect |
-|---|---|
-| Single push down (one tap) | Wait 1 s, then send `audio volume 100%` + `talk 7 s` + speak "Hellow how are you today?" |
-| Double tap down (within 1 s) | Send `music play track 1` + `talk 60 s` (60 s of all-blink lights while music plays) |
-| Single push up | Immediately send `audio volume 100%` + `talk 7 s` + speak "please let me go!" |
-
-These are the operator-side defaults. Change the messages in
-`prod_revopilot_udp_...py` and in `LAB/local_gamepad.py` (search for
-`AXIS4_NEG_MESSAGE` / `AXIS4_POS_MESSAGE`).
-
-### Payload `button` field
-
-Every motion packet carries a `button` integer indicating the currently
-pressed button (highest-priority one if multiple):
-
-| Value | Button |
-|---|---|
-| 0 | none |
-| 1 | A |
-| 2 | B |
-| 3 | X |
-| 4 | Y |
-| 5 | cruise down |
-| 6 | cruise up |
-| 7 | lights off |
-| 8 | lights on |
-
-The robot uses **button 8** as the "PTZ go-home" trigger. This is set
-by `cfg.ptz_home_button` in `config.py`.
-
----
-
-## Running the system
-
-### As services (production)
-
-Two systemd units, in `/etc/systemd/system/`:
-
-- `aadi_gps_rtk.service` — runs `gps_mux.py` + Polaris RTK client
-- `aadi_ros_start_teleop.service` — runs `ros_start.sh` (sources ROS2,
-  launches `agv_pro_bringup`, runs `teleop.py`)
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now aadi_gps_rtk.service
-sudo systemctl enable --now aadi_ros_start_teleop.service
-
-# Status + logs
-systemctl status aadi_gps_rtk.service
-systemctl status aadi_ros_start_teleop.service
-journalctl -u aadi_gps_rtk.service -f
-journalctl -u aadi_ros_start_teleop.service -f
-```
-
-Both services have `WantedBy=multi-user.target` so they start at boot.
-`aadi_ros_start_teleop.service` has `After=aadi_gps_rtk.service` so
-GPS comes up first.
-
-### Interactively (development)
-
-Stop the services first if they're running:
-
-```bash
-sudo systemctl stop aadi_ros_start_teleop.service
-sudo systemctl stop aadi_gps_rtk.service
-```
-
-Then:
-
-```bash
-cd ~/Revobots/aditya/aadi_scout
-set -a; source LAB/.env; set +a
-./gps_rtk.sh &              # in one terminal
-bash ros_start.sh           # in another
-```
-
-To bypass the local gamepad (e.g. when no controller is plugged in but
-pygame keeps printing errors):
-
-```bash
-python3 -m LAB.teleop --no-local-dongle
-```
-
-### Verifying things work
-
-- **GPS**: `journalctl -u aadi_gps_rtk -f` should show NMEA fanned out.
-  After ~30 s with sky view: `gps_fix` should transition to `RTK_FIXED`.
-- **ROS**: `ros2 topic echo /cmd_vel` — should publish at 50 Hz when the
-  robot is unlocked and receiving commands.
-- **Cameras**: `journalctl -u aadi_ros_start_teleop -f` will show
-  `[cameras] orbital: started 640x480@15fps (RTSP)` etc. as each opens.
-- **Daily stream**: open the Daily room URL — you should see the
-  composed view inside ~5 s of teleop starting.
-- **Recording**: unlock the robot. A new folder appears under
-  `~/.cache/scout/lab/`. Lock the robot — `session.json` is created.
-
----
-
-## Replicating to a new robot
-
-This is the canonical checklist for cloning the codebase to a new
-machine. Run through it top-to-bottom; if you skip a step it usually
-shows up as an unhelpful error 20 minutes later.
-
-### 1. OS + user
-
-```bash
-# Create the elephant user (or whichever name you'll standardise on)
-sudo adduser elephant
-sudo usermod -aG dialout,audio,plugdev,sudo elephant
-sudo loginctl enable-linger elephant
-```
-
-### 2. System packages
-
-```bash
-sudo apt update
-sudo apt install -y \
-  python3-pip ffmpeg \
-  pulseaudio pulseaudio-utils alsa-utils \
-  libhidapi-libusb0 libhidapi-hidraw0 \
-  v4l-utils \
-  build-essential python3-dev cmake git
-```
-
-### 3. ROS2
-
-Install ROS2 Humble per the official instructions. Then clone your
-`agv_pro_ros2` workspace to `~/agv_pro_ros2/` and build it:
-
-```bash
-cd ~/agv_pro_ros2
-colcon build --symlink-install
-```
-
-### 4. Clone this repo
-
-```bash
-mkdir -p ~/Revobots/aditya
-cd ~/Revobots/aditya
-git clone <your-repo-url> aadi_scout
-cd aadi_scout
-chmod +x gps_rtk.sh ros_start.sh
-```
-
-### 5. Python deps
-
-```bash
-pip install --break-system-packages \
-  pyserial pyaudio numpy opencv-python pygame hid \
-  onvif-zeep daily-python piper-tts
-```
-
-### 6. Piper voice + music
-
-```bash
-mkdir -p ~/Revobots/piper/voices ~/Revobots/Audio
-# Download voice .onnx + .onnx.json into ~/Revobots/piper/voices/
-# Copy your .wav tracks into ~/Revobots/Audio/
-```
-
-### 7. Polaris RTK client
-
-```bash
-git clone https://github.com/PointOneNav/polaris ~/Revobots/polaris
-cd ~/Revobots/polaris && mkdir build && cd build && cmake .. && make -j
-```
-
-### 8. udev rules
-
-Write `/etc/udev/rules.d/99-revo-scout.rules` with stable names for the
-GPS, IMU, USB cameras, and HID relay. Reload udev:
-
-```bash
-sudo udevadm control --reload-rules && sudo udevadm trigger
-```
-
-Then verify:
-
-```bash
-ls -l /dev/ttyCH341USB2 /dev/ttyCH341USB3 /dev/floor_cam
-ls -l /dev/hidraw*  # the relay should be group-readable for plugdev
-```
-
-### 9. Edit `LAB/config.py` for THIS robot
-
-This is the part most often skipped. Walk through `LabConfig` field
-by field and update:
-
-- `ptz_ip` — the orbital camera's IP on this robot's LAN
-- `ptz_user`, `ptz_password` *(password goes in `.env`)*
-- `cameras = [...]` — every `CameraConfig` source. RTSP URLs change
-  per robot (different orbital camera IP), USB device paths can vary
-- `daily_room_url`, `daily_room_name` — each robot needs its own Daily
-  room or operators will see each other's feeds
-- `mic_rtsp_url` — same as the orbital camera's RTSP URL
-- `imu_port_hint`, `gps_udp_port` — only change if your udev rules use
-  different symlinks
-- `record_encoder_preference` — on Jetson with NVENC, prepend
-  `"h264_nvenc"` for hardware encoding
-- `music_tracks` — if you renamed/added music files
-- `piper_model` — if you use a different voice
-- `preferred_sink_patterns`, `preferred_source_patterns` — if your USB
-  audio device isn't UGREEN or EMEET, add a substring of its
-  PulseAudio name here
-
-### 10. Create `LAB/.env`
-
-```bash
-cp LAB/.env.example LAB/.env
-nano LAB/.env
-```
-
-Fill in:
-
-```
-DAILY_API_KEY=...        # from Daily.co dashboard
-PTZ_PASSWORD=...         # this robot's orbital camera password
-POINTONE_API_KEY=...     # from Point One dashboard
-POLARIS_UNIQUE_ID=...    # a STABLE per-robot string, e.g. "scout-elephant-01"
-```
-
-**The `POLARIS_UNIQUE_ID` must be different on every robot** — Point
-One uses it to deduplicate clients on their virtual reference station
-network. Two robots with the same ID will fight each other for RTK
-corrections.
-
-### 11. Install the systemd units
-
-```bash
-# Write the two unit files
-sudo nano /etc/systemd/system/aadi_gps_rtk.service
-sudo nano /etc/systemd/system/aadi_ros_start_teleop.service
-```
-
-Paste the unit content from this repo. Then:
-
-```bash
-# Check the UID matches what's in the teleop unit
-id -u elephant      # if not 1000, edit Environment=XDG_RUNTIME_DIR=/run/user/<UID>
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now aadi_gps_rtk.service
-sudo systemctl enable --now aadi_ros_start_teleop.service
-```
-
-### 12. Operator-side config
-
-On the **operator PC** (not the robot), edit
-`prod_revopilot_udp_highlowfreq_gamepad_cmds_win_lin.py`:
-
-```python
-ROBOT_IPS = {
-    "ELEPHANT": "100.80.7.54",       # ← Tailscale IP of THIS robot
-    ...
-}
-DEFAULT_ROBOT = "ELEPHANT"
-```
-
-Add an entry for the new robot, set it as default if it's becoming the
-primary, and run the script.
-
-### 13. Smoke test
-
-```bash
-# 1. Does GPS come up?
-sudo systemctl status aadi_gps_rtk
-journalctl -u aadi_gps_rtk -n 50 | grep -E '(opened|PTY|NMEA)'
-
-# 2. Does teleop come up?
-sudo systemctl status aadi_ros_start_teleop
-journalctl -u aadi_ros_start_teleop -n 100 | grep -E '(ready|started|connected)'
-
-# 3. Connect operator, unlock robot
-#    → /cmd_vel should publish at 50 Hz
-#    → a new session folder should appear in ~/.cache/scout/lab/
-#    → Daily room should show the live composed view
-
-# 4. Lock robot, Ctrl-C the service (just to verify)
-sudo systemctl stop aadi_ros_start_teleop
-ls ~/.cache/scout/lab/session_*/session.json    # must exist
-```
-
-### 14. Optional but recommended
-
-- Set up a **log rotation** policy for the `~/.cache/scout/lab/`
-  dataset folder. A 30-minute session at 15 fps is ~50 MB of video
-  plus a few MB of JSONL — easily a gig per day if you record a lot.
-- Pin Python package versions in a `requirements.txt` so reinstalls
-  don't drift.
-- Consider a **read-only `git` checkout** on the robot, with a separate
-  config repo for the per-robot `.env` and `config.py`. Avoids
-  accidentally committing one robot's IPs to another robot's branch.
-- Set the **robot hostname** to something memorable
-  (`sudo hostnamectl set-hostname scout-elephant-01`) so journalctl
-  logs are unambiguous when you SSH between machines.
-
----
-
-## Troubleshooting
-
-### `session.json` sometimes missing after Ctrl-C
-
-Fixed as of the last revision. The bug was that `record.py`'s `stop()`
-early-returned when `_active` was already `False` (typically because
-the ffmpeg pipe died mid-session). The current code uses
-`_session_dir is None` as the gate, so any session that opened a folder
-will get its `session.json` written on shutdown, regardless of internal
-state. If you see this happen on the current code, check the journal
-for `[record] session.json write error` lines.
-
-### Lights don't respond / flash randomly
-
-- Confirm the HID relay is plugged in: `lsusb | grep 16c0`
-- Check `elephant` is in the `plugdev` group: `groups elephant`
-- Check `/dev/hidraw*` is readable by your user:
-  `ls -l /dev/hidraw*`
-- If the relay is shared with another process (e.g. a stale Python),
-  HID writes will silently fail. `lsof /dev/hidraw0` (substitute the
-  right number) shows owners.
-
-### Cameras don't open
-
-- USB: `v4l2-ctl --list-devices` and verify the device path in
-  `config.py` matches.
-- RTSP: try `ffplay rtsp://...` from the Jetson to confirm the URL
-  works outside OpenCV.
-- Check `cfg.cameras[i].rtsp_transport` — switch between `"tcp"` and
-  `"udp"` if you're behind a flaky link.
-
-### GPS shows `NO_FIX` indefinitely
-
-- Confirm the antenna has clear sky view (RTK needs >180° of sky).
-- `journalctl -u aadi_gps_rtk -f | grep ADRNAVA` — should show position
-  updates within ~30 s of fix acquisition.
-- Check `POINTONE_API_KEY` and `POLARIS_UNIQUE_ID` are set in `.env`
-  and that `set -a; source LAB/.env; set +a` exports them. The
-  supervisor errors loudly if they're missing.
-
-### Audio is silent
-
-- Linger enabled? `loginctl show-user elephant | grep Linger`
-- Default sink correct? `pactl info | grep "Default Sink"`
-- Volume non-zero? `pactl get-sink-volume @DEFAULT_SINK@`
-- If you just switched USB ports, `audio.py` only matches sinks at
-  startup — restart the teleop service after re-plugging.
-
-### Daily stream not connecting
-
-- `DAILY_API_KEY` in `.env`?
-- `cfg.daily_room_url` matches what you created in the Daily
-  dashboard?
-- Outbound UDP not blocked? Daily uses WebRTC over UDP. On a
-  restrictive network you may need to allow ports 16384-32767 outbound.
-
-### Operator UDP packets arrive but robot doesn't move
-
-- Confirm packets reach the listener:
-  `sudo tcpdump -i any udp port 55999`
-- Confirm arbiter is picking the right source — packets with no
-  `_local: true` get tagged as remote. `journalctl -f` will show source
-  switches.
-- Check `motion._locked`. The robot starts locked by default. The
-  operator must send `robot_lock: false` (via the A→B unlock sequence)
-  before `/cmd_vel` will publish non-zero.
-
-### Both controllers (local + remote) fighting each other
-
-This is by design: local wins for 1 s after the last local packet, then
-remote takes over automatically. If you don't want this, set
-`cfg.local_dongle_enabled = False` or run with `--no-local-dongle`.
-
----
-
-## Conventions in this codebase
-
-A few patterns that recur and are worth knowing about:
-
-- **`log(tag, msg)`** is used everywhere instead of `print`. It writes
-  to stdout in `[tag] msg` format and flushes. journalctl picks it up.
-- **`truthy(x)`** accepts bool / int / strings like `"true"`, `"yes"`,
-  `"on"`, `"pressed"`. Operator-side fields use varied conventions so
-  this is the safe parser.
-- **`first_float(pkt, keys, default)`** returns the first parseable
-  float from a list of candidate keys. Same for `first_int`. Lets the
-  wire format vary slightly without breaking the receiver.
-- **All subsystems are daemon threads with `.start()` and `.stop()`.**
-  `stop()` is always idempotent and always safe to call during
-  shutdown. If you add a new subsystem, follow this pattern.
-- **State is protected by per-subsystem `threading.Lock`s**, not one
-  global lock. Don't introduce cross-subsystem locks — it's a recipe
-  for deadlock.
-- **`rclpy.init()` is called exactly once**, by `teleop.main()`. Don't
-  call it again from inside a subsystem.
-
----
-
-## Whom to ask
-
-- Original author: Aadi
-- Operator script: `prod_revopilot_udp_highlowfreq_gamepad_cmds_win_lin.py`
-  (lives in a separate repo on the operator PC)
-- Daily.co account / API key: dashboard at https://dashboard.daily.co
-- Point One Polaris account: https://app.pointonenav.com
-
-If this README is wrong, fix it in the same PR as the code change that
-made it wrong.
+## Re-enabling commented-out subsystems
+
+`teleop.py` has marker comments throughout: **`RE-ENABLE-WHEN-HARDWARE-INSTALLED`**.
+Currently disabled in code but ready to go:
+
+| Subsystem | Where to uncomment                                  |
+|-----------|-----------------------------------------------------|
+| `lights`  | imports near top of `teleop.py` + the `LightsController(...)` block (~line 427) |
+| `ptz`     | imports near top + the `PtzController(...)` block (~line 437) |
+| `audio`   | imports near top + the `AudioController(...)` block (~line 414) |
+| `imu`     | the `ImuReader(...)` line (~line 350)              |
+
+For cameras, edit `config.py`:
+- `orbital` (RTSP `192.168.10.52`) — uncomment the `CameraConfig(...)` block.
+- `rear`    (RTSP `192.168.10.51`) — uncomment.
+- `driver`  (RTSP `192.168.10.50`) — uncomment.
+
+All dispatchers (`on_motion_packet`, `on_events_packet`,
+`on_tts_packet`) already guard with `if subsystem is not None`, so the
+order in which subsystems come back doesn't matter.
