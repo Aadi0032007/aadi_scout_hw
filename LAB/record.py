@@ -737,6 +737,7 @@ class SessionRecorder:
 
         if self._motion_state is not None:
             try:
+                print(self._motion_state())
                 lin_x, ang_z, locked, braking = self._motion_state()
             except Exception:
                 pass
