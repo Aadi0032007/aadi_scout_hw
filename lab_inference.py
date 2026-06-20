@@ -26,7 +26,9 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import signal
+import socket
 import sys
 import threading
 import time
@@ -44,7 +46,9 @@ if str(_REPO) not in sys.path:
 # ── LAB ───────────────────────────────────────────────────────────────────
 from LAB.common  import log
 from LAB.config  import LabConfig
-from LAB.motion  import MotionController
+# NOTE: We no longer instantiate MotionController here. lab_inference now
+# sends UDP packets into teleop's motion listener with origin="ai", and
+# teleop's MotionController handles human/AI arbitration centrally.
 from LAB.sensors import GpsReader
 
 # ── LeRobot — identical imports to lerobot_inference_api.py ───────────────
@@ -331,7 +335,6 @@ class LabInference:
         self._send        = send
         self._ang_deadband= ang_deadband
         self._stop        = threading.Event()
-        self._owns_rclpy  = False
         self._duration_s  = duration_s
 
         # ── 1. Policy pipeline ────────────────────────────────────────────
@@ -359,24 +362,32 @@ class LabInference:
             expected_w = cfg.record_width,
         )
 
-        # ── 4. Motion controller ──────────────────────────────────────────
-        try:
-            import rclpy
-            if not rclpy.ok():
-                rclpy.init()
-                self._owns_rclpy = True
-        except ImportError:
-            log("inference", "WARNING: rclpy not available — motion disabled")
-
-        self._motion = MotionController(
-            topic        = cfg.cmd_vel_topic,
-            publish_hz   = cfg.motion_publish_hz,
-            watchdog_sec = cfg.motion_watchdog_sec,
-            ang_z_scale  = cfg.ang_z_scale,
-        )
+        # ── 4. Motion UDP sender (replaces MotionController) ──────────────
+        # Previously we owned a MotionController and forwarded directly to
+        # the Docker bridge. Now we send UDP packets to teleop's motion
+        # listener (cfg.udp_motion_port, default 55999) tagged origin="ai".
+        # teleop's MotionController arbitrates human vs AI per its
+        # human-priority policy.
+        #
+        # No rclpy. No direct Docker UDP. teleop must be running.
+        self._motion_udp_host = "127.0.0.1"
+        self._motion_udp_port = getattr(cfg, "udp_motion_port", 55999)
+        self._motion_sock: Optional[socket.socket] = None
         if send:
-            self._motion.start()
-            self._motion.command(0.0, 0.0, locked=True, braking=False)
+            self._motion_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            log("inference",
+                f"motion UDP → {self._motion_udp_host}:{self._motion_udp_port} "
+                f"(origin=ai)  — teleop must be running")
+            # Initial inert packet so teleop has a fresh AI slot (still
+            # ignored until the human chord-enables AI).
+            self._send_motion_ai(0.0, 0.0, locked=False, braking=False)
+
+        # Self-consistent obs echo (replaces motion.state() in the obs loop).
+        # We feed our last commanded values back as the policy's obs state
+        # so the loop is coherent when no gamepad is present. This mirrors
+        # what motion.state() used to return — the last value we commanded.
+        self._last_sent_lin: float = 0.0
+        self._last_sent_ang: float = 0.0
 
         # ── 5. GPS ────────────────────────────────────────────────────────
         self._gps = GpsReader(
@@ -421,7 +432,7 @@ class LabInference:
         log("inference", f"starting — {mode}  deadband={self._ang_deadband}  scale={self._ang_z_scale}")
 
         if self._send:
-            self._motion.command(0.0, 0.0, locked=False, braking=False)
+            self._send_motion_ai(0.0, 0.0, locked=False, braking=False)
 
         self._policy.reset()
         self._preprocessor.reset()
@@ -479,8 +490,9 @@ class LabInference:
                 #   tick N:   motion.command(pred_ang_raw)
                 #   tick N+1: motion.state() -> pred_ang_raw -> obs ang_z ✓
                 if self._send:
-                    lin_x_obs, ang_z_raw_obs, _locked, _braking = self._motion.state()
-                    ang_z_obs = ang_z_raw_obs   # raw — matches old dataset
+                    lin_x_obs    = self._last_sent_lin
+                    ang_z_raw_obs = self._last_sent_ang
+                    ang_z_obs    = ang_z_raw_obs   # raw — matches old dataset
                 else:
                     lin_x_obs, ang_z_obs = 0.0, 0.0
 
@@ -548,9 +560,9 @@ class LabInference:
 
                 # ── H. Send to robot ───────────────────────────────────────
                 if self._send:
-                    self._motion.command(
+                    self._send_motion_ai(
                         lin_x   = pred_lin,
-                        ang_z   = ang_z_cmd,   # raw pred_ang passed directly; MotionController *0.20 -> /cmd_vel
+                        ang_z   = ang_z_cmd,   # raw pred_ang; teleop's MotionController applies *0.20
                         locked  = False,
                         braking = False,
                     )
@@ -642,19 +654,49 @@ class LabInference:
             return frame
         return None
 
+    def _send_motion_ai(self, lin_x: float, ang_z: float,
+                        locked: bool = False, braking: bool = False) -> None:
+        """Send one AI motion packet to teleop's UDP motion listener.
+
+        Tagged origin="ai" so teleop's MotionController routes it through
+        the human/AI arbiter (which may ignore it if AI isn't enabled or
+        if the human is currently in control).
+
+        Also stores the values locally so the next obs read can echo them
+        — keeps the inference loop self-consistent without needing to
+        round-trip through motion.state().
+        """
+        if self._motion_sock is None:
+            # Dry-run: keep self-consistent obs only.
+            self._last_sent_lin = float(lin_x)
+            self._last_sent_ang = float(ang_z)
+            return
+        try:
+            payload = json.dumps({
+                "lin_x":      float(lin_x),
+                "ang_z":      float(ang_z),
+                "robot_lock": bool(locked),
+                "brake":      1.0 if braking else 0.0,
+                "origin":     "ai",
+            }).encode("utf-8")
+            self._motion_sock.sendto(
+                payload, (self._motion_udp_host, self._motion_udp_port)
+            )
+            self._last_sent_lin = float(lin_x)
+            self._last_sent_ang = float(ang_z)
+        except Exception as exc:
+            log("inference", f"motion sendto error: {exc}")
+
     def _safe_stop(self) -> None:
-        log("inference", "stopping — zeroing and locking robot")
+        log("inference", "stopping — zeroing and closing UDP socket")
         if self._send:
             for _ in range(3):
-                try:
-                    self._motion.command(0.0, 0.0, locked=True, braking=False)
-                except Exception:
-                    pass
+                self._send_motion_ai(0.0, 0.0, locked=False, braking=False)
                 time.sleep(0.05)
-            try:
-                self._motion.stop()
-            except Exception:
-                pass
+        if self._motion_sock is not None:
+            try: self._motion_sock.close()
+            except Exception: pass
+            self._motion_sock = None
 
         if self._cameras is not None:
             try: self._cameras.stop_all()
@@ -666,13 +708,6 @@ class LabInference:
 
         try: self._gps.stop()
         except Exception: pass
-
-        if self._owns_rclpy:
-            try:
-                import rclpy
-                rclpy.shutdown()
-            except Exception:
-                pass
 
         log("inference", "shutdown complete")
 
