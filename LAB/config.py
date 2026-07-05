@@ -139,14 +139,14 @@ class LabConfig:
             name="drive",
             source="rtsp://admin:revolabs123%40@192.168.10.51:554/cam/realmonitor?channel=1&subtype=1",
             width=640, height=480, fps=15, rtsp_transport="udp",
-            audio=True,
+            audio=False,
             stream_only=True,
         ),
         CameraConfig(
             name="rear",
             source="rtsp://admin:revolabs123%40@192.168.10.52:554/cam/realmonitor?channel=1&subtype=1",
             width=640, height=480, fps=15, rtsp_transport="udp",
-            audio=True,
+            audio=False,
             stream_only=True,
         ),
         # USB AI camera. `audio` is ignored for USB (no audio branch in the
