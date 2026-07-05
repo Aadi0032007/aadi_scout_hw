@@ -1,28 +1,45 @@
 # -*- coding: utf-8 -*-
 """
-Local gamepad — evdev-based local controller.
+Created on Sun Jul  5 07:09:45 2026
 
-Drop-in replacement for LAB.local_gamepad.LocalGamepad.
-
-Why evdev:
-    pygame can see the 8BitDo USB receiver even when the physical controller
-    is OFF, and may still poll default/noisy states. evdev is event-driven:
-    if no real input event arrives, we do not take local control.
-
-Behavior:
-    - No local input event  -> no local packet
-    - A -> B sequence       -> local unlock, emit robot_lock=False
-    - B -> A sequence       -> local lock, emit robot_lock=True, then idle out
-    - While unlocked        -> emit motion at SEND_HZ using latest state
-    - Lights, signals, TTS, music events are preserved
-    - Packet schema matches remote/operator packets
+@author: Aadi
 """
-
 from __future__ import annotations
+
+"""
+local_gamepad.py — REDESIGN v2.
+
+Local dongle handler. Same behavior as the pilot gamepad (same profiles,
+same buttons, same axis mappings, same state machines) but calls the
+teleop dispatchers in-process instead of going over the wire.
+
+Wire equivalence:
+    - Motion packets are built in the trimmed 12-field schema (same as
+      pilot's UDP payload) plus "_local": True for the source arbiter.
+    - Event packets are built in the unified TCP envelope
+      {seq, t, type, data} — same shape the TCP event server produces.
+    - Both are handed to teleop's dispatchers (on_motion, on_events)
+      directly. No sockets involved.
+
+Behaviors carried over from the pilot gamepad, byte-for-byte:
+    - Steering: deadzone → expo → gain → yaw limit (in-place vs moving)
+    - Cruise ± buttons cycle a level table into lin_x
+    - Both cruise buttons pressed simultaneously = brake, zero yaw
+    - Lock sequence: A→B unlock, B→A lock, A→B while unlocked cycles speed
+    - Turn signals: axis 3 threshold edge → indicator event
+    - Talk: axis 4 negative single-tap → audio+talk speech
+                     positive → audio+talk speech
+                     negative double-tap → music + long talk
+    - Lights ON button → all three True (lights, park, strobe)
+    - Lights OFF button → all three False
+    - Lift triggers → int -255..-50, 0, +50..+255
+    - AI-enable chord (both lift triggers > 0.95) → ai_request="enable"
+      for 5 packets
+    - Head direction (hat pad or right stick) → head field in motion pkt
+"""
 
 import math
 import platform
-import select
 import threading
 import time
 from typing import Callable, Optional
@@ -30,845 +47,576 @@ from typing import Callable, Optional
 from .common import log
 
 
-# ── Tunables ─────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIG (parity with pilot)
+# ══════════════════════════════════════════════════════════════════════════════
 
 SEND_HZ = 50
-JOYSTICK_RETRY_SEC = 1.0
-LOCAL_IDLE_LOCKED_DISARM_SEC = 1.5
-LOCAL_IDLE_UNLOCKED_DISARM_SEC = 60.0
+AXIS_ACTION_THRESHOLD_COUNTS = 30000
 
-AXIS_ACTION_THRESHOLD = 0.75
-HEAD_THRESHOLD = 0.5
-STEER_DEADZONE = 0.1
-STEER_EXPO = 0.8
-STEER_GAIN = 1.0
+AXIS4_NEG_MESSAGE           = "Hellow how are you today?"
+AXIS4_POS_MESSAGE           = "please let me go!"
+TALK_DURATION_SEC           = 7.0
+AXIS4_MULTI_TAP_WINDOW_SEC  = 1.0
+MUSIC_TRACK_ID              = 1
+MUSIC_TALK_DURATION_SEC     = 60.0
+AUDIO_FULL_VOLUME_PCT       = 100
 
-MAX_YAW_MOVING = 2.0
+# Steering behavior
+MAX_YAW_MOVING   = 2.0
 MAX_YAW_INPLACE = 3.5
-MAX_SPEED_INITIAL = 1.0
+STEER_DEADZONE  = 0.1
+STEER_EXPO      = 0.8
+STEER_GAIN      = 1.0
 
-CRUISE_LEVELS = [-1.0, -0.6, -0.4, -0.2, -0.1, -0.05, 0.0, 0.05, 0.1, 0.2, 0.4, 0.6, 1.0]
+# Pedal / cruise
+BRAKE_THRESHOLD = 0.2
+CRUISE_LEVELS = [-1.0, -0.6, -0.4, -0.2, -0.1, -0.05,
+                 0.0, 0.05, 0.1, 0.2, 0.4, 0.6, 1.0]
 PEDAL_DEADBAND = 0.05
 
+# Lift
+LIFT_MIN_CMD        = 50
+LIFT_MAX_CMD        = 255
+LIFT_AXIS_DEADBAND  = 0.02
+
+# AI-enable chord
+AI_ENABLE_PRESS_THRESHOLD = 0.95
+AI_REQUEST_REPEAT_PACKETS = 5
+
+# Lock sequence
 LOCK_SEQUENCE_TIMEOUT = 2.0
+MAX_SPEED_INITIAL     = 1.0
+SWAP_XY_BUTTONS       = False
 
-LIFT_MIN_CMD = 50
-LIFT_MAX_CMD = 255
-LIFT_AXIS_DEADBAND = 0.02
-
-AXIS4_NEG_MESSAGE = "Hellow how are you today?"
-AXIS4_POS_MESSAGE = "please let me go!"
-TALK_DURATION_SEC = 7.0
-AXIS4_MULTI_TAP_WINDOW_SEC = 1.0
-MUSIC_TRACK_ID = 1
-MUSIC_TALK_DURATION_SEC = 60.0
-AUDIO_FULL_VOLUME_PCT = 100
-
-SWAP_XY_BUTTONS = False
+# Joystick reconnect
+JOYSTICK_RETRY_SEC = 1.0
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Gamepad mappings (identical to pilot) ────────────────────────────────────
 
-def _clamp(x: float, lo: float, hi: float) -> float:
+GAMEPAD_MAPPINGS = {
+    "8bitdo_ultimate_wireless_pc": {
+        "axis_steer":     0,
+        "axis_sound":     3,
+        "axis_signal":    4,
+        "axis_head_lr":   6,
+        "axis_head_ud":   7,
+        "axis_lift_pos":  4,
+        "axis_lift_neg":  5,
+        "btn_a": 0, "btn_b": 1, "btn_x": 3, "btn_y": 4,
+        "btn_cruise_down": 6, "btn_cruise_up": 7,
+        "btn_lights_on":  11, "btn_lights_off": 10,
+    },
+    "8bitdo_ultimate2_wireless": {
+        "axis_steer":     0,
+        "axis_signal":    3,
+        "axis_sound":     4,
+        "axis_head_lr":   6,
+        "axis_head_ud":   7,
+        "axis_lift_pos":  5,
+        "axis_lift_neg":  2,
+        "btn_a": 0, "btn_b": 1, "btn_x": 2, "btn_y": 3,
+        "btn_cruise_down": 4, "btn_cruise_up": 5,
+        "btn_lights_on":  7, "btn_lights_off": 6,
+    },
+    "8bitdo_ultimate2_wireless_windows": {
+        "axis_steer":     0,
+        "axis_signal":    2,
+        "axis_sound":     3,
+        "axis_head_lr":   6,
+        "axis_head_ud":   7,
+        "axis_lift_pos":  5,
+        "axis_lift_neg":  4,
+        "btn_a": 0, "btn_b": 1, "btn_x": 2, "btn_y": 3,
+        "btn_cruise_down": 4, "btn_cruise_up": 5,
+        "btn_lights_on":  7, "btn_lights_off": 6,
+    },
+}
+
+DEFAULT_MAPPING_KEY = "8bitdo_ultimate_wireless_pc"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Utility functions (parity with pilot)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
 
-def _deadzone(x: float, dz: float) -> float:
+def _apply_deadzone(x, dz):
     if abs(x) <= dz:
         return 0.0
     return math.copysign((abs(x) - dz) / (1.0 - dz), x)
 
 
-def _expo(x: float, expo: float) -> float:
+def _expo_curve(x, expo):
     return (1.0 - expo) * x + expo * (x ** 3)
 
 
-def _lift_axis_to_cmd(axis_value: float) -> int:
-    """
-    axis_value is normalized [-1..+1].
-    Rest may be -1 for triggers, or 0 for sticks depending on driver.
-    We map only strong positive values to lift command.
-    """
+def _lift_axis_to_cmd(axis_value):
     press = _clamp((axis_value + 1.0) * 0.5, 0.0, 1.0)
     if press <= LIFT_AXIS_DEADBAND:
         return 0
     return int(round(LIFT_MIN_CMD + press * (LIFT_MAX_CMD - LIFT_MIN_CMD)))
 
 
-def _axis_norm(value: int, info) -> float:
-    """
-    Normalize evdev abs value to [-1, +1] using device absinfo.
-    """
-    if info is None:
-        # Fallback for common 0..255 style axes.
-        if 0 <= value <= 255:
-            return _clamp((value - 128) / 127.0, -1.0, 1.0)
-        # Fallback for signed int16 style axes.
-        return _clamp(value / 32767.0, -1.0, 1.0)
+# ══════════════════════════════════════════════════════════════════════════════
+#  LocalGamepad
+# ══════════════════════════════════════════════════════════════════════════════
 
-    mn = info.min
-    mx = info.max
-    if mx == mn:
-        return 0.0
+class LocalGamepad:
+    """Reads a locally-attached gamepad and drives teleop dispatchers directly.
 
-    mid = (mx + mn) * 0.5
-    half = (mx - mn) * 0.5
-    return _clamp((value - mid) / half, -1.0, 1.0)
+    Both callbacks are teleop functions:
+        on_motion(pkt: dict, addr: tuple, port: int) — same signature as UDP
+        on_events(envelope: dict, addr: tuple, port: int) — TCP-shape envelope
 
+    addr and port are supplied for logging parity with the UDP path;
+    for local we use ("local", 0) and -1 respectively.
 
-# ── Main class ────────────────────────────────────────────────────────────────
-
-class LocalGamepad(threading.Thread):
-    """
-    Same constructor/signature as the pygame LocalGamepad.
-
-    teleop.py can keep:
-
-        from LAB.local_gamepad import LocalGamepad
-
-    and:
-
-        local = LocalGamepad(
-            on_motion=on_motion_packet,
-            on_events=on_events_packet,
-            on_tts=on_tts_packet,
-            initial_robot_lock=True,
-            priority_value=cfg.local_dongle_priority,
-        )
+    priority_value is stored inside the motion packet as `priority`. Even
+    though teleop's SourceArbiter uses hardcoded local/remote priorities,
+    we set the field for observability.
     """
 
     def __init__(
         self,
-        on_motion: Callable[[dict, tuple, int], None],
-        on_events: Callable[[dict, tuple, int], None],
-        on_tts:    Callable[[dict, tuple, int], None],
-        initial_robot_lock: bool = True,
-        priority_value:     int  = 100,
+        on_motion:           Callable[[dict, tuple, int], None],
+        on_events:           Callable[[dict, tuple, int], None],
+        initial_robot_lock:  bool = True,
+        priority_value:      int  = 100,
     ) -> None:
-        super().__init__(daemon=True, name="local-gamepad-evdev")
         self._on_motion = on_motion
         self._on_events = on_events
-        self._on_tts = on_tts
-        self._priority = priority_value
-        self._init_lock = bool(initial_robot_lock)
+        self._robot_lock = bool(initial_robot_lock)
+        self._priority   = int(priority_value)
+
         self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._local_event_seq = 0
+
+    # ── lifecycle ───────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="local-gamepad"
+        )
+        self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
 
-    # ── Thread main ──────────────────────────────────────────────────────────
+    # ── envelope emission ───────────────────────────────────────────────────
 
-    def run(self) -> None:
-        try:
-            from evdev import InputDevice, list_devices, ecodes
-        except ImportError:
-            log("local_gp", "evdev not installed — local gamepad disabled: pip install evdev")
-            return
-
-        while not self._stop.is_set():
-            dev = self._find_device(InputDevice, list_devices, ecodes)
-
-            if dev is None:
-                # log("local_gp", "no evdev gamepad found — waiting…")
-                self._stop.wait(timeout=JOYSTICK_RETRY_SEC)
-                continue
-
-            try:
-                self._run_device(dev, ecodes)
-            except OSError:
-                log("local_gp", "local evdev gamepad disconnected")
-            except Exception as exc:
-                log("local_gp", f"local evdev gamepad error: {exc}")
-
-            self._stop.wait(timeout=JOYSTICK_RETRY_SEC)
-
-    # ── Device loop ──────────────────────────────────────────────────────────
-
-    def _run_device(self, dev, ecodes) -> None:
-        log("local_gp", f"evdev connected: {dev.path} name={dev.name!r}")
-
-        # Try to grab device so events do not leak elsewhere.
-        try:
-            dev.grab()
-            grabbed = True
-            log("local_gp", "evdev device grabbed")
-        except Exception:
-            grabbed = False
-            log("local_gp", "evdev grab unavailable — continuing without grab")
-
-        caps = dev.capabilities(absinfo=True)
-
-        abs_info = {}
-        for item in caps.get(ecodes.EV_ABS, []):
-            # item can be (code, AbsInfo) depending on evdev version.
-            if isinstance(item, tuple):
-                abs_info[item[0]] = item[1]
-            else:
-                abs_info[item] = None
-
-        # State mirrors operator/local pygame logic.
-        seq = 0
-        speech_seq = 0
-        period = 1.0 / SEND_HZ
-        next_send_t = time.monotonic()
-
-        cruise_zero_idx = CRUISE_LEVELS.index(0.0)
-        cruise_level_idx = cruise_zero_idx
-
-        camera_modes = ["floor", "orbital", "ai_front", "ai_back"]
-        camera_index = 1
-        camera_mode = camera_modes[camera_index]
-
-        robot_lock = self._init_lock
-        lock_user_engaged = False
-
-        max_speed = MAX_SPEED_INITIAL
-        speed_level = 1
-
-        lock_seq: list[tuple[str, float]] = []
-        seq_start_state: Optional[str] = None
-        sequence_active = False
-
-        axis = {
-            "steer": 0.0,
-            "head_lr": 0.0,
-            "head_ud": 0.0,
-            "signal": 0.0,
-            "sound": 0.0,
-            "lift_pos": -1.0,
-            "lift_neg": -1.0,
+    def _emit_envelope(self, type_: str, data: dict) -> None:
+        """Emit one event envelope in the same shape TCP produces."""
+        self._local_event_seq += 1
+        pkt = {
+            "seq":    self._local_event_seq,
+            "t":      time.time(),
+            "type":   type_,
+            "data":   data,
         }
-
-        btn = {
-            "a": 0,
-            "b": 0,
-            "x": 0,
-            "y": 0,
-            "cruise_up": 0,
-            "cruise_down": 0,
-            "lights_on": 0,
-            "lights_off": 0,
-        }
-
-        prev_btn = dict(btn)
-
-        axis_signal_state = "center"
-        axis_sound_state = "center"
-        axis4_neg_taps: list[float] = []
-        axis4_pending_speech_deadline: Optional[float] = None
-
-        local_engaged = False
-        last_active_t = 0.0
-
-        # Main event + periodic emit loop.
-        try:
-            while not self._stop.is_set():
-                now = time.monotonic()
-
-                # Wait for either an evdev event or next packet tick.
-                timeout = max(0.0, min(0.05, next_send_t - now))
-                r, _, _ = select.select([dev.fd], [], [], timeout)
-
-                event_happened = False
-
-                if r:
-                    for event in dev.read():
-                        event_happened = True
-
-                        if event.type == ecodes.EV_ABS:
-                            self._handle_abs_event(event, ecodes, axis, abs_info)
-
-                        elif event.type == ecodes.EV_KEY:
-                            self._handle_key_event(event, ecodes, btn)
-
-                now_wall = time.time()
-
-                # Handle deferred speech after event processing.
-                if (
-                    axis4_pending_speech_deadline is not None
-                    and now_wall >= axis4_pending_speech_deadline
-                ):
-                    self._emit_event({"event": "audio", "volume_pct": AUDIO_FULL_VOLUME_PCT})
-                    self._emit_event({"event": "talk", "duration": TALK_DURATION_SEC})
-                    self._emit_tts(AXIS4_NEG_MESSAGE, speech_seq)
-                    speech_seq += 1
-                    axis4_pending_speech_deadline = None
-                    axis4_neg_taps = []
-                    last_active_t = time.monotonic()
-                    local_engaged = True
-
-                # Button edges.
-                a = btn["a"]
-                b = btn["b"]
-                x = btn["x"]
-                y = btn["y"]
-                cu = btn["cruise_up"]
-                cd = btn["cruise_down"]
-                lon = btn["lights_on"]
-                loff = btn["lights_off"]
-
-                if SWAP_XY_BUTTONS:
-                    y, x = x, y
-
-                a_edge = a and not prev_btn["a"]
-                b_edge = b and not prev_btn["b"]
-                x_edge = x and not prev_btn["x"]
-                y_edge = y and not prev_btn["y"]
-                cu_edge = cu and not prev_btn["cruise_up"]
-                cd_edge = cd and not prev_btn["cruise_down"]
-                lon_edge = lon and not prev_btn["lights_on"]
-                loff_edge = loff and not prev_btn["lights_off"]
-
-                any_button_edge = bool(
-                    a_edge or b_edge or x_edge or y_edge
-                    or cu_edge or cd_edge or lon_edge or loff_edge
-                )
-
-                if any_button_edge:
-                    last_active_t = time.monotonic()
-                    local_engaged = True
-
-                # Lights buttons.
-                if lon_edge:
-                    self._emit_event({
-                        "event": "lights",
-                        "headlights": True,
-                        "parklights": True,
-                        "strobe": True,
-                    })
-                    log("local_gp", "lights ON")
-
-                if loff_edge:
-                    self._emit_event({
-                        "event": "lights",
-                        "headlights": False,
-                        "parklights": False,
-                        "strobe": False,
-                    })
-                    log("local_gp", "lights OFF")
-
-                # Signals axis.
-                new_signal = "center"
-                if axis["signal"] < -AXIS_ACTION_THRESHOLD:
-                    new_signal = "left"
-                elif axis["signal"] > AXIS_ACTION_THRESHOLD:
-                    new_signal = "right"
-
-                if new_signal != axis_signal_state:
-                    if new_signal == "left":
-                        self._emit_event({"event": "signals", "left": True, "right": False})
-                        last_active_t = time.monotonic()
-                        local_engaged = True
-                    elif new_signal == "right":
-                        self._emit_event({"event": "signals", "left": False, "right": True})
-                        last_active_t = time.monotonic()
-                        local_engaged = True
-                    axis_signal_state = new_signal
-
-                # Sound axis.
-                new_sound = "center"
-                if axis["sound"] < -AXIS_ACTION_THRESHOLD:
-                    new_sound = "neg"
-                elif axis["sound"] > AXIS_ACTION_THRESHOLD:
-                    new_sound = "pos"
-
-                if new_sound != axis_sound_state:
-                    now_wall = time.time()
-
-                    if new_sound == "neg":
-                        axis4_neg_taps = [
-                            t for t in axis4_neg_taps
-                            if now_wall - t <= AXIS4_MULTI_TAP_WINDOW_SEC
-                        ]
-                        axis4_neg_taps.append(now_wall)
-
-                        if len(axis4_neg_taps) >= 2:
-                            self._emit_event({
-                                "event": "music",
-                                "action": "play",
-                                "track": MUSIC_TRACK_ID,
-                            })
-                            self._emit_event({
-                                "event": "talk",
-                                "duration": MUSIC_TALK_DURATION_SEC,
-                            })
-                            axis4_pending_speech_deadline = None
-                            axis4_neg_taps = []
-                        else:
-                            axis4_pending_speech_deadline = now_wall + AXIS4_MULTI_TAP_WINDOW_SEC
-
-                        last_active_t = time.monotonic()
-                        local_engaged = True
-
-                    elif new_sound == "pos":
-                        self._emit_event({"event": "audio", "volume_pct": AUDIO_FULL_VOLUME_PCT})
-                        self._emit_event({"event": "talk", "duration": TALK_DURATION_SEC})
-                        self._emit_tts(AXIS4_POS_MESSAGE, speech_seq)
-                        speech_seq += 1
-                        last_active_t = time.monotonic()
-                        local_engaged = True
-
-                    axis_sound_state = new_sound
-
-                # Lock sequence bookkeeping.
-                pre_camera_mode = camera_mode
-                now_seq = time.time()
-
-                if a_edge:
-                    if not lock_seq and seq_start_state is None:
-                        seq_start_state = pre_camera_mode
-                    lock_seq.append(("A", now_seq))
-
-                if b_edge:
-                    if not lock_seq and seq_start_state is None:
-                        seq_start_state = pre_camera_mode
-                    lock_seq.append(("B", now_seq))
-
-                if y_edge:
-                    if not lock_seq and seq_start_state is None:
-                        seq_start_state = pre_camera_mode
-                    lock_seq.append(("Y", now_seq))
-
-                if x_edge:
-                    if not lock_seq and seq_start_state is None:
-                        seq_start_state = pre_camera_mode
-                    lock_seq.append(("X", now_seq))
-
-                lock_seq = [
-                    (k, t) for (k, t) in lock_seq
-                    if now_seq - t <= LOCK_SEQUENCE_TIMEOUT
-                ]
-
-                if not sequence_active and len(lock_seq) >= 2:
-                    first2 = "".join(k for k, _ in lock_seq[:2])
-                    if first2 in ("AB", "BA"):
-                        sequence_active = True
-
-                sequence_matched = False
-
-                if len(lock_seq) >= 2:
-                    last2 = lock_seq[-2:]
-                    seq_str = "".join(k for k, _ in last2)
-                    span = last2[-1][1] - last2[0][1]
-
-                    if span <= LOCK_SEQUENCE_TIMEOUT:
-                        if seq_str == "AB":
-                            if robot_lock:
-                                robot_lock = False
-                                max_speed = 1.0
-                                speed_level = 1
-                                log("local_gp", "robot unlocked A→B")
-                            else:
-                                speed_level += 1
-                                if speed_level > 3:
-                                    speed_level = 1
-                                max_speed = float(speed_level)
-                                log("local_gp", f"speed cycle → {speed_level}")
-
-                            lock_user_engaged = True
-                            sequence_matched = True
-                            lock_seq = []
-                            last_active_t = time.monotonic()
-                            local_engaged = True
-
-                        elif seq_str == "BA":
-                            robot_lock = True
-                            log("local_gp", "robot locked B→A")
-
-                            lock_user_engaged = True
-                            sequence_matched = True
-                            lock_seq = []
-                            last_active_t = time.monotonic()
-                            local_engaged = True
-
-                if sequence_matched:
-                    camera_mode = seq_start_state if seq_start_state is not None else pre_camera_mode
-                    seq_start_state = None
-                    sequence_active = False
-
-                elif not lock_seq and seq_start_state is not None:
-                    seq_start_state = None
-                    sequence_active = False
-
-                # Camera cycling, only when no lock sequence in flight.
-                if not sequence_matched and not sequence_active:
-                    if x_edge:
-                        camera_index = (camera_index + 1) % len(camera_modes)
-                        camera_mode = camera_modes[camera_index]
-                        last_active_t = time.monotonic()
-                        local_engaged = True
-
-                    if y_edge:
-                        camera_index = (camera_index - 1) % len(camera_modes)
-                        camera_mode = camera_modes[camera_index]
-                        last_active_t = time.monotonic()
-                        local_engaged = True
-
-                # Cruise.
-                both_cruise = bool(cu and cd)
-
-                if both_cruise:
-                    cruise_level_idx = cruise_zero_idx
-                    last_active_t = time.monotonic()
-                    local_engaged = True
-                else:
-                    if cu_edge:
-                        cruise_level_idx = min(cruise_level_idx + 1, len(CRUISE_LEVELS) - 1)
-                    if cd_edge:
-                        cruise_level_idx = max(cruise_level_idx - 1, 0)
-
-                if cu_edge or cd_edge:
-                    last_active_t = time.monotonic()
-                    local_engaged = True
-
-                # Compute lift.
-                lp = _lift_axis_to_cmd(axis["lift_pos"])
-                ln = _lift_axis_to_cmd(axis["lift_neg"])
-
-                if lp > ln:
-                    lift = lp
-                elif ln > lp:
-                    lift = -ln
-                else:
-                    lift = 0
-
-                if lift != 0:
-                    last_active_t = time.monotonic()
-                    local_engaged = True
-
-                # Head.
-                head = "center"
-                if axis["head_lr"] < -HEAD_THRESHOLD:
-                    head = "left"
-                elif axis["head_lr"] > HEAD_THRESHOLD:
-                    head = "right"
-                elif axis["head_ud"] < -HEAD_THRESHOLD:
-                    head = "up"
-                elif axis["head_ud"] > HEAD_THRESHOLD:
-                    head = "down"
-
-                if head != "center":
-                    last_active_t = time.monotonic()
-                    local_engaged = True
-
-                # Steering and motion.
-                raw_steer = -axis["steer"]
-                s = _deadzone(raw_steer, STEER_DEADZONE)
-                s = _expo(s, STEER_EXPO)
-                s *= STEER_GAIN
-                s = _clamp(s, -1.0, 1.0)
-
-                cruise_speed = CRUISE_LEVELS[cruise_level_idx]
-                cruise_abs_max = min(1.0, max_speed)
-                cruise_speed = _clamp(cruise_speed, -cruise_abs_max, cruise_abs_max)
-
-                if both_cruise:
-                    lin_x = 0.0
-                    cruise_speed = 0.0
-                    cruise_level_idx = cruise_zero_idx
-                else:
-                    lin_x = cruise_speed
-
-                if abs(lin_x) > 0.001:
-                    last_active_t = time.monotonic()
-                    local_engaged = True
-
-                speed_frac = min(abs(lin_x) / max_speed, 1.0) if max_speed > 0 else 0.0
-                yaw_limit = MAX_YAW_INPLACE * (1.0 - speed_frac) + MAX_YAW_MOVING * speed_frac
-                ang_z = _clamp(s * yaw_limit, -yaw_limit, yaw_limit)
-
-                if both_cruise:
-                    ang_z = 0.0
-
-                if abs(ang_z) > 0.001:
-                    last_active_t = time.monotonic()
-                    local_engaged = True
-
-                # Button field.
-                current_button = 0
-                if a:
-                    current_button = 1
-                elif b:
-                    current_button = 2
-                elif x:
-                    current_button = 3
-                elif y:
-                    current_button = 4
-                elif cd:
-                    current_button = 5
-                elif cu:
-                    current_button = 6
-                elif loff:
-                    current_button = 7
-                elif lon:
-                    current_button = 8
-
-                speed_label = {1: "slow", 2: "medium", 3: "fast"}.get(speed_level, "slow")
-
-                # Idle release.
-                now_m = time.monotonic()
-                idle_for = now_m - last_active_t if last_active_t > 0 else 999.0
-
-                if robot_lock:
-                    if idle_for > LOCAL_IDLE_LOCKED_DISARM_SEC:
-                        local_engaged = False
-                else:
-                    if idle_for > LOCAL_IDLE_UNLOCKED_DISARM_SEC:
-                        local_engaged = False
-
-                # Periodic motion packet only when local is engaged.
-                if now_m >= next_send_t:
-                    next_send_t = now_m + period
-
-                    if local_engaged:
-                        payload = {
-                            "seq": seq,
-                            "t": time.time(),
-                            "lin_x": round(lin_x, 4),
-                            "ang_z": round(ang_z, 4),
-                            "accel": 0.0,
-                            "brake": 1.0 if both_cruise else 0.0,
-                            "cruise": round(cruise_speed, 3),
-                            "fwd": True,
-                            "camera": camera_mode,
-                            "head": head,
-                            "speed": speed_label,
-                            "lift": lift,
-                            "priority": self._priority,
-                            "button": current_button,
-                            "_local": True,
-                        }
-
-                        # Critical:
-                        # Do not send initial robot_lock=True just because local exists.
-                        # Only send robot_lock after a local A→B or B→A sequence.
-                        if lock_user_engaged:
-                            payload["robot_lock"] = robot_lock
-
-                        try:
-                            self._on_motion(payload, ("local", 0), -1)
-                        except Exception as exc:
-                            log("local_gp", f"motion dispatch error: {exc}")
-
-                    seq += 1
-
-                prev_btn["a"] = a
-                prev_btn["b"] = b
-                prev_btn["x"] = x
-                prev_btn["y"] = y
-                prev_btn["cruise_up"] = cu
-                prev_btn["cruise_down"] = cd
-                prev_btn["lights_on"] = lon
-                prev_btn["lights_off"] = loff
-
-        finally:
-            if grabbed:
-                try:
-                    dev.ungrab()
-                except Exception:
-                    pass
-            try:
-                dev.close()
-            except Exception:
-                pass
-
-    # ── Event mapping ────────────────────────────────────────────────────────
-
-    def _handle_abs_event(self, event, ecodes, axis: dict, abs_info: dict) -> None:
-        code = event.code
-        val = _axis_norm(event.value, abs_info.get(code))
-
-        # Common Linux/8BitDo mappings. These cover both old simple evdev and
-        # modern 8BitDo modes. Adjust here if your evtest output differs.
-
-        # Steering.
-        if code in (
-            getattr(ecodes, "ABS_X", -1),
-        ):
-            axis["steer"] = val
-
-        # Triggers / secondary axes.
-        elif code in (
-            getattr(ecodes, "ABS_Z", -1),
-            getattr(ecodes, "ABS_GAS", -1),
-        ):
-            # On many 8BitDo profiles this is signal or lift neg.
-            axis["signal"] = val
-            axis["lift_neg"] = val
-
-        elif code in (
-            getattr(ecodes, "ABS_RZ", -1),
-            getattr(ecodes, "ABS_BRAKE", -1),
-        ):
-            # On many 8BitDo profiles this is sound or lift pos.
-            axis["sound"] = val
-            axis["lift_pos"] = val
-
-        # Right stick / D-pad axes for head.
-        elif code in (
-            getattr(ecodes, "ABS_RX", -1),
-            getattr(ecodes, "ABS_HAT0X", -1),
-        ):
-            axis["head_lr"] = val
-
-        elif code in (
-            getattr(ecodes, "ABS_RY", -1),
-            getattr(ecodes, "ABS_HAT0Y", -1),
-        ):
-            axis["head_ud"] = val
-
-        # Some controllers expose D-pad as ABS_HAT1X/Y or ABS_Y.
-        elif code in (
-            getattr(ecodes, "ABS_HAT1X", -1),
-        ):
-            axis["head_lr"] = val
-
-        elif code in (
-            getattr(ecodes, "ABS_HAT1Y", -1),
-        ):
-            axis["head_ud"] = val
-
-    def _handle_key_event(self, event, ecodes, btn: dict) -> None:
-        pressed = 1 if event.value else 0
-        code = event.code
-
-        # A/B/X/Y aliases.
-        if code in (
-            getattr(ecodes, "BTN_SOUTH", -1),
-            getattr(ecodes, "BTN_A", -1),
-            304,
-        ):
-            btn["a"] = pressed
-
-        elif code in (
-            getattr(ecodes, "BTN_EAST", -1),
-            getattr(ecodes, "BTN_B", -1),
-            305,
-        ):
-            btn["b"] = pressed
-
-        elif code in (
-            getattr(ecodes, "BTN_WEST", -1),
-            getattr(ecodes, "BTN_X", -1),
-            307,
-        ):
-            btn["x"] = pressed
-
-        elif code in (
-            getattr(ecodes, "BTN_NORTH", -1),
-            getattr(ecodes, "BTN_Y", -1),
-            308,
-        ):
-            btn["y"] = pressed
-
-        # Shoulders / cruise.
-        elif code in (
-            getattr(ecodes, "BTN_TL", -1),
-            310,
-        ):
-            btn["cruise_down"] = pressed
-
-        elif code in (
-            getattr(ecodes, "BTN_TR", -1),
-            311,
-        ):
-            btn["cruise_up"] = pressed
-
-        # Start/select/thumb buttons for lights. These may vary by 8BitDo mode.
-        elif code in (
-            getattr(ecodes, "BTN_SELECT", -1),
-            getattr(ecodes, "BTN_THUMBL", -1),
-            314,
-            317,
-        ):
-            btn["lights_off"] = pressed
-
-        elif code in (
-            getattr(ecodes, "BTN_START", -1),
-            getattr(ecodes, "BTN_THUMBR", -1),
-            315,
-            318,
-        ):
-            btn["lights_on"] = pressed
-
-    # ── Device discovery ──────────────────────────────────────────────────────
-
-    def _find_device(self, InputDevice, list_devices, ecodes):
-        """
-        Pick first likely joystick/gamepad.
-
-        This intentionally ignores keyboards, mice, consumer/system controls.
-        """
-        candidates = []
-
-        for path in list_devices():
-            try:
-                dev = InputDevice(path)
-            except Exception:
-                continue
-
-            name = (dev.name or "").lower()
-            phys = (dev.phys or "").lower()
-
-            if any(x in name for x in ("keyboard", "mouse", "consumer", "system")):
-                continue
-
-            try:
-                caps = dev.capabilities()
-            except Exception:
-                continue
-
-            has_keys = ecodes.EV_KEY in caps
-            has_abs = ecodes.EV_ABS in caps
-
-            if not has_keys or not has_abs:
-                continue
-
-            score = 0
-            if "8bitdo" in name:
-                score += 100
-            if "ultimate" in name:
-                score += 50
-            if "x-box" in name or "xbox" in name:
-                score += 20
-            if "gamepad" in name or "joystick" in name:
-                score += 20
-            if "usb" in phys:
-                score += 5
-
-            candidates.append((score, path, dev.name))
-
-        if not candidates:
-            return None
-
-        candidates.sort(reverse=True)
-        score, path, name = candidates[0]
-
-        try:
-            dev = InputDevice(path)
-            log("local_gp", f"selected evdev device score={score}: {path} {name!r}")
-            return dev
-        except Exception:
-            return None
-
-    # ── Dispatcher helpers ────────────────────────────────────────────────────
-
-    def _emit_event(self, pkt: dict) -> None:
-        pkt["_local"] = True
         try:
             self._on_events(pkt, ("local", 0), -1)
         except Exception as exc:
             log("local_gp", f"events dispatch error: {exc}")
 
-    def _emit_tts(self, text: str, seq: int) -> None:
-        pkt = {
-            "type": "stt",
-            "seq": seq,
-            "ts": time.time(),
-            "text": text,
-            "_local": True,
-        }
+    # ── pygame init helpers ─────────────────────────────────────────────────
+
+    def _init_pygame(self):
+        """Lazy pygame import + init. Kept inside the worker thread so a
+        missing pygame doesn't crash teleop startup, and to avoid touching
+        SDL from the main thread."""
         try:
-            self._on_tts(pkt, ("local", 0), -1)
+            import pygame
+        except ImportError:
+            log("local_gp", "pygame not installed — local gamepad disabled")
+            return None
+        try:
+            pygame.init()
+            pygame.joystick.init()
         except Exception as exc:
-            log("local_gp", f"tts dispatch error: {exc}")
+            log("local_gp", f"pygame init failed: {exc}")
+            return None
+        return pygame
+
+    def _wait_for_joystick(self, pygame_mod, retry_sec=JOYSTICK_RETRY_SEC):
+        while not self._stop.is_set():
+            pygame_mod.joystick.quit()
+            pygame_mod.joystick.init()
+            if pygame_mod.joystick.get_count() > 0:
+                try:
+                    js = pygame_mod.joystick.Joystick(0)
+                    js.init()
+                except pygame_mod.error as exc:
+                    log("local_gp", f"joystick init failed: {exc}")
+                    self._stop.wait(timeout=retry_sec)
+                    continue
+                log("local_gp",
+                    f"joystick found: {js.get_name()} "
+                    f"(axes={js.get_numaxes()} btns={js.get_numbuttons()} "
+                    f"hats={js.get_numhats()})")
+                return js
+            self._stop.wait(timeout=retry_sec)
+        return None
+
+    def _get_mapping(self, js):
+        name = (js.get_name() or "").strip().lower()
+        num_buttons = js.get_numbuttons()
+        current_os = platform.system()
+        if "ultimate 2 wireless" in name and current_os == "Linux":
+            key = "8bitdo_ultimate2_wireless"
+        elif "ultimate wireless controller for pc" in name and current_os == "Linux":
+            key = "8bitdo_ultimate_wireless_pc"
+        elif "ultimate 2 wireless" in name and current_os == "Windows":
+            key = "8bitdo_ultimate2_wireless_windows"
+        elif num_buttons <= 12:
+            key = "8bitdo_ultimate2_wireless"
+        else:
+            key = DEFAULT_MAPPING_KEY
+        log("local_gp", f"mapping='{key}' for '{js.get_name()}'")
+        return GAMEPAD_MAPPINGS[key]
+
+    # ── input reads (safe against varying axis counts) ──────────────────────
+
+    @staticmethod
+    def _read_button(js, idx):
+        if idx is None or idx < 0:
+            return 0
+        return js.get_button(idx) if js.get_numbuttons() > idx else 0
+
+    def _read_axis(self, js, idx, pygame_mod):
+        if js.get_numaxes() <= idx:
+            return 0.0
+        try:
+            v = js.get_axis(idx)
+        except pygame_mod.error:
+            return 0.0
+        if abs(v) > 1.5:
+            v = v / 32767.0
+        return _clamp(v, -1.0, 1.0)
+
+    def _read_axis_counts(self, js, idx, pygame_mod):
+        return int(round(self._read_axis(js, idx, pygame_mod) * 32767.0))
+
+    # ── main worker loop ────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        pygame_mod = self._init_pygame()
+        if pygame_mod is None:
+            return
+
+        js = self._wait_for_joystick(pygame_mod)
+        if js is None:
+            return
+        gp = self._get_mapping(js)
+
+        # State
+        seq = 0
+        period = 1.0 / SEND_HZ
+        next_t = time.time()
+
+        cruise_zero_idx = CRUISE_LEVELS.index(0.0)
+        cruise_level_idx = cruise_zero_idx
+        cruise_speed = 0.0
+
+        max_speed = MAX_SPEED_INITIAL
+        speed_level = 1   # 1=slow, 2=medium, 3=fast
+
+        lock_seq_buf = []
+        sequence_active = False
+        prev_a = prev_b = prev_y = prev_x = 0
+        prev_cruise_up = prev_cruise_down = 0
+        prev_lights_on = prev_lights_off = 0
+        axis3_state = "center"
+        axis4_state = "center"
+        axis4_neg_taps: list = []
+        axis4_pending_speech_deadline: Optional[float] = None
+
+        prev_ai_chord = False
+        ai_request_counter = 0
+
+        while not self._stop.is_set():
+            # ── tick pacing ─────────────────────────────────────────────
+            now = time.time()
+            if now < next_t:
+                self._stop.wait(timeout=next_t - now)
+                if self._stop.is_set():
+                    break
+            next_t += period
+
+            # ── joystick health ─────────────────────────────────────────
+            if pygame_mod.joystick.get_count() == 0:
+                log("local_gp", "joystick disconnected, waiting…")
+                js = self._wait_for_joystick(pygame_mod)
+                if js is None:
+                    return
+                gp = self._get_mapping(js)
+                next_t = time.time()
+                continue
+
+            try:
+                pygame_mod.event.pump()
+            except pygame_mod.error:
+                log("local_gp", "event pump error, re-detecting")
+                js = self._wait_for_joystick(pygame_mod)
+                if js is None:
+                    return
+                gp = self._get_mapping(js)
+                next_t = time.time()
+                continue
+
+            # ── inputs ──────────────────────────────────────────────────
+            raw_steer   = -self._read_axis(js, gp["axis_steer"], pygame_mod)
+            head_lr     = self._read_axis(js, gp["axis_head_lr"], pygame_mod)
+            head_ud     = self._read_axis(js, gp["axis_head_ud"], pygame_mod)
+            signal_axis = self._read_axis_counts(js, gp["axis_signal"], pygame_mod)
+            sound_axis  = self._read_axis_counts(js, gp["axis_sound"], pygame_mod)
+
+            # Fall back to hat pad for head direction if right stick idle
+            if abs(head_lr) < 0.01 and abs(head_ud) < 0.01 and js.get_numhats() > 0:
+                hx, hy = js.get_hat(0)
+                head_lr = float(hx)
+                head_ud = float(-hy)
+
+            # ── Axis 3 → indicator event ────────────────────────────────
+            if signal_axis < -AXIS_ACTION_THRESHOLD_COUNTS:
+                new_axis3 = "left"
+            elif signal_axis > AXIS_ACTION_THRESHOLD_COUNTS:
+                new_axis3 = "right"
+            else:
+                new_axis3 = "center"
+
+            if new_axis3 != axis3_state:
+                self._emit_envelope("indicator", {"side": new_axis3})
+                axis3_state = new_axis3
+
+            # ── Axis 4 → audio / talk / music ───────────────────────────
+            if sound_axis < -AXIS_ACTION_THRESHOLD_COUNTS:
+                new_axis4 = "neg"
+            elif sound_axis > AXIS_ACTION_THRESHOLD_COUNTS:
+                new_axis4 = "pos"
+            else:
+                new_axis4 = "center"
+
+            axis4_now = time.time()
+
+            # Deferred single-tap-neg speech, fires once the tap window closes
+            if (axis4_pending_speech_deadline is not None
+                    and axis4_now >= axis4_pending_speech_deadline):
+                self._emit_envelope("audio", {"volume_pct": AUDIO_FULL_VOLUME_PCT})
+                self._emit_envelope("talk",  {"text": AXIS4_NEG_MESSAGE,
+                                              "duration": TALK_DURATION_SEC})
+                axis4_pending_speech_deadline = None
+                axis4_neg_taps = []
+
+            if new_axis4 != axis4_state:
+                if new_axis4 == "neg":
+                    axis4_neg_taps = [t for t in axis4_neg_taps
+                                      if axis4_now - t <= AXIS4_MULTI_TAP_WINDOW_SEC]
+                    axis4_neg_taps.append(axis4_now)
+                    if len(axis4_neg_taps) >= 2:
+                        # Double-tap: music + long talk
+                        self._emit_envelope("music", {"action": "play",
+                                                      "track": MUSIC_TRACK_ID})
+                        self._emit_envelope("talk",  {"text": "",
+                                                      "duration": MUSIC_TALK_DURATION_SEC})
+                        axis4_pending_speech_deadline = None
+                        axis4_neg_taps = []
+                    else:
+                        axis4_pending_speech_deadline = (
+                            axis4_now + AXIS4_MULTI_TAP_WINDOW_SEC
+                        )
+                elif new_axis4 == "pos":
+                    self._emit_envelope("audio", {"volume_pct": AUDIO_FULL_VOLUME_PCT})
+                    self._emit_envelope("talk",  {"text": AXIS4_POS_MESSAGE,
+                                                  "duration": TALK_DURATION_SEC})
+                axis4_state = new_axis4
+
+            # ── buttons ─────────────────────────────────────────────────
+            a_pressed = self._read_button(js, gp["btn_a"])
+            b_pressed = self._read_button(js, gp["btn_b"])
+            y_pressed = self._read_button(js, gp["btn_y"])
+            x_pressed = self._read_button(js, gp["btn_x"])
+            cruise_up = self._read_button(js, gp["btn_cruise_up"])
+            cruise_down = self._read_button(js, gp["btn_cruise_down"])
+            lights_on_pressed  = self._read_button(js, gp["btn_lights_on"])
+            lights_off_pressed = self._read_button(js, gp["btn_lights_off"])
+
+            lift_pos_axis = self._read_axis(js, gp["axis_lift_pos"], pygame_mod)
+            lift_neg_axis = self._read_axis(js, gp["axis_lift_neg"], pygame_mod)
+            lift_pos_cmd = _lift_axis_to_cmd(lift_pos_axis)
+            lift_neg_cmd = _lift_axis_to_cmd(lift_neg_axis)
+            if lift_pos_cmd > lift_neg_cmd:
+                lift = lift_pos_cmd
+            elif lift_neg_cmd > lift_pos_cmd:
+                lift = -lift_neg_cmd
+            else:
+                lift = 0
+
+            # ── AI-enable chord ─────────────────────────────────────────
+            press_pos = _clamp((lift_pos_axis + 1.0) * 0.5, 0.0, 1.0)
+            press_neg = _clamp((lift_neg_axis + 1.0) * 0.5, 0.0, 1.0)
+            ai_chord = (press_pos > AI_ENABLE_PRESS_THRESHOLD
+                        and press_neg > AI_ENABLE_PRESS_THRESHOLD)
+            if ai_chord and not prev_ai_chord:
+                ai_request_counter = AI_REQUEST_REPEAT_PACKETS
+                log("local_gp",
+                    f"AI enable chord → ai_request x{AI_REQUEST_REPEAT_PACKETS}")
+            prev_ai_chord = ai_chord
+
+            if SWAP_XY_BUTTONS:
+                y_pressed, x_pressed = x_pressed, y_pressed
+
+            now_t = time.time()
+            a_edge = a_pressed and not prev_a
+            b_edge = b_pressed and not prev_b
+            lights_on_edge  = lights_on_pressed  and not prev_lights_on
+            lights_off_edge = lights_off_pressed and not prev_lights_off
+
+            # ── Lights buttons (all three fields together) ──────────────
+            if lights_on_edge:
+                self._emit_envelope("lights", {
+                    "headlights": True, "parklights": True, "strobe": True,
+                })
+            if lights_off_edge:
+                self._emit_envelope("lights", {
+                    "headlights": False, "parklights": False, "strobe": False,
+                })
+
+            # ── Lock sequence (A→B unlock / cycle speed, B→A lock) ─────
+            if a_edge:
+                lock_seq_buf.append(("A", now_t))
+            if b_edge:
+                lock_seq_buf.append(("B", now_t))
+
+            prev_a, prev_b = a_pressed, b_pressed
+            prev_y, prev_x = y_pressed, x_pressed
+            prev_lights_on  = lights_on_pressed
+            prev_lights_off = lights_off_pressed
+
+            lock_seq_buf = [(k, t) for (k, t) in lock_seq_buf
+                            if now_t - t <= LOCK_SEQUENCE_TIMEOUT]
+
+            if not sequence_active and len(lock_seq_buf) >= 2:
+                first2 = "".join([k for (k, _) in lock_seq_buf[:2]])
+                if first2 in ("AB", "BA"):
+                    sequence_active = True
+
+            if len(lock_seq_buf) >= 2:
+                last2 = lock_seq_buf[-2:]
+                seq_str = "".join([k for (k, _) in last2])
+                span = last2[-1][1] - last2[0][1]
+                if span <= LOCK_SEQUENCE_TIMEOUT:
+                    if seq_str == "AB":
+                        if self._robot_lock:
+                            self._robot_lock = False
+                            max_speed = 1.0
+                            speed_level = 1
+                            log("local_gp", "robot UNLOCKED")
+                        else:
+                            speed_level = 1 if speed_level >= 3 else speed_level + 1
+                            max_speed = float(speed_level)
+                            log("local_gp", f"speed level → {speed_level}")
+                        lock_seq_buf = []
+                        sequence_active = False
+                    elif seq_str == "BA":
+                        self._robot_lock = True
+                        lock_seq_buf = []
+                        sequence_active = False
+                        log("local_gp", "robot LOCKED")
+
+            # ── Cruise / lin_x computation ──────────────────────────────
+            both_cruise_pressed = bool(cruise_up and cruise_down)
+            pedal_signed = 0.0   # local dongle has no pedal contribution
+            brake = 1.0 if both_cruise_pressed else 0.0
+            brake_active = (brake > BRAKE_THRESHOLD) or both_cruise_pressed
+
+            pedal_speed = pedal_signed * max_speed
+            if abs(pedal_speed) <= PEDAL_DEADBAND:
+                pedal_speed = 0.0
+
+            if both_cruise_pressed:
+                cruise_level_idx = cruise_zero_idx
+            else:
+                if cruise_up and not prev_cruise_up:
+                    cruise_level_idx = min(cruise_level_idx + 1,
+                                           len(CRUISE_LEVELS) - 1)
+                if cruise_down and not prev_cruise_down:
+                    cruise_level_idx = max(cruise_level_idx - 1, 0)
+
+            cruise_speed = CRUISE_LEVELS[cruise_level_idx]
+            prev_cruise_up, prev_cruise_down = cruise_up, cruise_down
+
+            cruise_abs_max = min(1.0, max_speed)
+            cruise_speed = _clamp(cruise_speed, -cruise_abs_max, cruise_abs_max)
+
+            if brake_active:
+                lin_x = 0.0
+                cruise_speed = 0.0
+                cruise_level_idx = cruise_zero_idx
+            elif abs(pedal_speed) > 0.0:
+                lin_x = pedal_speed
+                cruise_speed = 0.0
+                cruise_level_idx = cruise_zero_idx
+            else:
+                lin_x = cruise_speed
+
+            # ── Head direction ──────────────────────────────────────────
+            head = "center"
+            axis_head_threshold = 0.5
+            if head_lr < -axis_head_threshold:
+                head = "left"
+            elif head_lr > axis_head_threshold:
+                head = "right"
+            elif head_ud < -axis_head_threshold:
+                head = "up"
+            elif head_ud > axis_head_threshold:
+                head = "down"
+
+            # ── Steering → ang_z ────────────────────────────────────────
+            s = _apply_deadzone(raw_steer, STEER_DEADZONE)
+            s = _expo_curve(s, STEER_EXPO)
+            s *= STEER_GAIN
+            s = _clamp(s, -1.0, 1.0)
+
+            speed_frac = min(abs(lin_x) / max_speed, 1.0) if max_speed > 0 else 0.0
+            yaw_limit = (MAX_YAW_INPLACE * (1.0 - speed_frac)
+                         + MAX_YAW_MOVING * speed_frac)
+            ang_z = _clamp(s * yaw_limit, -yaw_limit, yaw_limit)
+            if both_cruise_pressed:
+                ang_z = 0.0
+
+            # ── Motion payload (trimmed schema, same as pilot) ──────────
+            speed_label = {1: "slow", 2: "medium", 3: "fast"}.get(speed_level, "slow")
+            pkt = {
+                "seq":         seq,
+                "t":           time.time(),
+                "lin_x":       round(lin_x, 4),
+                "ang_z":       round(ang_z, 4),
+                "brake":       round(brake, 3),
+                "robot_lock":  self._robot_lock,
+                "head":        head,
+                "speed":       speed_label,
+                "lift":        lift,
+                "priority":    self._priority,
+                "origin":      "human",
+                "ai_request":  "enable" if ai_request_counter > 0 else None,
+                "_local":      True,
+            }
+            if ai_request_counter > 0:
+                ai_request_counter -= 1
+            seq += 1
+
+            try:
+                self._on_motion(pkt, ("local", 0), -1)
+            except Exception as exc:
+                log("local_gp", f"motion dispatch error: {exc}")
+
+        log("local_gp", "stopped")

@@ -6,45 +6,17 @@ Created on Wed Jun  3 20:04:03 2026
 """
 from __future__ import annotations
 
-
-# -*- coding: utf-8 -*-
 """
-Motion: UDP commands → Docker ROS1 /cmd_vel via UDP forward.
+motion.py — REDESIGN delta.
 
-Previously this module used rclpy to publish directly to a local ROS2 node.
-The Segway SmartCar SDK has moved into a ROS1 Docker container
-(segway_ros1), so we now forward motion commands as JSON UDP packets to
-revo_docker_udp_motion_keepalive.py running inside that container.
+Changes from previous version:
+    + set_ai_enabled(bool) / is_ai_enabled() — flag driven by the gamepad's
+      ai_request field in the motion UDP payload. Currently exposed only
+      for telemetry; motion output is not gated on it yet. Add gating in
+      _compute_output() when ready.
 
-The Docker script listens on UDP port 55999 inside the container; the
-container is port-mapped so host port 56000 → container 55999. We send
-to host port 56000. (Host port 55999 is already in use by the gamepad
-listener, so we can't reuse it.)
-
-The Docker script applies its own deadzone/limits and publishes /cmd_vel
-to ROS1 at 50 Hz with keepalive. We run our own publish loop here at
-motion_publish_hz so the Docker side always receives a steady stream
-and its watchdog (HOLD_LAST_CMD_S=0.40s) never trips during normal
-operation.
-
-Public API is IDENTICAL to the rclpy version — teleop.py call site
-updated only to pass docker_host/docker_port instead of topic; record.py
-is untouched:
-    command(lin_x, ang_z, locked, braking)   ← called by UDP dispatcher
-    state()           → raw pre-gate values  ← used by stream overlay
-    published_state() → post-gate values     ← used by recorder
-    start() / stop()
-
-Behavior preserved from rclpy version:
-    - Watchdog: zero output if no command within motion_watchdog_sec.
-    - robot_lock=True  → zero output.
-    - brake=True       → zero output.
-    - ang_z multiplied by ang_z_scale (default 0.20).
-    - Sends 3× zero on stop() for safety.
-
-Wire protocol:
-    JSON  {"lin_x": <float>, "ang_z": <float>}
-    UDP   127.0.0.1:56000  (default; override via docker_host/docker_port)
+Everything else (UDP forward to Docker, watchdog, lidar gate, published_state)
+is unchanged.
 """
 
 import json
@@ -71,40 +43,28 @@ class MotionController:
         self._publish_hz    = max(1, publish_hz)
         self._watchdog      = watchdog_sec
         self._ang_z_scale   = ang_z_scale
-        # Optional safety hook: called every publish tick with the current
-        # commanded lin_x. If it returns True, we zero output for this tick.
-        # Intended use: LidarReader.is_blocked_forward, which only fires when
-        # commanded forward AND the front bubble is tripped on a fresh scan.
-        # None disables the gate entirely.
         self._lidar_block_fn = lidar_block_fn
 
-        # State (protected by _lock)
         self._lock          = threading.Lock()
         self._lin_x         = 0.0
         self._ang_z         = 0.0
-        self._locked        = True   # start locked for safety
+        self._locked        = True
         self._braking       = False
         self._last_cmd_t    = 0.0
+        self._ai_enabled    = False   # NEW — driven by gamepad ai_request field
 
-        # Last values actually sent by the publish loop.
-        # Updated synchronously — no ROS subscription timing involved.
-        # published_state() exposes these to the recorder.
         self._last_pub_lin: float = 0.0
         self._last_pub_ang: float = 0.0
 
-        # UDP socket (send-only, reused across ticks)
         self._sock: Optional[socket.socket] = None
-
-        # Publisher loop
         self._stop          = threading.Event()
         self._pub_thread    = threading.Thread(
             target=self._publish_loop, daemon=True, name="motion-pub"
         )
 
-    # ── lifecycle ─────────────────────────────────────────────────────────────
+    # ── lifecycle ───────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Open the UDP socket and start the publish loop."""
         try:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._pub_thread.start()
@@ -123,12 +83,9 @@ class MotionController:
             self._pub_thread.join(timeout=1.0)
         except Exception:
             pass
-
-        # Send 3× zero for safety so the Docker keepalive ramps to zero
         for _ in range(3):
             self._send_twist(0.0, 0.0)
             time.sleep(0.02)
-
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -136,10 +93,9 @@ class MotionController:
                 pass
             self._sock = None
 
-    # ── public API ────────────────────────────────────────────────────────────
+    # ── public API ──────────────────────────────────────────────────────────
 
     def command(self, lin_x: float, ang_z: float, locked: bool, braking: bool) -> None:
-        """Update the latest commanded state. Called from the UDP dispatcher."""
         with self._lock:
             self._lin_x      = float(lin_x)
             self._ang_z      = float(ang_z)
@@ -147,48 +103,42 @@ class MotionController:
             self._braking    = bool(braking)
             self._last_cmd_t = time.monotonic()
 
-    def state(self) -> tuple[float, float, bool, bool]:
-        """Raw pre-gate state: (lin_x, ang_z, locked, braking).
+    def set_ai_enabled(self, enabled: bool) -> None:
+        """Called by teleop when gamepad packet contains ai_request=='enable'.
 
-        This is what the teleoperator commanded before ang_z_scale,
-        watchdog, lock, and brake are applied. Used for the stream's
-        speed-badge overlay where showing operator intent is appropriate.
-
-        Do NOT pass this to the recorder. Use published_state() there.
+        Currently only tracked for telemetry. To gate motion, add a check in
+        _compute_output() (e.g. if self._ai_enabled and origin != 'ai': ...).
         """
+        with self._lock:
+            if enabled != self._ai_enabled:
+                self._ai_enabled = enabled
+                log("motion", f"ai_enabled={enabled}")
+
+    def is_ai_enabled(self) -> bool:
+        with self._lock:
+            return self._ai_enabled
+
+    def state(self) -> tuple[float, float, bool, bool]:
         with self._lock:
             return self._lin_x, self._ang_z, self._locked, self._braking
 
     def published_state(self) -> tuple[float, float]:
-        """Return the last (linear_x, angular_z) actually forwarded to Docker.
-
-        Updated synchronously in _publish_loop right after _send_twist,
-        so it always reflects what the robot received: post ang_z_scale,
-        post watchdog, post lock/brake.
-
-        Pass THIS to the recorder, not state().
-        """
         with self._lock:
             return self._last_pub_lin, self._last_pub_ang
 
-    # ── publisher loop ────────────────────────────────────────────────────────
+    # ── publisher loop ──────────────────────────────────────────────────────
 
     def _publish_loop(self) -> None:
         interval = 1.0 / self._publish_hz
         while not self._stop.is_set():
             lin, ang = self._compute_output()
             self._send_twist(lin, ang)
-
-            # Store synchronously so published_state() always reflects
-            # what we just forwarded, without any subscription timing.
             with self._lock:
                 self._last_pub_lin = lin
                 self._last_pub_ang = ang
-
             self._stop.wait(timeout=interval)
 
     def _compute_output(self) -> tuple[float, float]:
-        """Apply all safety gates and return (lin_x, ang_z) to send this tick."""
         with self._lock:
             now         = time.monotonic()
             watchdog_ok = (now - self._last_cmd_t) < self._watchdog
@@ -200,22 +150,16 @@ class MotionController:
         if not watchdog_ok or locked or braking:
             return 0.0, 0.0
 
-        # Lidar safety gate — checked outside the lock so the lidar reader's
-        # internal lock can't deadlock with ours. The fn must be cheap and
-        # non-blocking (LidarReader.is_blocked_forward just copies a dict).
         if self._lidar_block_fn is not None:
             try:
                 if self._lidar_block_fn(lin_x):
                     return 0.0, 0.0
             except Exception as exc:
-                # Don't let a misbehaving safety hook brick motion — log
-                # once-ish and fall through. (log() itself is cheap.)
                 log("motion", f"lidar_block_fn error: {exc}")
 
         return lin_x, ang_z
 
     def _send_twist(self, lin: float, ang: float) -> None:
-        """Send a JSON UDP packet to the Docker ROS1 bridge."""
         if self._sock is None:
             return
         try:
