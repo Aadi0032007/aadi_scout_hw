@@ -89,8 +89,8 @@ class LabConfig:
 
     # ── PTZ ──────────────────────────────────────────────────────────────────
     ptz_ip:                 str   = "192.168.10.50"
-    ptz_port:               int   = 8000
-    ptz_user:               str   = "revolabs"
+    ptz_port:               int   = 80
+    ptz_user:               str   = "admin"
     ptz_pan_speed:          float = 0.65
     ptz_tilt_speed:         float = 0.55
     ptz_loop_hz:            float = 25.0
@@ -165,7 +165,7 @@ class LabConfig:
     gst_rtsp_bind:              str  = "0.0.0.0"
     gst_rtsp_port:              int  = 8556
     gst_hw_encode:              bool = False           # true → nvv4l2h264enc, false → x264enc
-    usb_stream_mount:           str  = "usb-ai"        # → rtsp://<robot>:8556/usb-ai
+    usb_stream_mount:           str  = "ai"        # → rtsp://<robot>:8556/ai
     usb_stream_bitrate_kbps:    int  = 1500            # x264enc bitrate (kbps)
     usb_stream_bitrate_bps:     int  = 1500000         # nvv4l2h264enc bitrate (bps)
     # Watchdog: found live that abandoned client TCP connections pile up in
