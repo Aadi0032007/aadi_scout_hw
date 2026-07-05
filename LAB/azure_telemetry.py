@@ -49,6 +49,30 @@ from typing import Callable, Optional
 
 from .common import log
 
+import logging
+
+# Silence the azure-iot-device SDK and its underlying paho MQTT chatter.
+# Keep WARNING+ so real problems still surface.
+for _name in (
+    "azure",
+    "azure.iot",
+    "azure.iot.device",
+    "azure.iot.device.common",
+    "azure.iot.device.common.mqtt_transport",
+    "azure.iot.device.common.pipeline",
+    "azure.iot.device.iothub",
+    "azure.iot.device.iothub.aio",
+    "azure.iot.device.iothub.abstract_clients",
+    "azure.iot.device.provisioning",
+    "azure.iot.device.provisioning.aio",
+    "azure.iot.device.provisioning.pipeline",
+    "azure.iot.device.provisioning.abstract_provisioning_device_client",
+    "paho",
+    "paho.mqtt",
+    "websockets",
+    "websockets.client",
+):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 
 DPS_HOST        = "global.azure-devices-provisioning.net"
 DEFAULT_WS_BASE = "wss://streams.revobots.ai/api/ws/telemetry"
