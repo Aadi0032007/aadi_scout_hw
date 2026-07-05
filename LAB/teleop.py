@@ -28,9 +28,8 @@ Major structural changes vs previous version:
       per telemetry tick. Real errors still surface.
     - Snapshot now carries lin_x / ang_z straight from motion.published_state()
       (the actual values forwarded to the segway_ros1 UDP endpoint).
-    - Startup prints the full snapshot 10 times at 1 s intervals so every
-      field can be eyeballed as populated (or MISSING) before the console
-      goes quiet.
+    - Startup prints the full snapshot once so every field can be eyeballed
+      as populated (or MISSING) before the console goes quiet.
 """
 
 import json
@@ -522,40 +521,6 @@ def _make_dashboard_snapshot_fn(motion, temphum, gps, battery, speed_label_fn):
     return snapshot
 
 
-def _start_snapshot_debug(snapshot_fn: Callable[[], dict],
-                          passes: int = 10,
-                          initial_delay_sec: float = 5.0,
-                          interval_sec: float = 1.0) -> None:
-    """Background thread: sleep `initial_delay_sec`, then print the full
-    snapshot `passes` times at `interval_sec` intervals. One line per pass,
-    every expected key shown as value or MISSING so it's obvious what isn't
-    being fetched. Runs once at startup, then the thread exits and the
-    console goes quiet.
-    """
-    def worker():
-        time.sleep(initial_delay_sec)
-        log("snapdbg",
-            f"begin — {passes} passes at {interval_sec:.1f}s each "
-            f"(after {initial_delay_sec:.1f}s warmup)")
-        for i in range(1, passes + 1):
-            try:
-                snap = snapshot_fn() or {}
-            except Exception as exc:
-                log("snapdbg", f"{i}/{passes} snapshot error: {exc}")
-                time.sleep(interval_sec)
-                continue
-            parts = [
-                f"{k}={snap[k]}" if k in snap else f"{k}=MISSING"
-                for k in _SNAPSHOT_KEYS
-            ]
-            log("snapdbg", f"{i}/{passes} " + " ".join(parts))
-            if i < passes:
-                time.sleep(interval_sec)
-        log("snapdbg", "done")
-
-    threading.Thread(target=worker, daemon=True, name="snapshot-debug").start()
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  Main
 # ══════════════════════════════════════════════════════════════════════════════
@@ -744,10 +709,19 @@ def main() -> None:
         motion, temphum, gps, battery, lambda: shared.get("speed_label")
     )
 
-    # One-shot startup debug: prints the full snapshot 10 times at 1 s each,
-    # 5 s after ready so sensors have time to populate.
-    _start_snapshot_debug(dashboard_snap, passes=10,
-                          initial_delay_sec=5.0, interval_sec=1.0)
+    # One-shot snapshot dump. Every expected key is shown as value or MISSING
+    # so it's obvious which sources aren't populating. Runs synchronously —
+    # sensors that haven't produced their first reading yet will show MISSING,
+    # which is exactly what you want at startup.
+    try:
+        snap = dashboard_snap() or {}
+        parts = [
+            f"{k}={snap[k]}" if k in snap else f"{k}=MISSING"
+            for k in _SNAPSHOT_KEYS
+        ]
+        log("snapdbg", " ".join(parts))
+    except Exception as exc:
+        log("snapdbg", f"snapshot error: {exc}")
 
     azure_tel = AzureTelemetryPublisher(
         robot_id=robot_id,
