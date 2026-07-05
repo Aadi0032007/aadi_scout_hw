@@ -470,14 +470,23 @@ def main() -> None:
     # imu handle in this batch.
     temphum = gps = battery = None   # TODO: wire from sensors.py
 
-    # Recorder
+    # Recorder — signature per record.py:
+    #   SessionRecorder(base_dir, camera_name, cameras, width, height, fps,
+    #                   video_bitrate, encoder_preference,
+    #                   motion_state_fn=None, gps_get_fn=None)
+    # motion.published_state() is what actually went to the wheels (post-gate),
+    # which is the right thing to log for training.
     recorder = SessionRecorder(
+        base_dir=cfg.cache_dir,
         camera_name=cfg.record_camera_name,
         cameras=cameras,
-        cache_dir=cfg.cache_dir,
-        width=cfg.record_width, height=cfg.record_height, fps=cfg.record_fps,
+        width=cfg.record_width,
+        height=cfg.record_height,
+        fps=cfg.record_fps,
         video_bitrate=cfg.record_video_bitrate,
         encoder_preference=cfg.record_encoder_preference,
+        motion_state_fn=motion.published_state,
+        gps_get_fn=(gps.latest if gps is not None else None),
     )
     recorder.set_robot_lock(True)   # start not recording
 
