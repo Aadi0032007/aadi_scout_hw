@@ -6,7 +6,6 @@ Created on Wed Jun  3 20:04:03 2026
 """
 from __future__ import annotations
 
-# -*- coding: utf-8 -*-
 """
 teleop.py — REDESIGN.
 
@@ -311,7 +310,6 @@ class SessionManager(threading.Thread):
             if pending is None:
                 continue
             if now_mono() - last_t < self._debounce_sec:
-                # still bouncing — reschedule
                 self._wake.set()
                 time.sleep(0.05)
                 continue
@@ -322,9 +320,19 @@ class SessionManager(threading.Thread):
                 continue
             self._current_locked = target
             try:
+                # Recorder is start/stop driven, not flag driven. Unlock →
+                # start(). Lock → stop() and finalize the MP4 + JSONL.
+                # set_robot_lock() is still called so the recorder tick loop
+                # can gate frame writes internally if it wants to.
                 self._recorder.set_robot_lock(target)
+                if target:
+                    log("session", "robot LOCKED — stopping recorder")
+                    self._recorder.stop()
+                else:
+                    log("session", "robot UNLOCKED — starting recorder")
+                    self._recorder.start()
             except Exception as exc:
-                log("teleop", f"recorder lock transition error: {exc}")
+                log("session", f"recorder transition error: {exc}")
 
     def stop(self) -> None:
         self._stop.set()
