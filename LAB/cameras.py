@@ -366,7 +366,7 @@ class RtspServer:
             'src. ! queue leaky=downstream max-size-buffers=0 max-size-bytes=0 '
             'max-size-time=500000000 '
             '! application/x-rtp,media=audio ! decodebin ! audioconvert ! audioresample '
-            '! opusenc bitrate=16000 complexity=3 audio-type=voice bandwidth=wideband '
+            '! opusenc bitrate=32000 complexity=3 audio-type=voice bandwidth=wideband '
             '! rtpopuspay name=pay1 pt=97'
         )
 

@@ -354,63 +354,138 @@ class SessionManager(threading.Thread):
     def stop(self) -> None:
         self._stop.set()
         self._wake.set()
+        try:
+            self.join(timeout=2.0)
+        except Exception:
+            pass
+        # Finalize any in-progress recording. Without this the MP4 never gets
+        # its moov atom (mp4mux needs EOS), the JSONL isn't flushed/closed, and
+        # session.json is never written — i.e. a Ctrl-C mid-recording leaves a
+        # corrupt session. Safe to call when not recording.
+        try:
+            self._recorder.set_robot_lock(True)
+            self._recorder.stop()
+        except Exception as exc:
+            log("session", f"final recorder stop error: {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Sensor snapshot helper for telemetry
+#  Telemetry snapshot helper (dashboard schema, real values)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _make_sensor_snapshot_fn(temphum, gps, battery):
-    """Build the callable telemetry uses to gather sensor fields.
+# Turns commanded lin_x into a 0–100% dashboard bar. Set this to your
+# gamepad's max |lin_x| as seen by motion.published_state(). If lin_x is
+# already normalized to [-1, 1], leave it at 1.0.  << VERIFY on hardware >>
+MAX_LIN_X = 0.75
 
-    All three readers expose get() -> dict (see sensors.py). Missing values
-    are omitted; UdpTelemetryPublisher drops absent keys from the packet.
-    Orientation (heading) comes from the GPS/RTK receiver, not a separate IMU.
+_SPEED_MODE_CUTS = (34.0, 67.0)   # <34 slow, <67 medium, else fast
 
-    Output keys match what UdpTelemetryPublisher looks for:
-        temperature_c, humidity_pct, lat, lon, alt_m, gps_fix,
-        orientation_deg, battery_v
 
-    Reader field names (from sensors.py):
-        temphum.get() → {"temp_c", "temp_f", "humidity_pct", "age_sec"}
-        gps.get()     → {"gps_latitude", "gps_longitude", "gps_altitude",
-                         "gps_status", "gps_fix", "heading_deg_true"/"orientation", …}
-        battery.get() → {"bat_soc", "bat_vol"(mV), "bat_current", "bat_temp",
-                         "bat_charging", "age_sec"}
+def _speed_mode_from_pct(pct: float) -> str:
+    if pct < _SPEED_MODE_CUTS[0]:
+        return "slow"
+    if pct < _SPEED_MODE_CUTS[1]:
+        return "medium"
+    return "fast"
+
+
+def _read_cpu_temp_f() -> Optional[float]:
+    """Jetson CPU temperature in °F from the kernel thermal zones.
+
+    Prefers a zone whose `type` mentions CPU; falls back to the hottest zone.
+    """
+    import glob
+    chosen_c: Optional[float] = None
+    all_c: list = []
+    for zone in glob.glob("/sys/class/thermal/thermal_zone*"):
+        try:
+            with open(f"{zone}/temp") as f:
+                milli = int(f.read().strip())
+        except (OSError, ValueError):
+            continue
+        c = milli / 1000.0
+        all_c.append(c)
+        try:
+            with open(f"{zone}/type") as f:
+                ztype = f.read().strip().lower()
+        except OSError:
+            ztype = ""
+        if chosen_c is None and "cpu" in ztype:
+            chosen_c = c
+    if chosen_c is None and all_c:
+        chosen_c = max(all_c)
+    if chosen_c is None:
+        return None
+    return chosen_c * 9.0 / 5.0 + 32.0
+
+
+def _make_dashboard_snapshot_fn(motion, temphum, gps, battery, speed_label_fn):
+    """Callable AzureTelemetryPublisher invokes each tick, returning REAL values
+    in the dashboard schema. The publisher adds robot_id, ts, up_time, fake.
+
+    Field sources:
+        speed_pct / speed_mode ← motion.published_state() lin_x + gamepad speed label
+        robot_battery_pct      ← battery.get()["bat_soc"]
+        box_temp_F / humidity  ← temphum.get()["temp_f" / "humidity_pct"]
+        cpu_temp_F             ← Jetson thermal zone
+        gps_lat/lng/alt/orient/fix ← gps.get()
+    Missing values are simply omitted.
     """
     def snapshot() -> dict:
         out: dict = {}
 
+        # Speed
         try:
-            if temphum is not None:
-                d = temphum.get()
-                if d.get("temp_c") is not None:
-                    out["temperature_c"] = d["temp_c"]
-                if d.get("humidity_pct") is not None:
-                    out["humidity_pct"] = d["humidity_pct"]
+            lin, _ang = motion.published_state()
+            pct = (min(100.0, abs(float(lin)) / MAX_LIN_X * 100.0) if MAX_LIN_X else 0.0)
+            out["speed_pct"] = round(pct, 1)
         except Exception:
             pass
-
+        label = None
         try:
-            if gps is not None:
-                d = gps.get()
-                if d.get("gps_latitude")  is not None: out["lat"]     = d["gps_latitude"]
-                if d.get("gps_longitude") is not None: out["lon"]     = d["gps_longitude"]
-                if d.get("gps_altitude")  is not None: out["alt_m"]   = d["gps_altitude"]
-                if d.get("gps_fix")       is not None: out["gps_fix"] = d["gps_fix"]
-                heading = d.get("heading_deg_true", d.get("orientation"))
-                if heading is not None:
-                    out["orientation_deg"] = heading
+            label = speed_label_fn()
         except Exception:
             pass
+        out["speed_mode"] = (str(label) if label
+                             else _speed_mode_from_pct(out.get("speed_pct", 0.0)))
 
+        # Battery state of charge
         try:
             if battery is not None:
-                mv = battery.get().get("bat_vol")
-                if mv is not None:
-                    # sensors.py documents bat_vol in mV → volts.
-                    # If a full pack reads ~48000 here instead of ~48, drop the /1000.
-                    out["battery_v"] = round(float(mv) / 1000.0, 2)
+                soc = battery.get().get("bat_soc")
+                if soc is not None:
+                    out["robot_battery_pct"] = round(float(soc), 1)
+        except Exception:
+            pass
+
+        # Enclosure temp + humidity (TEMPerHUM)
+        try:
+            if temphum is not None:
+                th = temphum.get()
+                if th.get("temp_f") is not None:
+                    out["box_temp_F"] = round(float(th["temp_f"]), 1)
+                if th.get("humidity_pct") is not None:
+                    out["humidity_pct"] = round(float(th["humidity_pct"]), 1)
+        except Exception:
+            pass
+
+        # CPU temp (Jetson)
+        cpu_f = _read_cpu_temp_f()
+        if cpu_f is not None:
+            out["cpu_temp_F"] = round(cpu_f, 1)
+
+        # GPS
+        try:
+            if gps is not None:
+                g = gps.get()
+                if g.get("gps_latitude")  is not None: out["gps_lat"]  = round(float(g["gps_latitude"]), 7)
+                if g.get("gps_longitude") is not None: out["gps_lng"]  = round(float(g["gps_longitude"]), 7)
+                if g.get("gps_altitude")  is not None: out["gps_alt"]  = round(float(g["gps_altitude"]), 1)
+                heading = g.get("heading_deg_true", g.get("orientation"))
+                if heading is not None:
+                    out["gps_orient"] = round(float(heading), 1)
+                if g.get("gps_fix") is not None:
+                    out["gps_fix"] = g["gps_fix"]
         except Exception:
             pass
 
@@ -441,9 +516,9 @@ def main() -> None:
     from .motion        import MotionController
     from .ptz           import PtzController
     from .audio         import AudioController
-    from .record        import SessionRecorder
-    from .udp_telemetry import UdpTelemetryPublisher
-    from .local_gamepad import LocalGamepad
+    from .record         import SessionRecorder
+    from .azure_telemetry import AzureTelemetryPublisher
+    from .local_gamepad   import LocalGamepad
     from .sensors       import GpsReader, TempHumReader, BatteryReader, LidarReader
 
     # ── Cameras (RTSP-out + local USB for record/AI) ────────────────────────
@@ -614,24 +689,23 @@ def main() -> None:
         "speed_label": None,   # last seen speed field from motion pkt
     }
 
-    # Telemetry — single path: plain UDP to the Azure VM Tailscale IP.
-    # Reads snapshots from the same subsystem objects. Fields with no
-    # available source are omitted from the outgoing packet.
-    sensor_snap = _make_sensor_snapshot_fn(temphum, gps, battery)
-    robot_id    = os.environ.get("AZURE_DEVICE_ID", "unknown")
-
-    udp_telemetry = UdpTelemetryPublisher(
-        host=cfg.udp_telemetry_host,
-        port=cfg.udp_telemetry_port,
-        hz=cfg.udp_telemetry_hz,
-        robot_id=robot_id,
-        motion_state_fn=motion.state,
-        published_state_fn=motion.published_state,
-        speed_label_fn=lambda: shared.get("speed_label"),
-        ai_enabled_fn=motion.is_ai_enabled,
-        sensor_snapshot_fn=sensor_snap,
+    # Telemetry — dashboard WebSocket (1 Hz) + Azure IoT Hub via DPS (30 s),
+    # real robot values in the dashboard schema. IoT Hub secrets are read from
+    # /etc/revobots/revo.env (AZURE_DEVICE_ID / AZURE_DPS_ID_SCOPE /
+    # AZURE_DPS_PRIMARY_KEY); if absent, only the dashboard WS runs.
+    robot_id = os.environ.get("AZURE_DEVICE_ID", "iwu-scout-001")
+    dashboard_snap = _make_dashboard_snapshot_fn(
+        motion, temphum, gps, battery, lambda: shared.get("speed_label")
     )
-    udp_telemetry.start()
+
+    azure_tel = AzureTelemetryPublisher(
+        robot_id=robot_id,
+        snapshot_fn=dashboard_snap,
+        env_file="/etc/revobots/revo.env",
+        dashboard_interval_s=1.0,
+        iot_interval_s=30.0,
+    )
+    azure_tel.start()
 
     arbiter = SourceArbiter(
         priorities={
@@ -794,7 +868,7 @@ def main() -> None:
         ("udp_motion",    udp_motion),
         ("tcp_events",    tcp_events),
         ("local",         local),
-        ("udp_telemetry", udp_telemetry),
+        ("azure_tel",     azure_tel),
         ("ptz",           ptz),
         ("lights",        lights),
         ("audio",         audio),
