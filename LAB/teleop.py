@@ -591,22 +591,25 @@ def main() -> None:
         lights = None
 
     ptz: Optional[PtzController] = None
-    try:
-        ptz = PtzController(
-            ip=cfg.ptz_ip, port=cfg.ptz_port,
-            user=cfg.ptz_user, password=cfg.ptz_password,
-            pan_speed=cfg.ptz_pan_speed, tilt_speed=cfg.ptz_tilt_speed,
-            loop_hz=cfg.ptz_loop_hz,
-            deadband_sec=cfg.ptz_deadband_sec,
-            stop_after_sec=cfg.ptz_stop_after_sec,
-        )
-        ptz.start()
-        # PTZ has its own lock independent of the drivetrain; unlock now so
-        # the operator can look around, and capture the startup pose as home.
-        ptz.set_ptz_unlock_state(True)
-    except Exception as exc:
-        log("teleop", f"ptz init failed: {exc} — disabled")
-        ptz = None
+    if getattr(cfg, "ptz_enabled", True):
+        try:
+            ptz = PtzController(
+                ip=cfg.ptz_ip, port=cfg.ptz_port,
+                user=cfg.ptz_user, password=(cfg.ptz_password or cfg.camera_password),
+                pan_speed=cfg.ptz_pan_speed, tilt_speed=cfg.ptz_tilt_speed,
+                loop_hz=cfg.ptz_loop_hz,
+                deadband_sec=cfg.ptz_deadband_sec,
+                stop_after_sec=cfg.ptz_stop_after_sec,
+            )
+            ptz.start()
+            # PTZ has its own lock independent of the drivetrain; unlock now so
+            # the operator can look around, and capture the startup pose as home.
+            ptz.set_ptz_unlock_state(True)
+        except Exception as exc:
+            log("teleop", f"ptz init failed: {exc} — disabled")
+            ptz = None
+    else:
+        log("teleop", "ptz disabled by config (ptz_enabled=False)")
 
     audio: Optional[AudioController] = None
     try:
@@ -701,7 +704,7 @@ def main() -> None:
     azure_tel = AzureTelemetryPublisher(
         robot_id=robot_id,
         snapshot_fn=dashboard_snap,
-        env_file="/etc/revobots/revo.env",
+        env_file=str(Path(__file__).parent / ".env"),   # was "/etc/revobots/revo.env"
         dashboard_interval_s=1.0,
         iot_interval_s=30.0,
     )
