@@ -654,13 +654,15 @@ def main() -> None:
     battery: Optional[BatteryReader] = None
     if cfg.battery_enabled:
         try:
+            # Streaming design — no more per-poll timeout / shell exec. See
+            # sensors.py::BatteryReader. `stale_after_sec` is how long we
+            # tolerate silence on /bms_fb before tearing down and respawning.
             battery = BatteryReader(
                 container=cfg.battery_container,
                 topic=cfg.battery_topic,
                 ros_setup=cfg.battery_ros_setup,
                 ws_setup=cfg.battery_ws_setup,
-                poll_sec=cfg.battery_poll_sec,
-                cmd_timeout=cfg.battery_cmd_timeout_sec,
+                stale_after_sec=cfg.battery_stale_after_sec,
             )
             battery.start()
         except Exception as exc:

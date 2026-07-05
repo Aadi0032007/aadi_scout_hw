@@ -8,14 +8,13 @@ from __future__ import annotations
 
 
 """
-Sensor readers — IMU (WIT/JY901 over UART) and GPS (NMEA over UART).
+Sensor readers — IMU (WIT/JY901 over UART), GPS (NMEA over UDP),
+TEMPerHUM (USB HID), Battery (Segway BMS via Docker ROS1).
 
-Both read serial ports directly. No journalctl, no ROS2 subscriptions,
-no external service dependencies. Each runs in a background daemon thread
-and exposes a latest-snapshot via get().
-
-IMU frames are 11 bytes: 0x55, frame_id, 8 payload, checksum.
-GPS sentences are standard NMEA + Unicore UM982 #ADRNAVA extensions.
+Battery reader uses ONE persistent `docker exec rostopic echo` subprocess
+and parses its streaming YAML output. This replaces the previous
+poll-and-timeout design, which was paying the ROS-source + rostopic-startup
+cost per poll and timing out whenever `/bms_fb` published slower than 3 s.
 """
 
 import errno
@@ -537,13 +536,18 @@ class TempHumReader:
             self._stop.wait(timeout=self._poll_sec)
 
 
-# ═══ Battery (Segway BMS via Docker ROS1) ═════════════════════════════════════
+# ═══ Battery (Segway BMS via Docker ROS1, streaming) ══════════════════════════
 #
-# Polls /bms_fb inside the segway_ros1 Docker container via
-# `docker exec ... rostopic echo -n 1 /bms_fb` and parses the YAML-style
-# key/value output rostopic prints. No persistent subprocess — each poll
-# is a fresh `docker exec`, same approach as util_get_battery_charge.sh,
-# just looped and parsed instead of a one-shot print.
+# Previous design shelled out to `rostopic echo -n 1 /bms_fb` every 2 s. That
+# waited for the *next* message and paid the ROS-source + rostopic-startup
+# cost per poll — which is exactly why the 3 s timeouts fired constantly.
+#
+# New design: one persistent `docker exec rostopic echo` subprocess streams
+# messages continuously. Each YAML record (separated by `---`) is parsed and
+# used to update the snapshot dict. `stdbuf -oL` inside the container forces
+# line-buffered stdout so we see records as they arrive rather than in 4 KB
+# chunks. Log spam is throttled to one line on stream start and one on stream
+# loss / respawn.
 #
 # Fields exposed via get():
 #   bat_soc       - state of charge, %
@@ -561,99 +565,153 @@ _BMS_FIELD_RE = re.compile(
 class BatteryReader:
     """Reads Segway BMS state from /bms_fb inside the segway_ros1 container.
 
-    Same get()/start()/stop() pattern as ImuReader/GpsReader. Runs its own
-    polling thread; each tick shells out to `docker exec ... rostopic echo`
-    with a timeout, parses the printed fields, and updates a snapshot dict
-    under a lock.
+    Runs ONE persistent `docker exec ... rostopic echo` subprocess and parses
+    its streaming output. This avoids the fresh-exec overhead per poll (which
+    caused the 3 s timeouts in the previous design — most of the budget was
+    spent sourcing ROS and starting rostopic, not waiting for a message).
+
+    Snapshot dict keys are unchanged: bat_soc, bat_charging, bat_vol,
+    bat_current, bat_temp, age_sec.
+
+    If the subprocess dies or the topic goes silent for `stale_after_sec`,
+    the reader tears it down and respawns with exponential backoff.
     """
 
     def __init__(
         self,
-        container:    str   = "segway_ros1",
-        topic:        str   = "/bms_fb",
-        ros_setup:    str   = "/opt/ros/noetic/setup.bash",
-        ws_setup:     str   = "/root/catkin_ws/devel/setup.bash",
-        poll_sec:     float = 2.0,
-        cmd_timeout:  float = 3.0,
+        container:       str   = "segway_ros1",
+        topic:           str   = "/bms_fb",
+        ros_setup:       str   = "/opt/ros/noetic/setup.bash",
+        ws_setup:        str   = "/root/catkin_ws/devel/setup.bash",
+        stale_after_sec: float = 30.0,
+        # kept for back-compat with existing callers — no-ops in this design.
+        poll_sec:        float = 2.0,
+        cmd_timeout:     float = 3.0,
     ) -> None:
-        self._container   = container
-        self._topic       = topic
-        self._ros_setup   = ros_setup
-        self._ws_setup    = ws_setup
-        self._poll_sec    = max(0.5, float(poll_sec))
-        self._cmd_timeout = cmd_timeout
+        self._container       = container
+        self._topic           = topic
+        self._ros_setup       = ros_setup
+        self._ws_setup        = ws_setup
+        self._stale_after_sec = stale_after_sec
 
         self._data: dict = {}
-        self._last_update: float = 0.0
+        self._last_msg_t: float = 0.0
         self._lock   = threading.Lock()
         self._stop   = threading.Event()
+        self._proc:  Optional[subprocess.Popen] = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="battery-reader")
 
     def start(self) -> None:
         self._thread.start()
-        log("sensors", f"Battery reader started (container={self._container}, topic={self._topic})")
+        log("sensors",
+            f"Battery reader started (container={self._container}, topic={self._topic})")
 
     def get(self) -> dict:
         with self._lock:
             d = dict(self._data)
-        if self._last_update > 0:
-            d["age_sec"] = time.monotonic() - self._last_update
+        if self._last_msg_t > 0:
+            d["age_sec"] = time.monotonic() - self._last_msg_t
         return d
 
     def stop(self) -> None:
         self._stop.set()
+        self._kill_proc()
 
-    # ── internals ─────────────────────────────────────────────────────────────
+    # ── internals ─────────────────────────────────────────────────────────
 
     def _run(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
-            parsed = self._poll_once()
-
-            if parsed is None:
+            proc = self._spawn()
+            if proc is None:
                 self._stop.wait(timeout=backoff)
-                backoff = min(backoff * 2, 10.0)
+                backoff = min(backoff * 2, 30.0)
                 continue
 
+            self._proc = proc
+            log("sensors", "Battery: stream started")
             backoff = 1.0
-            with self._lock:
-                self._data.update(parsed)
-                self._last_update = time.monotonic()
 
-            self._stop.wait(timeout=self._poll_sec)
+            # One YAML "record" per message. rostopic separates them with "---".
+            buf: list = []
+            stream_alive = True
+            last_stale_check = time.monotonic()
 
-    def _poll_once(self) -> Optional[dict]:
-        """Run one `docker exec ... rostopic echo -n 1 /bms_fb` and parse it."""
+            try:
+                assert proc.stdout is not None
+                for raw in proc.stdout:
+                    if self._stop.is_set():
+                        break
+                    line = raw.rstrip("\n")
+                    if line.strip() == "---":
+                        self._flush_record(buf)
+                        buf.clear()
+                    else:
+                        buf.append(line)
+
+                    # Cheap stale check between messages — if the topic dies
+                    # mid-stream, we notice within stale_after_sec instead of
+                    # blocking on readline forever.
+                    now = time.monotonic()
+                    if now - last_stale_check > 5.0:
+                        last_stale_check = now
+                        if (self._last_msg_t > 0
+                                and (now - self._last_msg_t) > self._stale_after_sec):
+                            log("sensors",
+                                f"Battery: no message for "
+                                f"{now - self._last_msg_t:.0f}s — respawning")
+                            stream_alive = False
+                            break
+            except Exception as exc:
+                log("sensors", f"Battery: stream read error: {exc}")
+                stream_alive = False
+
+            if stream_alive and not self._stop.is_set():
+                log("sensors", "Battery: stream ended — respawning")
+
+            self._kill_proc()
+
+    def _spawn(self) -> Optional[subprocess.Popen]:
+        """Start a persistent `docker exec rostopic echo` subprocess.
+
+        `stdbuf -oL` forces rostopic to line-buffer inside the container so we
+        get messages as they arrive, not in 4 KB chunks.
+        """
         cmd = [
             "docker", "exec", "-i", self._container, "bash", "-c",
             f"source {self._ros_setup} && source {self._ws_setup} && "
-            f"rostopic echo -n 1 {self._topic}",
+            f"exec stdbuf -oL rostopic echo {self._topic}",
         ]
         try:
-            result = subprocess.run(
+            return subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 text=True,
-                timeout=self._cmd_timeout,
+                bufsize=1,   # line-buffered on the Python side
             )
-        except subprocess.TimeoutExpired:
-            log("sensors", f"Battery: rostopic echo timed out after {self._cmd_timeout}s")
-            return None
         except Exception as exc:
             log("sensors", f"Battery: docker exec failed: {exc}")
             return None
 
-        if result.returncode != 0:
-            # Container stopped, topic not publishing yet, etc. Don't spam
-            # the log every poll — only at most once per backoff cycle.
-            log("sensors", f"Battery: rostopic echo failed (rc={result.returncode})")
-            return None
+    def _kill_proc(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except Exception:
+            pass
 
-        return self._parse(result.stdout)
-
-    def _parse(self, text: str) -> Optional[dict]:
+    def _flush_record(self, lines: list) -> None:
+        """Parse one YAML record (a full message between `---` separators)."""
         upd: dict = {}
-        for line in text.splitlines():
+        for line in lines:
             m = _BMS_FIELD_RE.match(line)
             if not m:
                 continue
@@ -674,4 +732,8 @@ class BatteryReader:
             elif field == "bat_temp":
                 upd["bat_temp"] = value
 
-        return upd if upd else None
+        if not upd:
+            return
+        with self._lock:
+            self._data.update(upd)
+            self._last_msg_t = time.monotonic()
