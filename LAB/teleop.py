@@ -6,7 +6,6 @@ Created on Wed Jun  3 20:04:03 2026
 """
 from __future__ import annotations
 
-
 """
 teleop.py — REDESIGN.
 
@@ -298,14 +297,23 @@ class SessionManager(threading.Thread):
 
         self._lock = threading.Lock()
         self._last_edge_t = 0.0
+        self._requested_locked: Optional[bool] = None  # last value handed to set_robot_lock
         self._pending_locked: Optional[bool] = None
         self._current_locked = True
         self._stop = threading.Event()
         self._wake = threading.Event()
 
     def set_robot_lock(self, locked: bool) -> None:
+        locked = bool(locked)
         with self._lock:
-            self._pending_locked = bool(locked)
+            # The motion channel re-asserts robot_lock on every packet (~50 Hz).
+            # Only treat a *change* as an edge — otherwise the steady stream of
+            # same-value calls keeps resetting the debounce timer and the
+            # unlock→start / lock→stop transition never fires.
+            if locked == self._requested_locked:
+                return
+            self._requested_locked = locked
+            self._pending_locked = locked
             self._last_edge_t = now_mono()
         self._wake.set()
 
