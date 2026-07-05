@@ -44,6 +44,7 @@ Watchdog:
     unreliable in practice; keeping the proven hard-restart pattern.
 """
 
+
 import os
 import threading
 import time
@@ -178,7 +179,7 @@ class UsbCameraCapture:
             self._publish_enabled = False
             return
         try:
-            from LAB.utils.frame_bus import FrameBusPublisher
+            from .frame_bus import FrameBusPublisher
             h, w, c = frame.shape
             self._publisher = FrameBusPublisher(self.name, height=h, width=w, channels=c)
             log("cameras",
@@ -280,7 +281,13 @@ class RtspServer:
 
         Gst.init(None)
         self._server = GstRtspServer.RTSPServer.new()
-        self._server.props.address = self._cfg.gst_rtsp_bind
+        # Only set the bind address if the user explicitly asked for something
+        # other than the default. Setting props.address = "0.0.0.0" is subtly
+        # different from leaving it unset on some GstRtspServer versions —
+        # the standalone util_rtsp_server.py leaves it default and works,
+        # setting it here breaks Tailscale-IP client access.
+        if self._cfg.gst_rtsp_bind and self._cfg.gst_rtsp_bind not in ("0.0.0.0", ""):
+            self._server.set_address(self._cfg.gst_rtsp_bind)
         self._server.props.service = str(self._cfg.gst_rtsp_port)
         mounts = self._server.get_mount_points()
 
