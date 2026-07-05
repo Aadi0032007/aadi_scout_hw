@@ -291,6 +291,28 @@ class RtspServer:
             factory = GstRtspServer.RTSPMediaFactory.new()
             factory.set_launch(self._rtsp_pipeline(cam))
             factory.set_shared(True)
+            # Match proven-working standalone factory settings.
+            # set_protocols pins the client transport (MediaMTX's UDP pull)
+            # set_suspend_mode=NONE keeps the pipeline hot across client
+            # reconnects so MediaMTX doesn't get stuck on a suspended mount.
+            # set_latency=200 keeps the server-side jitter buffer aligned
+            # with the rtspsrc jitter buffer.
+            try:
+                from gi.repository import GstRtsp
+                if cam.rtsp_transport == "tcp":
+                    factory.set_protocols(GstRtsp.RTSPLowerTrans.TCP)
+                else:
+                    factory.set_protocols(GstRtsp.RTSPLowerTrans.UDP)
+            except Exception:
+                pass
+            try:
+                factory.set_suspend_mode(GstRtspServer.RTSPSuspendMode.NONE)
+            except Exception:
+                pass
+            try:
+                factory.set_latency(200)
+            except Exception:
+                pass
             mounts.add_factory(f"/{cam.name}", factory)
             log("rtsp", f"mount /{cam.name} ← {cam.source} ({cam.rtsp_transport})")
 
@@ -327,14 +349,22 @@ class RtspServer:
     # ── Pipelines ───────────────────────────────────────────────────────────
 
     def _rtsp_pipeline(self, cam: CameraConfig) -> str:
+        """Match the proven-working standalone util_rtsp_server.py pipeline.
+
+        Key settings (learned empirically that MediaMTX needs these):
+            latency=200               — RTP jitter buffer; latency=0 causes
+                                        reorder-drops through MediaMTX
+            drop-on-latency=true      — drop late packets instead of stalling
+            config-interval=1         — send SPS/PPS every 1s so late-joining
+                                        clients don't wait for the next IDR
+        """
         source = self._expand_secret(cam.source)
-        latency = 0 if cam.rtsp_transport == "tcp" else 100
         video = (
             f'rtspsrc location="{source}" protocols={cam.rtsp_transport} '
-            f'latency={latency} name=src '
+            f'latency=200 drop-on-latency=true name=src '
             'src. ! queue ! application/x-rtp,media=video,encoding-name=H264 '
-            '! rtph264depay ! h264parse config-interval=-1 '
-            '! rtph264pay name=pay0 config-interval=-1 pt=96 '
+            '! rtph264depay ! h264parse '
+            '! rtph264pay name=pay0 pt=96 config-interval=1 '
         )
         if not cam.audio:
             return video
