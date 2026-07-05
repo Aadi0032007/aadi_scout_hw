@@ -23,10 +23,12 @@ Behavior:
         - if OFF         → all 3 channels steady on
     Lights OFF button
         - all 3 channels off
-    Left  turn signal → channel 2 blinks at duty cycle blink_period_sec
-                        for signal_timeout_sec (default 5s)
-    Right turn signal → channel 1 blinks at duty cycle blink_period_sec
-                        for signal_timeout_sec (default 5s)
+    Left  turn signal → channel 2 blinks for signal_timeout_sec, then stops
+                        on its own (self-expiry); flick the SAME side again
+                        while active to cancel it early
+    Right turn signal → channel 1 blinks for signal_timeout_sec, then stops
+                        on its own (self-expiry); flick the SAME side again
+                        while active to cancel it early
     Talk event → all 3 channels blink for the talk duration, then restore
                  pre-talk state (matches the old talk-blink UX)
 
@@ -225,20 +227,42 @@ class LightsController:
         log("lights", f"lights envelope ignored (partial): hl={hl} pk={pk} st={st}")
 
     def _handle_indicator(self, data: dict) -> None:
-        """New envelope has a single `side` field: left | right | center."""
+        """Single `side` field: left | right | center.
+
+        Turn signals are self-timing and toggled:
+
+          • Flick a side once  → that side blinks hands-free for
+            signal_timeout_sec, then stops on its own (self-expiry).
+          • Flick the SAME side again while it's active → cancel it now.
+          • Flick the OPPOSITE side → switch: the new side arms, the old
+            side stops.
+          • center — the spring-loaded stick snapping back after a flick — is
+            a NO-OP. It's the *release* of the flick, not a cancel request;
+            zeroing the timers on center is what made the signal blink only
+            once. Left as-is, the active signal keeps running to self-expiry.
+        """
         side = (data.get("side") or "center").strip().lower()
         now = time.monotonic()
         with self._state_lock:
             if side == "left":
-                self._left_until  = now + self._signal_timeout
+                if self._left_until > now:
+                    # already blinking left → second flick cancels it
+                    self._left_until = 0.0
+                    log("lights", "indicator: left cancelled")
+                else:
+                    self._left_until = now + self._signal_timeout
+                    log("lights", f"indicator: left ON ({self._signal_timeout:.0f}s)")
                 self._right_until = 0.0
             elif side == "right":
-                self._left_until  = 0.0
-                self._right_until = now + self._signal_timeout
-            else:
-                self._left_until  = 0.0
-                self._right_until = 0.0
-        log("lights", f"indicator: side={side}")
+                if self._right_until > now:
+                    # already blinking right → second flick cancels it
+                    self._right_until = 0.0
+                    log("lights", "indicator: right cancelled")
+                else:
+                    self._right_until = now + self._signal_timeout
+                    log("lights", f"indicator: right ON ({self._signal_timeout:.0f}s)")
+                self._left_until = 0.0
+            # else: side == "center" → stick released; no-op, let it self-expire
 
     def _handle_talk(self, data: dict) -> None:
         try:
