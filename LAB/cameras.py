@@ -132,9 +132,14 @@ class UsbCameraCapture:
         cfg = self._cfg
         if cfg.hw_decode:
             fmt = cfg.pixel_format.upper()
+            # NOTE: io-mode= is intentionally omitted. io-mode=2 (DMABUF import)
+            # fails on these UVC cams — the driver doesn't export DMABUF, so
+            # v4l2src can't open the device. Letting v4l2src pick (defaults to
+            # MMAP) is what the standalone `gst-launch-1.0 v4l2src ...` uses,
+            # and both /dev/video0 and /dev/video2 stream cleanly that way.
             if fmt == "YUYV":
                 pipeline = (
-                    f"v4l2src device={cfg.source} io-mode=2 ! "
+                    f"v4l2src device={cfg.source} ! "
                     f"video/x-raw,format=YUY2,width={cfg.width},height={cfg.height},"
                     f"framerate={cfg.fps}/1 ! "
                     f"nvvidconv ! video/x-raw,format=BGRx ! "
@@ -143,7 +148,7 @@ class UsbCameraCapture:
                 )
             else:
                 pipeline = (
-                    f"v4l2src device={cfg.source} io-mode=2 ! "
+                    f"v4l2src device={cfg.source} ! "
                     f"image/jpeg,width={cfg.width},height={cfg.height},"
                     f"framerate={cfg.fps}/1 ! "
                     f"nvv4l2decoder mjpeg=1 ! "
