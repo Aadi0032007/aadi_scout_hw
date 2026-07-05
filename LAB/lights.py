@@ -6,7 +6,6 @@ Created on Wed Jun  3 20:04:03 2026
 """
 from __future__ import annotations
 
-# -*- coding: utf-8 -*-
 """
 lights.py — REDESIGN v2 (corrected channel mapping).
 
@@ -48,6 +47,7 @@ not independently controllable. The field is accepted but only participates
 in the "all three True" ON detection.
 """
 
+import os
 import threading
 import time
 from typing import Optional
@@ -86,8 +86,10 @@ class LightsController:
         self._combo_cooldown   = all_lights_cooldown_sec
         self._combo_blink_sec  = all_lights_blink_sec
 
-        # HID device
-        self._dev = None
+        # HID device — self._dev is an int fd (os.open) or None.
+        # No hidapi dependency; same raw-write approach as test_relay.py.
+        self._dev:      Optional[int] = None
+        self._dev_path: Optional[str] = None
         self._dev_lock = threading.Lock()
         self._last_reconnect_log = 0.0
 
@@ -125,8 +127,8 @@ class LightsController:
         with self._dev_lock:
             if self._dev is not None:
                 try:
-                    self._dev.close()
-                except Exception:
+                    os.close(self._dev)
+                except OSError:
                     pass
                 self._dev = None
 
@@ -253,16 +255,64 @@ class LightsController:
     # ── relay write with reconnect (unchanged) ──────────────────────────────
 
     def _open_hid(self) -> None:
-        try:
-            import hid
+        """Find the dcttech relay's /dev/hidraw* node by scanning sysfs.
+
+        No hidapi/pyusb dependency — this uses the same raw file I/O the
+        test_relay.py bench tool uses (os.open + os.write). Report format
+        is 3 bytes: [report_id, command, channel].
+        """
+        path = self._find_hidraw_node()
+        if path is None:
+            log("lights",
+                f"no /dev/hidraw* device matched vid=0x{VENDOR_ID:04x} "
+                f"pid=0x{PRODUCT_ID:04x} — is the relay plugged in?")
             with self._dev_lock:
-                self._dev = hid.Device(vid=VENDOR_ID, pid=PRODUCT_ID)
-            log("lights", f"HID opened vid=0x{VENDOR_ID:04x} pid=0x{PRODUCT_ID:04x}")
-        except ImportError:
-            log("lights", "hidapi not installed — pip install hid")
-        except Exception as exc:
-            log("lights", f"HID open failed: {exc} (check udev rule + plugdev group)")
-            self._dev = None
+                self._dev = None
+            return
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except PermissionError as exc:
+            log("lights",
+                f"HID open PermissionError on {path}: {exc} "
+                f"(need udev rule + plugdev group)")
+            with self._dev_lock:
+                self._dev = None
+            return
+        except OSError as exc:
+            log("lights", f"HID open failed on {path}: {exc}")
+            with self._dev_lock:
+                self._dev = None
+            return
+
+        with self._dev_lock:
+            self._dev = fd
+            self._dev_path = path
+        log("lights", f"HID opened {path} (vid=0x{VENDOR_ID:04x} pid=0x{PRODUCT_ID:04x})")
+
+    @staticmethod
+    def _find_hidraw_node() -> Optional[str]:
+        """Scan /sys/class/hidraw/*/device/uevent for the matching VID:PID.
+
+        `HID_ID=0003:000016C0:000005DF` uniquely identifies the dcttech relay.
+        Preferred over a hardcoded /dev/hidraw2 — the number changes with
+        USB enumeration order.
+        """
+        vid_hex = f"{VENDOR_ID:04X}"
+        pid_hex = f"{PRODUCT_ID:04X}"
+        try:
+            names = sorted(os.listdir("/sys/class/hidraw"))
+        except OSError:
+            return None
+        for name in names:
+            uevent_path = f"/sys/class/hidraw/{name}/device/uevent"
+            try:
+                with open(uevent_path, "r") as f:
+                    body = f.read()
+            except OSError:
+                continue
+            if vid_hex in body.upper() and pid_hex in body.upper():
+                return f"/dev/{name}"
+        return None
 
     def _write_relay(self, channel: int, on: bool) -> None:
         cmd = 0xFF if on else 0xFD
@@ -274,31 +324,37 @@ class LightsController:
                     if self._dev is None:
                         return
                 try:
-                    self._dev.write(payload)
+                    os.write(self._dev, payload)
                     return
-                except Exception as exc:
+                except OSError as exc:
                     msg = str(exc).lower()
                     transient = (
                         "no such device" in msg or "device disconnected" in msg
                         or "i/o error" in msg or "broken pipe" in msg
+                        or "no such file" in msg
                     )
                     try:
-                        self._dev.close()
-                    except Exception:
+                        os.close(self._dev)
+                    except OSError:
                         pass
                     self._dev = None
                     if not transient or attempt == 2:
                         return
 
     def _reopen_hid_locked(self, attempt: int) -> None:
+        """Called while self._dev_lock is held. Try to reopen the hidraw node."""
         now = time.time()
         if now - self._last_reconnect_log >= 1.0:
             log("lights", f"HID reconnect attempt {attempt}")
             self._last_reconnect_log = now
+        path = self._find_hidraw_node()
+        if path is None:
+            self._dev = None
+            return
         try:
-            import hid
-            self._dev = hid.Device(vid=VENDOR_ID, pid=PRODUCT_ID)
-        except Exception:
+            self._dev = os.open(path, os.O_RDWR)
+            self._dev_path = path
+        except OSError:
             self._dev = None
 
     # ── relay state application ─────────────────────────────────────────────
