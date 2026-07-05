@@ -1,5 +1,13 @@
 # -*- coding: utf-8 -*-
 """
+Created on Wed Jun  3 20:04:03 2026
+
+@author: Aadi
+"""
+from __future__ import annotations
+
+
+"""
 teleop.py — REDESIGN.
 
 Major structural changes vs previous version:
@@ -16,11 +24,18 @@ Major structural changes vs previous version:
     - PTZ home capture/return via TCP event: {"type":"ptz","data":{"action":"capture_home"|"goto_home"}}
     - Telemetry publisher pushes state to Azure over UDP.
 
+Subsystem status (this build):
+    - motion, cameras (RTSP-out + record), local gamepad: always on
+    - lights, PTZ, audio: constructed with try/except; disabled on init failure
+      (missing hardware just logs "… init failed — disabled" and keeps going)
+    - sensors (GPS, TempHum, Battery) + lidar: constructed from sensors.py,
+      gated on their config flags. GPS feeds the recorder + telemetry; lidar
+      feeds the motion forward-brake gate when cfg.lidar_safety_brake is set.
+
 Note on local_gamepad: its in-process event packets need to be built in
 the new envelope shape ({type, data} instead of {event, ...}) — see
 patch notes at end of local_gamepad.py update.
 """
-from __future__ import annotations
 
 import json
 import os
@@ -289,21 +304,8 @@ class SessionManager(threading.Thread):
         self._wake = threading.Event()
 
     def set_robot_lock(self, locked: bool) -> None:
-        """Called every motion packet (50 Hz). Only refresh the debounce
-        timer when the value actually changed vs. the last pending target
-        — otherwise 50 Hz of identical values re-arms the debounce forever
-        and the recorder never starts/stops.
-        """
-        locked = bool(locked)
         with self._lock:
-            # If a change is already pending and it matches the new value,
-            # don't touch _last_edge_t. If no pending change and value
-            # matches current, also don't touch (nothing to do).
-            if self._pending_locked == locked:
-                return
-            if self._pending_locked is None and locked == self._current_locked:
-                return
-            self._pending_locked = locked
+            self._pending_locked = bool(locked)
             self._last_edge_t = now_mono()
         self._wake.set()
 
@@ -351,46 +353,44 @@ class SessionManager(threading.Thread):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _make_sensor_snapshot_fn(temphum, gps, battery):
-    """Build the callable that gathers sensor fields for telemetry.
+    """Build the callable telemetry uses to gather sensor fields.
 
-    Uses sensors.py's actual API — `.get()` returns a dict — and remaps
-    to the telemetry field names used by udp_telemetry.py. Missing values
-    are simply omitted so absent readings don't appear in the packet.
+    All three readers expose get() -> dict (see sensors.py). Missing values
+    are omitted; UdpTelemetryPublisher drops absent keys from the packet.
+    Orientation (heading) comes from the GPS/RTK receiver, not a separate IMU.
 
-    sensors.py dict keys (as of current version):
-        TempHumReader.get():   temp_c, temp_f, humidity_pct
-        GpsReader.get():       gps_latitude, gps_longitude, gps_altitude,
-                               gps_status (numeric fix), gps_fix (label),
-                               orientation (heading, degrees)
-        BatteryReader.get():   bat_vol (volts), bat_soc, bat_current,
-                               bat_charging, bat_temp
+    Output keys match what UdpTelemetryPublisher looks for:
+        temperature_c, humidity_pct, lat, lon, alt_m, gps_fix,
+        orientation_deg, battery_v
+
+    Reader field names (from sensors.py):
+        temphum.get() → {"temp_c", "temp_f", "humidity_pct", "age_sec"}
+        gps.get()     → {"gps_latitude", "gps_longitude", "gps_altitude",
+                         "gps_status", "gps_fix", "heading_deg_true"/"orientation", …}
+        battery.get() → {"bat_soc", "bat_vol"(mV), "bat_current", "bat_temp",
+                         "bat_charging", "age_sec"}
     """
     def snapshot() -> dict:
         out: dict = {}
 
         try:
             if temphum is not None:
-                th = temphum.get()
-                if "temp_c" in th:      out["temperature_c"] = th["temp_c"]
-                if "humidity_pct" in th: out["humidity_pct"]  = th["humidity_pct"]
+                d = temphum.get()
+                if d.get("temp_c") is not None:
+                    out["temperature_c"] = d["temp_c"]
+                if d.get("humidity_pct") is not None:
+                    out["humidity_pct"] = d["humidity_pct"]
         except Exception:
             pass
 
         try:
             if gps is not None:
-                g = gps.get()
-                lat = g.get("gps_latitude")
-                lon = g.get("gps_longitude")
-                if lat is not None and lon is not None:
-                    out["lat"] = lat
-                    out["lon"] = lon
-                    alt = g.get("gps_altitude")
-                    if alt is not None:
-                        out["alt_m"] = alt
-                    fix = g.get("gps_status")
-                    if fix is not None:
-                        out["gps_fix"] = fix
-                heading = g.get("orientation")
+                d = gps.get()
+                if d.get("gps_latitude")  is not None: out["lat"]     = d["gps_latitude"]
+                if d.get("gps_longitude") is not None: out["lon"]     = d["gps_longitude"]
+                if d.get("gps_altitude")  is not None: out["alt_m"]   = d["gps_altitude"]
+                if d.get("gps_fix")       is not None: out["gps_fix"] = d["gps_fix"]
+                heading = d.get("heading_deg_true", d.get("orientation"))
                 if heading is not None:
                     out["orientation_deg"] = heading
         except Exception:
@@ -398,12 +398,11 @@ def _make_sensor_snapshot_fn(temphum, gps, battery):
 
         try:
             if battery is not None:
-                b = battery.get()
-                v = b.get("bat_vol")
-                if v is not None:
-                    # /bms_fb publishes volts on this build; if a different
-                    # build sends mV, divide by 1000 here.
-                    out["battery_v"] = v
+                mv = battery.get().get("bat_vol")
+                if mv is not None:
+                    # sensors.py documents bat_vol in mV → volts.
+                    # If a full pack reads ~48000 here instead of ~48, drop the /1000.
+                    out["battery_v"] = round(float(mv) / 1000.0, 2)
         except Exception:
             pass
 
@@ -418,33 +417,82 @@ def _make_sensor_snapshot_fn(temphum, gps, battery):
 def main() -> None:
     cfg = LabConfig.load_secrets()
 
-    log("teleop",
-        f"ports = motion:{cfg.udp_motion_port}(UDP) events:{cfg.tcp_events_port}(TCP)")
+    # ── Startup banner ──────────────────────────────────────────────────────
+    log("teleop", "=" * 60)
+    log("teleop", f"cache_dir  = {cfg.cache_dir}")
+    log("teleop", f"record_fps = {cfg.record_fps}")
+    log("teleop", f"ports      = motion:{cfg.udp_motion_port}(UDP) events:{cfg.tcp_events_port}(TCP)")
+    log("teleop", f"rtsp       = {cfg.gst_rtsp_bind}:{cfg.gst_rtsp_port}  usb_mount=/{cfg.usb_stream_mount}")
+    log("teleop", f"telemetry  = udp://{cfg.udp_telemetry_host}:{cfg.udp_telemetry_port} @ {cfg.udp_telemetry_hz}Hz")
+    log("teleop", "local_gamepad = always enabled")
+    log("teleop", "=" * 60)
 
-    # ── Subsystem construction ──────────────────────────────────────────────
-    from .cameras  import CamerasManager
-    from .lights   import LightsController
-    from .motion   import MotionController
-    from .ptz      import PtzController
-    from .audio    import AudioController
-    from .record   import SessionRecorder
+    # ── Subsystem imports ───────────────────────────────────────────────────
+    from .cameras       import CamerasManager
+    from .lights        import LightsController
+    from .motion        import MotionController
+    from .ptz           import PtzController
+    from .audio         import AudioController
+    from .record        import SessionRecorder
     from .udp_telemetry import UdpTelemetryPublisher
     from .local_gamepad import LocalGamepad
+    from .sensors       import GpsReader, TempHumReader, BatteryReader, LidarReader
 
+    # ── Cameras (RTSP-out + local USB for record/AI) ────────────────────────
     cameras = CamerasManager(cfg)
     cameras.start()
 
+    # ── Lidar (built before motion so its block_fn can gate the drivetrain) ──
+    lidar: Optional[LidarReader] = None
+    if cfg.lidar_enabled:
+        try:
+            lidar = LidarReader(
+                port=cfg.lidar_port,
+                symlink=cfg.lidar_symlink,
+                usb_serial=cfg.lidar_usb_serial,
+                baud=cfg.lidar_baud,
+                poll_hz=cfg.lidar_poll_hz,
+                scan_timeout_sec=cfg.lidar_scan_timeout_sec,
+                range_min=cfg.lidar_range_min_m,
+                range_max=cfg.lidar_range_max_m,
+                min_quality=cfg.lidar_min_quality,
+                front_min_deg=cfg.lidar_front_min_deg,
+                front_max_deg=cfg.lidar_front_max_deg,
+                left_min_deg=cfg.lidar_left_min_deg,
+                left_max_deg=cfg.lidar_left_max_deg,
+                right_min_deg=cfg.lidar_right_min_deg,
+                right_max_deg=cfg.lidar_right_max_deg,
+                bubble_front_m=cfg.lidar_bubble_front_m,
+                bubble_left_m=cfg.lidar_bubble_left_m,
+                bubble_right_m=cfg.lidar_bubble_right_m,
+                stale_after_sec=cfg.lidar_stale_after_sec,
+            )
+            lidar.start()
+        except Exception as exc:
+            log("teleop", f"lidar init failed: {exc} — disabled")
+            lidar = None
+
+    # Forward-brake gate: only wired when lidar is up AND safety brake is on.
+    lidar_block_fn = (
+        lidar.is_blocked_forward
+        if (lidar is not None and cfg.lidar_safety_brake)
+        else None
+    )
+    if lidar_block_fn is not None:
+        log("teleop", "lidar forward-brake gate ENABLED")
+
+    # ── Motion ──────────────────────────────────────────────────────────────
     motion = MotionController(
         docker_host=cfg.docker_motion_host,
         docker_port=cfg.docker_motion_port,
         publish_hz=cfg.motion_publish_hz,
         watchdog_sec=cfg.motion_watchdog_sec,
         ang_z_scale=cfg.ang_z_scale,
-        lidar_block_fn=None,   # wire up once lidar is running
+        lidar_block_fn=lidar_block_fn,
     )
     motion.start()
 
-    # Optional subsystems — construct with try/except, disable on failure
+    # ── Optional actuators — construct with try/except, disable on failure ──
     lights: Optional[LightsController] = None
     try:
         lights = LightsController(
@@ -470,6 +518,9 @@ def main() -> None:
             stop_after_sec=cfg.ptz_stop_after_sec,
         )
         ptz.start()
+        # PTZ has its own lock independent of the drivetrain; unlock now so
+        # the operator can look around, and capture the startup pose as home.
+        ptz.set_ptz_unlock_state(True)
     except Exception as exc:
         log("teleop", f"ptz init failed: {exc} — disabled")
         ptz = None
@@ -490,31 +541,31 @@ def main() -> None:
         log("teleop", f"audio init failed: {exc} — disabled")
         audio = None
 
-    # ── Sensors: GPS (UDP fan-out from gps_mux), TempHum (USB HID),
-    # Battery (docker exec rostopic echo /bms_fb). IMU is intentionally
-    # left out — orientation is read from GPS instead per spec.
-    from .sensors import GpsReader, TempHumReader, BatteryReader
-    temphum = gps = battery = None
+    # ── Sensors (GPS / TempHum / Battery) ───────────────────────────────────
+    # GPS is always constructed — it feeds both the recorder and telemetry.
+    # Orientation comes from the GPS/RTK receiver, not a separate IMU.
+    gps: Optional[GpsReader] = None
+    try:
+        gps = GpsReader(udp_host=cfg.gps_udp_host, udp_port=cfg.gps_udp_port)
+        gps.start()
+    except Exception as exc:
+        log("teleop", f"gps init failed: {exc} — disabled")
+        gps = None
 
+    temphum: Optional[TempHumReader] = None
     if cfg.temphum_enabled:
         try:
             temphum = TempHumReader(
-                vid=cfg.temphum_vid, pid=cfg.temphum_pid,
+                vid=cfg.temphum_vid,
+                pid=cfg.temphum_pid,
                 poll_sec=cfg.temphum_poll_sec,
-                stale_after_sec=cfg.temphum_stale_after_sec,
             )
             temphum.start()
         except Exception as exc:
             log("teleop", f"temphum init failed: {exc} — disabled")
             temphum = None
 
-    try:
-        gps = GpsReader(host=cfg.gps_udp_host, port=cfg.gps_udp_port)
-        gps.start()
-    except Exception as exc:
-        log("teleop", f"gps init failed: {exc} — disabled")
-        gps = None
-
+    battery: Optional[BatteryReader] = None
     if cfg.battery_enabled:
         try:
             battery = BatteryReader(
@@ -523,18 +574,14 @@ def main() -> None:
                 ros_setup=cfg.battery_ros_setup,
                 ws_setup=cfg.battery_ws_setup,
                 poll_sec=cfg.battery_poll_sec,
-                cmd_timeout_sec=cfg.battery_cmd_timeout_sec,
-                stale_after_sec=cfg.battery_stale_after_sec,
+                cmd_timeout=cfg.battery_cmd_timeout_sec,
             )
             battery.start()
         except Exception as exc:
             log("teleop", f"battery init failed: {exc} — disabled")
             battery = None
 
-    # Recorder — signature per record.py:
-    #   SessionRecorder(base_dir, camera_name, cameras, width, height, fps,
-    #                   video_bitrate, encoder_preference,
-    #                   motion_state_fn=None, gps_get_fn=None)
+    # ── Recorder ────────────────────────────────────────────────────────────
     # motion.published_state() is what actually went to the wheels (post-gate),
     # which is the right thing to log for training.
     recorder = SessionRecorder(
@@ -547,7 +594,7 @@ def main() -> None:
         video_bitrate=cfg.record_video_bitrate,
         encoder_preference=cfg.record_encoder_preference,
         motion_state_fn=motion.published_state,
-        gps_get_fn=(gps.latest if gps is not None else None),
+        gps_get_fn=(gps.get if gps is not None else None),
     )
     recorder.set_robot_lock(True)   # start not recording
 
@@ -744,10 +791,11 @@ def main() -> None:
         ("lights",        lights),
         ("audio",         audio),
         ("motion",        motion),
-        ("cameras",       cameras),
-        ("temphum",       temphum),
         ("gps",           gps),
+        ("temphum",       temphum),
         ("battery",       battery),
+        ("lidar",         lidar),
+        ("cameras",       cameras),
     ]:
         if sub is None:
             continue
