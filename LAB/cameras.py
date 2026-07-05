@@ -1,12 +1,5 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Jun  3 20:04:03 2026
-
-@author: Aadi
-"""
-from __future__ import annotations
-
-"""
 cameras.py — REDESIGN.
 
 Two responsibilities merged into one module:
@@ -44,6 +37,7 @@ Watchdog:
     unreliable in practice; keeping the proven hard-restart pattern.
 """
 
+from __future__ import annotations
 
 import os
 import threading
@@ -280,30 +274,23 @@ class RtspServer:
             return
 
         Gst.init(None)
-        self._server = GstRtspServer.RTSPServer.new()
-        # Only set the bind address if the user explicitly asked for something
-        # other than the default. Setting props.address = "0.0.0.0" is subtly
-        # different from leaving it unset on some GstRtspServer versions —
-        # the standalone util_rtsp_server.py leaves it default and works,
-        # setting it here breaks Tailscale-IP client access.
+        # Match the standalone util_rtsp_server.py construction exactly —
+        # different gi bindings versions treat RTSPServer() vs RTSPServer.new()
+        # differently, and the standalone form is known to work with
+        # MediaMTX pulls.
+        self._server = GstRtspServer.RTSPServer()
         if self._cfg.gst_rtsp_bind and self._cfg.gst_rtsp_bind not in ("0.0.0.0", ""):
             self._server.set_address(self._cfg.gst_rtsp_bind)
-        self._server.props.service = str(self._cfg.gst_rtsp_port)
+        self._server.set_service(str(self._cfg.gst_rtsp_port))
         mounts = self._server.get_mount_points()
 
         # ── RTSP passthrough mounts ────────────────────────────────────────
         for cam in self._cfg.cameras:
             if not cam.stream_only:
                 continue
-            factory = GstRtspServer.RTSPMediaFactory.new()
+            factory = GstRtspServer.RTSPMediaFactory()
             factory.set_launch(self._rtsp_pipeline(cam))
             factory.set_shared(True)
-            # Match proven-working standalone factory settings.
-            # set_protocols pins the client transport (MediaMTX's UDP pull)
-            # set_suspend_mode=NONE keeps the pipeline hot across client
-            # reconnects so MediaMTX doesn't get stuck on a suspended mount.
-            # set_latency=200 keeps the server-side jitter buffer aligned
-            # with the rtspsrc jitter buffer.
             try:
                 from gi.repository import GstRtsp
                 if cam.rtsp_transport == "tcp":
@@ -325,7 +312,7 @@ class RtspServer:
 
         # ── USB appsrc mount ───────────────────────────────────────────────
         if self._usb is not None:
-            factory = GstRtspServer.RTSPMediaFactory.new()
+            factory = GstRtspServer.RTSPMediaFactory()
             factory.set_launch(self._usb_pipeline())
             factory.set_shared(True)
             factory.connect("media-configure", self._on_usb_media_configure)

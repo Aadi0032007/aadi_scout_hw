@@ -1,12 +1,5 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Jun  3 20:04:03 2026
-
-@author: Aadi
-"""
-from __future__ import annotations
-
-"""
 teleop.py — REDESIGN.
 
 Major structural changes vs previous version:
@@ -27,6 +20,7 @@ Note on local_gamepad: its in-process event packets need to be built in
 the new envelope shape ({type, data} instead of {event, ...}) — see
 patch notes at end of local_gamepad.py update.
 """
+from __future__ import annotations
 
 import json
 import os
@@ -295,8 +289,21 @@ class SessionManager(threading.Thread):
         self._wake = threading.Event()
 
     def set_robot_lock(self, locked: bool) -> None:
+        """Called every motion packet (50 Hz). Only refresh the debounce
+        timer when the value actually changed vs. the last pending target
+        — otherwise 50 Hz of identical values re-arms the debounce forever
+        and the recorder never starts/stops.
+        """
+        locked = bool(locked)
         with self._lock:
-            self._pending_locked = bool(locked)
+            # If a change is already pending and it matches the new value,
+            # don't touch _last_edge_t. If no pending change and value
+            # matches current, also don't touch (nothing to do).
+            if self._pending_locked == locked:
+                return
+            if self._pending_locked is None and locked == self._current_locked:
+                return
+            self._pending_locked = locked
             self._last_edge_t = now_mono()
         self._wake.set()
 
@@ -344,47 +351,58 @@ class SessionManager(threading.Thread):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _make_sensor_snapshot_fn(temphum, gps, battery):
-    """Build the callable AzureTelemetry uses to gather sensor fields.
+    """Build the callable that gathers sensor fields for telemetry.
 
-    Missing values are simply omitted from the returned dict — the telemetry
-    layer already treats absent keys as "no data" and drops them from the
-    outgoing payload. Orientation (heading) comes from the GPS/RTK receiver,
-    not from a separate IMU.
+    Uses sensors.py's actual API — `.get()` returns a dict — and remaps
+    to the telemetry field names used by udp_telemetry.py. Missing values
+    are simply omitted so absent readings don't appear in the packet.
 
-    Expected reader APIs (adjust here if your sensors.py names differ):
-        temphum.latest()          → (temp_c, humidity_pct, ts) or None
-        gps.latest()              → dict with lat, lon, alt_m, fix, heading_deg
-                                     — or None if no fix yet
-        battery.latest_voltage()  → float volts or None
+    sensors.py dict keys (as of current version):
+        TempHumReader.get():   temp_c, temp_f, humidity_pct
+        GpsReader.get():       gps_latitude, gps_longitude, gps_altitude,
+                               gps_status (numeric fix), gps_fix (label),
+                               orientation (heading, degrees)
+        BatteryReader.get():   bat_vol (volts), bat_soc, bat_current,
+                               bat_charging, bat_temp
     """
     def snapshot() -> dict:
         out: dict = {}
 
         try:
             if temphum is not None:
-                th = temphum.latest()
-                if th:
-                    out["temperature_c"] = th[0]
-                    out["humidity_pct"]  = th[1]
+                th = temphum.get()
+                if "temp_c" in th:      out["temperature_c"] = th["temp_c"]
+                if "humidity_pct" in th: out["humidity_pct"]  = th["humidity_pct"]
         except Exception:
             pass
 
         try:
             if gps is not None:
-                fix = gps.latest()
-                if fix:
-                    out["lat"]             = fix.get("lat")
-                    out["lon"]             = fix.get("lon")
-                    out["alt_m"]           = fix.get("alt_m")
-                    out["gps_fix"]         = fix.get("fix")
-                    out["orientation_deg"] = fix.get("heading_deg")
+                g = gps.get()
+                lat = g.get("gps_latitude")
+                lon = g.get("gps_longitude")
+                if lat is not None and lon is not None:
+                    out["lat"] = lat
+                    out["lon"] = lon
+                    alt = g.get("gps_altitude")
+                    if alt is not None:
+                        out["alt_m"] = alt
+                    fix = g.get("gps_status")
+                    if fix is not None:
+                        out["gps_fix"] = fix
+                heading = g.get("orientation")
+                if heading is not None:
+                    out["orientation_deg"] = heading
         except Exception:
             pass
 
         try:
             if battery is not None:
-                v = battery.latest_voltage()
+                b = battery.get()
+                v = b.get("bat_vol")
                 if v is not None:
+                    # /bms_fb publishes volts on this build; if a different
+                    # build sends mV, divide by 1000 here.
                     out["battery_v"] = v
         except Exception:
             pass
@@ -472,11 +490,46 @@ def main() -> None:
         log("teleop", f"audio init failed: {exc} — disabled")
         audio = None
 
-    # Sensors (temphum / gps / battery / lidar) — construct from sensors.py
-    # here once wired. Left as None so teleop still starts on a bare box.
-    # Orientation comes from the GPS/RTK receiver, not a separate IMU, so no
-    # imu handle in this batch.
-    temphum = gps = battery = None   # TODO: wire from sensors.py
+    # ── Sensors: GPS (UDP fan-out from gps_mux), TempHum (USB HID),
+    # Battery (docker exec rostopic echo /bms_fb). IMU is intentionally
+    # left out — orientation is read from GPS instead per spec.
+    from .sensors import GpsReader, TempHumReader, BatteryReader
+    temphum = gps = battery = None
+
+    if cfg.temphum_enabled:
+        try:
+            temphum = TempHumReader(
+                vid=cfg.temphum_vid, pid=cfg.temphum_pid,
+                poll_sec=cfg.temphum_poll_sec,
+                stale_after_sec=cfg.temphum_stale_after_sec,
+            )
+            temphum.start()
+        except Exception as exc:
+            log("teleop", f"temphum init failed: {exc} — disabled")
+            temphum = None
+
+    try:
+        gps = GpsReader(host=cfg.gps_udp_host, port=cfg.gps_udp_port)
+        gps.start()
+    except Exception as exc:
+        log("teleop", f"gps init failed: {exc} — disabled")
+        gps = None
+
+    if cfg.battery_enabled:
+        try:
+            battery = BatteryReader(
+                container=cfg.battery_container,
+                topic=cfg.battery_topic,
+                ros_setup=cfg.battery_ros_setup,
+                ws_setup=cfg.battery_ws_setup,
+                poll_sec=cfg.battery_poll_sec,
+                cmd_timeout_sec=cfg.battery_cmd_timeout_sec,
+                stale_after_sec=cfg.battery_stale_after_sec,
+            )
+            battery.start()
+        except Exception as exc:
+            log("teleop", f"battery init failed: {exc} — disabled")
+            battery = None
 
     # Recorder — signature per record.py:
     #   SessionRecorder(base_dir, camera_name, cameras, width, height, fps,
@@ -692,6 +745,9 @@ def main() -> None:
         ("audio",         audio),
         ("motion",        motion),
         ("cameras",       cameras),
+        ("temphum",       temphum),
+        ("gps",           gps),
+        ("battery",       battery),
     ]:
         if sub is None:
             continue
