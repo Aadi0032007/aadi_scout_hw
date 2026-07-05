@@ -16,20 +16,22 @@ Major structural changes vs previous version:
     - SessionAndStreamManager collapsed to SessionManager (recorder only).
     - Port 57000 UDP + port 57001 UDP replaced with a single TCP server
       on port 57000. Length-prefixed JSON envelopes, ack per message.
-    - Motion UDP payload trimmed. Fields still consumed:
+    - Motion UDP payload trimmed (no camera/button/a/b/cruise/fwd/accel/
+      priority/record). Fields still consumed:
           robot_lock, lin_x, ang_z, brake, head, speed, ai_request
-    - PTZ home capture/return via TCP event:
-          {"type":"ptz","data":{"action":"capture_home"|"goto_home"}}
-    - Telemetry: Azure dashboard WS + IoT Hub via DPS.
+    - camera field is gone entirely — no more switch_source.
+    - PTZ home capture/return via TCP event: {"type":"ptz","data":{"action":"capture_home"|"goto_home"}}
+    - Telemetry publisher pushes state to Azure over UDP.
     - BatteryReader now streams `docker exec rostopic echo /bms_fb` instead
       of polling per tick — see sensors.py. Teleop passes `stale_after_sec`.
     - azure-iot-device / paho / websockets loggers muted to WARNING at import
       time so the console isn't drowned in `INFO:azure...publishing on ...`
       per telemetry tick. Real errors still surface.
-    - Snapshot now carries lin_x / ang_z straight from motion.published_state()
-      (the actual values forwarded to the segway_ros1 UDP endpoint).
-    - Startup prints the full snapshot once so every field can be eyeballed
-      as populated (or MISSING) before the console goes quiet.
+    - speed_pct in the dashboard snapshot is now the SIGNED lin_x*100 taken
+      straight from motion.published_state() (same value that goes to
+      udp://docker:56000). Reverse comes through as a negative number.
+    - Startup emits one snapshot preview after ~3 s so you can verify what
+      the dashboard sees without waiting for the WS to connect.
 """
 
 import json
@@ -52,8 +54,8 @@ from .config import LabConfig
 # ══════════════════════════════════════════════════════════════════════════════
 # The Azure IoT SDK and its paho MQTT transport log at INFO for every hub
 # reconnect + every message publish. At 1 Hz dashboard + 30 s IoT Hub cadence
-# that's a wall of text per second. Keep WARNING+ so real problems (auth
-# failure, disconnect) still surface.
+# that's a wall of text per second. Websockets is quieter but still chatty on
+# reconnect. Keep WARNING+ so real problems (auth failure, disconnect) surface.
 for _name in (
     "azure",
     "azure.iot",
@@ -147,11 +149,19 @@ LENGTH_PREFIX_SIZE = struct.calcsize(LENGTH_PREFIX_FORMAT)
 
 
 class TcpEventServer:
+    """Accepts one persistent TCP connection from the pilot gamepad.
+
+    Reads {seq, t, type, data} envelopes with 4-byte length prefix framing,
+    dispatches by type, and sends back {ack_of, status, t} on the same
+    socket. If the connection drops, the server keeps listening for the
+    next client.
+    """
+
     def __init__(
         self,
         bind_ip:  str,
         port:     int,
-        on_event: Callable[[dict], tuple[str, Optional[str]]],
+        on_event: Callable[[dict], tuple[str, Optional[str]]],   # → (status, error_or_none)
     ) -> None:
         self._bind = bind_ip
         self._port = port
@@ -304,10 +314,15 @@ def parse_lock_state(pkt: dict, last_known_locked: bool) -> tuple[bool, bool]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Session manager — recorder only
+#  Session manager — recorder only (stream half removed)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SessionManager(threading.Thread):
+    """Coordinates recorder lifecycle around lock/unlock edges.
+
+    Previous version also coordinated a Daily stream; that's gone entirely.
+    """
+
     def __init__(self, recorder, debounce_sec: float = 0.75) -> None:
         super().__init__(daemon=True, name="session-manager")
         self._recorder = recorder
@@ -315,7 +330,7 @@ class SessionManager(threading.Thread):
 
         self._lock = threading.Lock()
         self._last_edge_t = 0.0
-        self._requested_locked: Optional[bool] = None
+        self._requested_locked: Optional[bool] = None  # last value handed to set_robot_lock
         self._pending_locked: Optional[bool] = None
         self._current_locked = True
         self._stop = threading.Event()
@@ -324,6 +339,10 @@ class SessionManager(threading.Thread):
     def set_robot_lock(self, locked: bool) -> None:
         locked = bool(locked)
         with self._lock:
+            # The motion channel re-asserts robot_lock on every packet (~50 Hz).
+            # Only treat a *change* as an edge — otherwise the steady stream of
+            # same-value calls keeps resetting the debounce timer and the
+            # unlock→start / lock→stop transition never fires.
             if locked == self._requested_locked:
                 return
             self._requested_locked = locked
@@ -351,6 +370,10 @@ class SessionManager(threading.Thread):
                 continue
             self._current_locked = target
             try:
+                # Recorder is start/stop driven, not flag driven. Unlock →
+                # start(). Lock → stop() and finalize the MP4 + JSONL.
+                # set_robot_lock() is still called so the recorder tick loop
+                # can gate frame writes internally if it wants to.
                 self._recorder.set_robot_lock(target)
                 if target:
                     log("session", "robot LOCKED — stopping recorder")
@@ -368,6 +391,10 @@ class SessionManager(threading.Thread):
             self.join(timeout=2.0)
         except Exception:
             pass
+        # Finalize any in-progress recording. Without this the MP4 never gets
+        # its moov atom (mp4mux needs EOS), the JSONL isn't flushed/closed, and
+        # session.json is never written — i.e. a Ctrl-C mid-recording leaves a
+        # corrupt session. Safe to call when not recording.
         try:
             self._recorder.set_robot_lock(True)
             self._recorder.stop()
@@ -379,22 +406,9 @@ class SessionManager(threading.Thread):
 #  Telemetry snapshot helper (dashboard schema, real values)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Turns commanded lin_x into a 0–100% dashboard bar. Set this to your
-# gamepad's max |lin_x| as seen by motion.published_state(). If lin_x is
-# already normalized to [-1, 1], leave it at 1.0.  << VERIFY on hardware >>
-MAX_LIN_X = 0.75
-
+# Cutoffs for the categorical speed_mode fallback, in absolute percent.
+# Only used when the gamepad doesn't supply an explicit speed label.
 _SPEED_MODE_CUTS = (34.0, 67.0)   # <34 slow, <67 medium, else fast
-
-# Every key the snapshot may emit. Used by the 10-pass startup debug printer
-# so a MISSING field is obvious at a glance.
-_SNAPSHOT_KEYS = (
-    "lin_x", "ang_z",
-    "speed_pct", "speed_mode",
-    "robot_battery_pct",
-    "box_temp_F", "humidity_pct", "cpu_temp_F",
-    "gps_lat", "gps_lng", "gps_alt", "gps_orient", "gps_fix",
-)
 
 
 def _speed_mode_from_pct(pct: float) -> str:
@@ -406,7 +420,10 @@ def _speed_mode_from_pct(pct: float) -> str:
 
 
 def _read_cpu_temp_f() -> Optional[float]:
-    """Jetson CPU temperature in °F from the kernel thermal zones."""
+    """Jetson CPU temperature in °F from the kernel thermal zones.
+
+    Prefers a zone whose `type` mentions CPU; falls back to the hottest zone.
+    """
     import glob
     chosen_c: Optional[float] = None
     all_c: list = []
@@ -437,10 +454,11 @@ def _make_dashboard_snapshot_fn(motion, temphum, gps, battery, speed_label_fn):
     in the dashboard schema. The publisher adds robot_id, ts, up_time, fake.
 
     Field sources:
-        lin_x / ang_z          ← motion.published_state() — exactly what was
-                                  forwarded to the segway_ros1 UDP endpoint
-                                  this tick (post-scale, post-gate, post-lidar)
-        speed_pct / speed_mode ← lin_x magnitude vs MAX_LIN_X + gamepad label
+        speed_pct              ← motion.published_state() lin_x × 100 (SIGNED —
+                                 reverse comes through negative). This is
+                                 exactly the value going out to udp://docker:56000.
+        speed_mode             ← gamepad "speed" label if present, else derived
+                                 from |speed_pct| via _speed_mode_from_pct.
         robot_battery_pct      ← battery.get()["bat_soc"]
         box_temp_F / humidity  ← temphum.get()["temp_f" / "humidity_pct"]
         cpu_temp_F             ← Jetson thermal zone
@@ -450,32 +468,23 @@ def _make_dashboard_snapshot_fn(motion, temphum, gps, battery, speed_label_fn):
     def snapshot() -> dict:
         out: dict = {}
 
-        # Motion — the real numbers going out on the wire to the ROS1 container.
-        lin: Optional[float] = None
+        # Speed — raw lin_x × 100, sign preserved. Matches what leaves teleop
+        # on the Docker UDP wire (published_state is post ang_z_scale + all
+        # safety gates, and ang_z_scale doesn't touch lin_x).
         try:
-            lin, ang = motion.published_state()
-            out["lin_x"] = round(float(lin), 4)
-            out["ang_z"] = round(float(ang), 4)
+            lin, _ang = motion.published_state()
+            out["speed_pct"] = round(float(lin) * 100.0, 1)
         except Exception:
             pass
-
-        # Speed % derived from the same lin_x we just recorded, so the two
-        # fields always agree — no re-fetch, no race.
-        if lin is not None:
-            try:
-                pct = (min(100.0, abs(float(lin)) / MAX_LIN_X * 100.0)
-                       if MAX_LIN_X else 0.0)
-                out["speed_pct"] = round(pct, 1)
-            except Exception:
-                pass
 
         label = None
         try:
             label = speed_label_fn()
         except Exception:
             pass
+        # Fallback bins are on the magnitude so reverse doesn't get labeled "slow".
         out["speed_mode"] = (str(label) if label
-                             else _speed_mode_from_pct(out.get("speed_pct", 0.0)))
+                             else _speed_mode_from_pct(abs(out.get("speed_pct", 0.0))))
 
         # Battery state of charge
         try:
@@ -521,6 +530,32 @@ def _make_dashboard_snapshot_fn(motion, temphum, gps, battery, speed_label_fn):
     return snapshot
 
 
+def _debug_dump_snapshot_once(snap_fn: Callable[[], dict],
+                              delay_sec: float = 3.0) -> None:
+    """One-shot: wait for sensors to warm up, then log the snapshot dict.
+
+    Runs in a daemon thread so it never blocks startup. The delay gives GPS
+    time for its first NMEA burst, battery its first `/bms_fb` message, and
+    TempHum its first HID read. If a source isn't ready yet, its key is
+    simply absent — same as what the dashboard would receive.
+    """
+    def _run():
+        time.sleep(delay_sec)
+        try:
+            snap = snap_fn() or {}
+        except Exception as exc:
+            log("teleop", f"snapshot dump error: {exc}")
+            return
+        log("teleop", "── snapshot preview ──")
+        if not snap:
+            log("teleop", "    (empty)")
+        else:
+            for k in sorted(snap.keys()):
+                log("teleop", f"    {k} = {snap[k]!r}")
+        log("teleop", "──────────────────────")
+    threading.Thread(target=_run, daemon=True, name="snapshot-dump").start()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Main
 # ══════════════════════════════════════════════════════════════════════════════
@@ -528,6 +563,7 @@ def _make_dashboard_snapshot_fn(motion, temphum, gps, battery, speed_label_fn):
 def main() -> None:
     cfg = LabConfig.load_secrets()
 
+    # ── Startup banner ──────────────────────────────────────────────────────
     log("teleop", "=" * 60)
     log("teleop", f"cache_dir  = {cfg.cache_dir}")
     log("teleop", f"record_fps = {cfg.record_fps}")
@@ -537,6 +573,7 @@ def main() -> None:
     log("teleop", "local_gamepad = always enabled")
     log("teleop", "=" * 60)
 
+    # ── Subsystem imports ───────────────────────────────────────────────────
     from .cameras       import CamerasManager
     from .lights        import LightsController
     from .motion        import MotionController
@@ -547,9 +584,11 @@ def main() -> None:
     from .local_gamepad   import LocalGamepad
     from .sensors       import GpsReader, TempHumReader, BatteryReader, LidarReader
 
+    # ── Cameras (RTSP-out + local USB for record/AI) ────────────────────────
     cameras = CamerasManager(cfg)
     cameras.start()
 
+    # ── Lidar (built before motion so its block_fn can gate the drivetrain) ──
     lidar: Optional[LidarReader] = None
     if cfg.lidar_enabled:
         try:
@@ -579,6 +618,7 @@ def main() -> None:
             log("teleop", f"lidar init failed: {exc} — disabled")
             lidar = None
 
+    # Forward-brake gate: only wired when lidar is up AND safety brake is on.
     lidar_block_fn = (
         lidar.is_blocked_forward
         if (lidar is not None and cfg.lidar_safety_brake)
@@ -587,6 +627,7 @@ def main() -> None:
     if lidar_block_fn is not None:
         log("teleop", "lidar forward-brake gate ENABLED")
 
+    # ── Motion ──────────────────────────────────────────────────────────────
     motion = MotionController(
         docker_host=cfg.docker_motion_host,
         docker_port=cfg.docker_motion_port,
@@ -597,6 +638,7 @@ def main() -> None:
     )
     motion.start()
 
+    # ── Optional actuators — construct with try/except, disable on failure ──
     lights: Optional[LightsController] = None
     try:
         lights = LightsController(
@@ -623,6 +665,8 @@ def main() -> None:
                 stop_after_sec=cfg.ptz_stop_after_sec,
             )
             ptz.start()
+            # PTZ has its own lock independent of the drivetrain; unlock now so
+            # the operator can look around, and capture the startup pose as home.
             ptz.set_ptz_unlock_state(True)
         except Exception as exc:
             log("teleop", f"ptz init failed: {exc} — disabled")
@@ -646,6 +690,9 @@ def main() -> None:
         log("teleop", f"audio init failed: {exc} — disabled")
         audio = None
 
+    # ── Sensors (GPS / TempHum / Battery) ───────────────────────────────────
+    # GPS is always constructed — it feeds both the recorder and telemetry.
+    # Orientation comes from the GPS/RTK receiver, not a separate IMU.
     gps: Optional[GpsReader] = None
     try:
         gps = GpsReader(udp_host=cfg.gps_udp_host, udp_port=cfg.gps_udp_port)
@@ -685,6 +732,9 @@ def main() -> None:
             log("teleop", f"battery init failed: {exc} — disabled")
             battery = None
 
+    # ── Recorder ────────────────────────────────────────────────────────────
+    # motion.published_state() is what actually went to the wheels (post-gate),
+    # which is the right thing to log for training.
     recorder = SessionRecorder(
         base_dir=cfg.cache_dir,
         camera_name=cfg.record_camera_name,
@@ -697,40 +747,37 @@ def main() -> None:
         motion_state_fn=motion.published_state,
         gps_get_fn=(gps.get if gps is not None else None),
     )
-    recorder.set_robot_lock(True)
+    recorder.set_robot_lock(True)   # start not recording
 
     session_mgr = SessionManager(recorder)
     session_mgr.start()
 
-    shared: dict = {"speed_label": None}
+    # ── Shared mutable state visible to dispatchers ─────────────────────────
+    shared: dict = {
+        "speed_label": None,   # last seen speed field from motion pkt
+    }
 
+    # Telemetry — dashboard WebSocket (1 Hz) + Azure IoT Hub via DPS (30 s),
+    # real robot values in the dashboard schema. IoT Hub secrets are read from
+    # /etc/revobots/revo.env (AZURE_DEVICE_ID / AZURE_DPS_ID_SCOPE /
+    # AZURE_DPS_PRIMARY_KEY); if absent, only the dashboard WS runs.
     robot_id = os.environ.get("AZURE_DEVICE_ID", "iwu-scout-001")
     dashboard_snap = _make_dashboard_snapshot_fn(
         motion, temphum, gps, battery, lambda: shared.get("speed_label")
     )
 
-    # One-shot snapshot dump. Every expected key is shown as value or MISSING
-    # so it's obvious which sources aren't populating. Runs synchronously —
-    # sensors that haven't produced their first reading yet will show MISSING,
-    # which is exactly what you want at startup.
-    try:
-        snap = dashboard_snap() or {}
-        parts = [
-            f"{k}={snap[k]}" if k in snap else f"{k}=MISSING"
-            for k in _SNAPSHOT_KEYS
-        ]
-        log("snapdbg", " ".join(parts))
-    except Exception as exc:
-        log("snapdbg", f"snapshot error: {exc}")
-
     azure_tel = AzureTelemetryPublisher(
         robot_id=robot_id,
         snapshot_fn=dashboard_snap,
-        env_file=str(Path(__file__).parent / ".env"),
+        env_file=str(Path(__file__).parent / ".env"),   # was "/etc/revobots/revo.env"
         dashboard_interval_s=1.0,
         iot_interval_s=30.0,
     )
     azure_tel.start()
+
+    # One-shot snapshot preview so you can eyeball what the dashboard sees
+    # (or notice keys that are missing) without waiting for the WS to prove it.
+    _debug_dump_snapshot_once(dashboard_snap, delay_sec=3.0)
 
     arbiter = SourceArbiter(
         priorities={
@@ -741,6 +788,8 @@ def main() -> None:
     )
     lock_state = {"locked": True}
     prev_state = {"speed_label": None}
+
+    # ── Motion dispatcher (trimmed schema) ──────────────────────────────────
 
     def on_motion_packet(pkt: dict, addr, port: int) -> None:
         source = "local" if pkt.get("_local") else "remote"
@@ -761,9 +810,13 @@ def main() -> None:
 
         motion.command(lin, ang, locked, brake)
 
+        # AI-enable: gamepad sends "enable" for N packets after chord press
         ai_request = pkt.get("ai_request")
         if ai_request == "enable":
             motion.set_ai_enabled(True)
+        # Note: there's no explicit "disable" over the wire today. Add one
+        # when you decide how AI mode ends (chord press again? explicit
+        # button? timeout?).
 
         if lights is not None:
             lights.set_robot_lock(locked)
@@ -771,6 +824,7 @@ def main() -> None:
         if lock_present:
             session_mgr.set_robot_lock(locked)
 
+        # PTZ head (kept — head is still in the trimmed payload)
         if ptz is not None:
             head = pkt.get("head")
             if head:
@@ -783,7 +837,10 @@ def main() -> None:
                         ptz.capture_home()
                     prev_state["speed_label"] = speed_label
 
+    # ── TCP event dispatcher ────────────────────────────────────────────────
+
     def on_event(envelope: dict) -> tuple[str, Optional[str]]:
+        """Return (status, error_or_none) so the TCP server can ack."""
         type_ = (envelope.get("type") or "").strip().lower()
         data  = envelope.get("data") or {}
 
@@ -806,6 +863,8 @@ def main() -> None:
                 return "ok", None
 
             if type_ == "talk":
+                # Two effects for talk: (1) trigger the light blink,
+                # (2) speak the text if present.
                 if lights is not None:
                     lights.command(envelope)
                 if audio is not None:
@@ -836,12 +895,17 @@ def main() -> None:
         except Exception as exc:
             return "error", f"handler_exception:{exc}"
 
+    # ── Wire listeners ──────────────────────────────────────────────────────
+
     udp_motion = UdpListener(cfg.udp_listen_ip, cfg.udp_motion_port, "motion",
                              on_motion_packet)
     tcp_events = TcpEventServer(cfg.udp_listen_ip, cfg.tcp_events_port, on_event)
     udp_motion.start()
     tcp_events.start()
 
+    # Local gamepad — same dispatchers, in-process. Motion callbacks accept
+    # (pkt, addr, port); events callback needs the same signature so the
+    # local path looks identical to the TCP one from teleop's view.
     local = LocalGamepad(
         on_motion=on_motion_packet,
         on_events=lambda envelope, addr, port: on_event(envelope),
@@ -850,6 +914,8 @@ def main() -> None:
     )
     local.start()
     log("teleop", "local gamepad started")
+
+    # ── Signal handling & main wait ─────────────────────────────────────────
 
     running = threading.Event()
     running.set()
@@ -867,6 +933,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
 
+    # ── Shutdown ────────────────────────────────────────────────────────────
     log("teleop", "shutting down…")
     session_mgr.stop()
     for name, sub in [
