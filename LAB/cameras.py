@@ -132,6 +132,9 @@ class UsbCameraCapture:
         cfg = self._cfg
         if cfg.hw_decode:
             fmt = cfg.pixel_format.upper()
+            # io-mode=2 = GST_V4L2_IO_MMAP — the safe, explicit choice for UVC.
+            # Leaving it off makes v4l2src fall back to auto-negotiation, which
+            # is flakier on these HD USB Camera devices.
             if fmt == "YUYV":
                 pipeline = (
                     f"v4l2src device={cfg.source} io-mode=2 ! "
@@ -371,7 +374,22 @@ class RtspServer:
         )
 
     def _usb_pipeline(self) -> str:
-        """Appsrc pipeline for USB streaming. Frames arrive as BGR from Python."""
+        """Appsrc pipeline for USB streaming. Frames arrive as BGR from Python.
+
+        Fixes for "connects but no video" (vs the initial version):
+          • config-interval=1 on both h264parse and rtph264pay so SPS/PPS
+            are re-sent every 1s. Every client joins mid-stream (the pipeline
+            goes PLAYING before any client connects), so the default
+            "send SPS/PPS once at start" leaves clients with an undecodable
+            stream. The proven passthrough pipeline uses config-interval=1;
+            the USB path needs the same.
+          • x264enc byte-stream=true + explicit stream-format/alignment caps
+            so h264parse doesn't have to reformat. Without this, on some
+            GStreamer versions the caps negotiation with rtph264pay stalls
+            and no RTP packets ever come out.
+          • Queue with leaky=downstream between encoder and payloader so a
+            slow client can't backpressure into the encoder.
+        """
         cfg = self._cfg
         usb = self._usb
         w, h, fps = usb._cfg.width, usb._cfg.height, usb._cfg.fps
@@ -381,7 +399,9 @@ class RtspServer:
         )
 
         if cfg.gst_hw_encode:
-            # Jetson NVENC path — BGR → NV12 → NVMM → nvv4l2h264enc
+            # Jetson NVENC path — BGR → NV12 → NVMM → nvv4l2h264enc.
+            # insert-sps-pps=1 makes NVENC emit SPS/PPS with every IDR so
+            # config-interval=1 on rtph264pay has parameter sets to send.
             encoder = (
                 "videoconvert ! video/x-raw,format=NV12 ! "
                 "nvvidconv ! 'video/x-raw(memory:NVMM),format=NV12' ! "
@@ -389,20 +409,23 @@ class RtspServer:
                 "preset-level=1 profile=0 insert-sps-pps=1 iframeinterval=30 "
             )
         else:
-            # Software x264enc — same settings as the standalone
+            # Software x264enc — force byte-stream so h264parse and rtph264pay
+            # don't have to renegotiate stream-format mid-pipeline.
             encoder = (
                 "videoconvert ! "
                 "x264enc tune=zerolatency speed-preset=superfast "
-                f"bitrate={cfg.usb_stream_bitrate_kbps} key-int-max=30 ! "
-                "video/x-h264,profile=baseline "
+                f"bitrate={cfg.usb_stream_bitrate_kbps} key-int-max=30 "
+                "byte-stream=true ! "
+                "video/x-h264,profile=baseline,stream-format=byte-stream,alignment=au "
             )
 
         return (
             f"appsrc name=usb_src is-live=true format=time do-timestamp=true block=false "
             f"! {appsrc_caps} "
             f"! {encoder} "
-            "! h264parse config-interval=-1 "
-            "! rtph264pay name=pay0 config-interval=-1 pt=96"
+            "! h264parse config-interval=1 "
+            "! queue leaky=downstream max-size-buffers=4 "
+            "! rtph264pay name=pay0 pt=96 config-interval=1"
         )
 
     def _on_usb_media_configure(self, factory, media):
@@ -411,12 +434,32 @@ class RtspServer:
         With shared=True the same pipeline serves all clients, so the feeder
         is typically created once per server lifetime (or after the pipeline
         is torn down and rebuilt on last-client-leaves).
+
+        Also sets appsrc `caps` and related properties directly on the
+        element — the capsfilter in the parse_launch string isn't always
+        enough; some GStreamer versions require caps on the appsrc element
+        itself for push-buffer to succeed.
         """
         pipeline = media.get_element()
         appsrc = pipeline.get_by_name("usb_src")
         if appsrc is None:
             log("rtsp", "USB appsrc not found in pipeline")
             return
+
+        try:
+            from gi.repository import Gst
+            w = self._usb._cfg.width
+            h = self._usb._cfg.height
+            fps = self._usb._cfg.fps
+            caps_str = f"video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1"
+            appsrc.set_property("caps", Gst.Caps.from_string(caps_str))
+            appsrc.set_property("format", Gst.Format.TIME)
+            appsrc.set_property("is-live", True)
+            appsrc.set_property("do-timestamp", True)
+            appsrc.set_property("block", False)
+        except Exception as exc:
+            log("rtsp", f"appsrc property set failed: {exc}")
+
         feeder = _UsbAppsrcFeeder(self._usb, appsrc)
         feeder.start()
         # Stop the feeder when the media is unprepared
@@ -486,27 +529,34 @@ class _UsbAppsrcFeeder:
 
         # Pace by capture rate — read the same fps as configured
         target_period = 1.0 / max(1.0, float(self._usb._cfg.fps))
+        first_push_logged = False
+        push_error_logged = False
 
         while not self._stop.is_set():
             t0 = time.time()
             ts, frame = self._usb.read_latest()
             if frame is not None and ts != self._last_pushed_ts:
                 try:
-                    # Zero-copy wrap of the numpy buffer into a Gst.Buffer.
-                    # We .tobytes() to hand ownership to GStreamer safely —
-                    # a full 640x480x3 memcpy is ~1ms, negligible next to encode.
+                    # Copy the numpy buffer into an owned bytes object and wrap.
+                    # A 640x480x3 memcpy is ~1ms, negligible next to encode.
                     data = frame.tobytes()
                     buf = Gst.Buffer.new_wrapped(data)
                     ret = self._appsrc.emit("push-buffer", buf)
-                    if ret != Gst.FlowReturn.OK:
+                    if ret == Gst.FlowReturn.OK:
+                        if not first_push_logged:
+                            log("rtsp", "USB appsrc: first frame pushed OK")
+                            first_push_logged = True
+                    else:
                         # Encoder / downstream in trouble — drop and continue.
-                        # Common values: FLUSHING (shutdown), ERROR (encoder crashed).
-                        # Not fatal for capture; the RTSP subsystem will recover
-                        # on next client reconnect (or the watchdog restarts us).
-                        pass
+                        # Log once so we notice, but don't spam.
+                        if not push_error_logged:
+                            log("rtsp", f"USB appsrc push-buffer returned {ret.value_nick}")
+                            push_error_logged = True
                     self._last_pushed_ts = ts
-                except Exception:
-                    pass
+                except Exception as exc:
+                    if not push_error_logged:
+                        log("rtsp", f"USB appsrc push exception: {exc}")
+                        push_error_logged = True
 
             elapsed = time.time() - t0
             self._stop.wait(timeout=max(0.0, target_period - elapsed))
