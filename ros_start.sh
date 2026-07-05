@@ -284,12 +284,11 @@ log "Bringing up Segway ROS1 stack..."
 start_stack
 
 log "Starting LAB/teleop.py..."
-cd "$LAB_DIR"
 
 # No 'exec' here: keeping this as a regular foreground child means the
 # EXIT trap above still fires (and runs stop_stack) when teleop.py exits
 # or when systemd sends SIGTERM to this script.
-python3 teleop.py &
+python3 -m LAB.teleop &
 TELEOP_PID=$!
 wait "$TELEOP_PID"
 TELEOP_PID=""
