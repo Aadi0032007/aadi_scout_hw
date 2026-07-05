@@ -38,12 +38,35 @@ log_inline() { echo "[ros_teleop_start $(date '+%H:%M:%S')] $*"; }
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
+# Devices we must NEVER hand to SmartCar (would clobber their baud).
+# Each entry is a symlink path; we resolve to the real /dev/ttyUSB* it points at.
+RESERVED_SYMLINKS=(/dev/um982_gps /dev/rplidar_s2)
+
+_is_reserved() {
+  # $1 = candidate real device path (already resolved)
+  local target
+  for link in "${RESERVED_SYMLINKS[@]}"; do
+    [[ -e "$link" ]] || continue
+    target="$(readlink -f "$link" 2>/dev/null || true)"
+    [[ -n "$target" && "$target" == "$1" ]] && return 0
+  done
+  return 1
+}
+
 detect_tty_dev() {
-  for dev in /dev/ttyUSB0 /dev/ttyACM0 /dev/rpserialport; do
-    if [[ -e "$dev" ]]; then
-      TTY_DEV="$dev"
-      return 0
+  local dev real
+  # Widened from ttyUSB0-only to ttyUSB0..3 so the Segway is found even if
+  # the GPS or lidar enumerated ahead of it.
+  for dev in /dev/ttyUSB0 /dev/ttyUSB1 /dev/ttyUSB2 /dev/ttyUSB3 \
+             /dev/ttyACM0 /dev/rpserialport; do
+    [[ -e "$dev" ]] || continue
+    real="$(readlink -f "$dev" 2>/dev/null || echo "$dev")"
+    if _is_reserved "$real"; then
+      log_inline "detect_tty_dev: skipping $dev ($real) — reserved for GPS/lidar"
+      continue
     fi
+    TTY_DEV="$dev"
+    return 0
   done
   TTY_DEV=""
   return 1
