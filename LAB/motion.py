@@ -9,41 +9,37 @@ from __future__ import annotations
 """
 motion.py — UDP forward to segway_ros1 Docker + human/AI source arbitration.
 
-Transport (unchanged from previous new version):
+Changes vs previous version:
+    - New runtime toggle for the lidar safety brake, driven by WS bubble_mode:
+        motion.set_lidar_block_enabled(bool)   # runtime on/off
+        motion.lidar_block_enabled() -> bool
+      cfg.lidar_safety_brake is now the INITIAL value only.
+    - Watchdog contract is documented: silence zeros velocity (brake in
+      place); it does NOT latch robot_lock. Lock is owned by the WS channel
+      in the new architecture — UDP silence just brakes.
+
+Transport (unchanged):
     JSON {"lin_x", "ang_z"} → udp://docker_host:docker_port at publish_hz.
-    Docker-side keepalive republishes to /cmd_vel inside the container.
 
-Arbitration (ported from the ROS2 version):
+Arbitration (unchanged):
+    Two command sources arbitrated internally with HARD HUMAN PRIORITY.
+    - Human commands win during handback window opened by meaningful input.
+    - AI honored only if set_ai_enabled(True) AND handback closed.
+    - Human brake hard-latches AI off.
+    - Human always authoritative for lock and brake.
+    - Watchdog + lidar_block_fn apply to the selected source.
+    - Lidar gate now respects _lidar_block_enabled (see set_lidar_block_enabled).
 
-  Two command sources are arbitrated internally with HARD HUMAN PRIORITY:
-
-  • Human commands always win during a "handback" window that opens on
-    any meaningful human input and stays open for human_handback_sec
-    (default 2.0s) past the last meaningful sample.
-  • AI commands are only honored when BOTH:
-        1. set_ai_enabled(True) was called (explicit human consent), AND
-        2. the handback window is closed (human is idle).
-  • Human BRAKE is a hard latch — it disables AI until an explicit
-    set_ai_enabled(True) re-enables it.
-  • Human is ALWAYS authoritative for lock and brake. AI cannot unlock
-    and cannot un-brake.
-  • Watchdog / lidar_block_fn apply to whichever source the arbiter
-    picks. Lidar gates AI too — safety trumps source.
-
-Public API (back-compatible; origin defaults to "human"):
+Public API (back-compatible):
     command(lin_x, ang_z, locked, braking, origin="human")
     set_ai_enabled(on: bool)
     ai_enabled() -> bool
-    is_ai_enabled() -> bool          # alias, kept for existing callers
+    is_ai_enabled() -> bool
     human_in_control() -> bool
-    state() -> (lin_x, ang_z, locked, braking)   # active source's pre-gate intent
-    published_state() -> (lin_x, ang_z)          # last values actually sent
-
-Recording note
---------------
-Pass motion.published_state to the recorder, NOT motion.state.
-published_state reflects whichever source the arbiter selected,
-post-scale and post-gate — the same values that reached Docker → /cmd_vel.
+    state() -> (lin_x, ang_z, locked, braking)
+    published_state() -> (lin_x, ang_z)
+    set_lidar_block_enabled(on: bool)      # NEW
+    lidar_block_enabled() -> bool          # NEW
 """
 
 import json
@@ -64,10 +60,11 @@ class MotionController:
         watchdog_sec:        float = 0.30,
         ang_z_scale:         float = 0.20,
         lidar_block_fn:      Optional[Callable[[float], bool]] = None,
+        lidar_block_enabled: bool  = True,
         # ── human-priority arbiter knobs ─────────────────────────────────
         human_handback_sec:  float = 2.0,
         human_idle_deadband: float = 0.05,
-        human_stale_timeout: float = 2.0,   # disable AI if no human packet for this long
+        human_stale_timeout: float = 2.0,
     ) -> None:
         self._docker_host    = docker_host
         self._docker_port    = docker_port
@@ -79,8 +76,7 @@ class MotionController:
         # ── State (protected by _lock) ────────────────────────────────────
         self._lock = threading.Lock()
 
-        # Per-origin latest command: (lin_x, ang_z, locked, braking, t_monotonic)
-        # Human starts LOCKED (safety). AI starts inert AND gated off.
+        # Per-origin latest command
         self._latest_human: tuple[float, float, bool, bool, float] = (
             0.0, 0.0, True, False, 0.0
         )
@@ -88,16 +84,14 @@ class MotionController:
             0.0, 0.0, False, False, 0.0
         )
 
-        # AI control gate. Latched off; flipped on only by an explicit
-        # set_ai_enabled(True) call from teleop on the human's enable chord.
-        # Flipped back off by human brake, human packet going stale, or an
-        # explicit set_ai_enabled(False).
+        # AI control gate (latched off by default; flipped by explicit call).
         self._ai_enabled = False
 
-        # Handback window. While now < _human_active_until, human is "in
-        # control" even if AI is publishing. Extended on every human
-        # command above the idle deadband. After it expires AND AI is
-        # enabled, AI resumes driving.
+        # Runtime lidar brake gate. Toggled at runtime by
+        # motion.set_lidar_block_enabled() driven by WS bubble_mode.
+        self._lidar_block_enabled = bool(lidar_block_enabled)
+
+        # Handback window
         self._human_active_until  = 0.0
         self._human_handback_sec  = float(human_handback_sec)
         self._human_idle_db       = float(human_idle_deadband)
@@ -126,7 +120,8 @@ class MotionController:
                 f"@ {self._publish_hz} Hz "
                 f"(watchdog={self._watchdog*1000:.0f}ms, ang_scale={self._ang_z_scale}, "
                 f"handback={self._human_handback_sec}s, idle_db={self._human_idle_db}, "
-                f"human_stale={self._human_stale_timeout}s)"
+                f"human_stale={self._human_stale_timeout}s, "
+                f"lidar_gate={self._lidar_block_enabled})"
             )
         except Exception as exc:
             log("motion", f"start failed: {exc}")
@@ -137,7 +132,6 @@ class MotionController:
             self._pub_thread.join(timeout=1.0)
         except Exception:
             pass
-        # 3× zero for safety on shutdown
         for _ in range(3):
             self._send_twist(0.0, 0.0)
             time.sleep(0.02)
@@ -158,16 +152,6 @@ class MotionController:
         braking: bool,
         origin:  str = "human",
     ) -> None:
-        """Update the latest command for one source.
-
-        origin = "human" (default, back-compat) or "ai".
-
-        Human path also:
-          • extends the handback window on meaningful input,
-          • latches AI off on brake.
-        AI path only updates the latest-AI tuple — whether it actually
-        drives Docker is decided each publish tick.
-        """
         now = time.monotonic()
         with self._lock:
             if origin == "ai":
@@ -188,19 +172,15 @@ class MotionController:
                 self._human_active_until = now + self._human_handback_sec
 
             if braking:
-                # HARD LATCH: human brake disables AI until explicitly re-enabled.
                 if self._ai_enabled:
                     log("motion", "AI disabled by human brake")
                 self._ai_enabled = False
 
     def set_ai_enabled(self, on: bool) -> None:
-        """Toggle the AI control gate. Called by teleop on the human's
-        explicit enable chord (and any explicit disable path)."""
         with self._lock:
             prev = self._ai_enabled
             self._ai_enabled = bool(on)
             if not on:
-                # Wipe stale AI state so a fresh enable starts clean.
                 self._latest_ai = (0.0, 0.0, False, False, 0.0)
             if prev != self._ai_enabled:
                 log("motion", f"ai_enabled -> {self._ai_enabled}")
@@ -209,30 +189,33 @@ class MotionController:
         with self._lock:
             return self._ai_enabled
 
-    # Alias — matches the pre-arbitration new-motion API so existing
-    # telemetry callers (udp_telemetry, azure_telemetry) keep working.
     def is_ai_enabled(self) -> bool:
         return self.ai_enabled()
 
+    def set_lidar_block_enabled(self, on: bool) -> None:
+        """Runtime toggle for the lidar safety brake (bubble_mode from browser).
+
+        When off, the drivetrain no longer consults lidar_block_fn — motion
+        proceeds regardless of proximity readings. Human brake and watchdog
+        still apply. Off by default in cfg.lidar_safety_brake; the browser
+        owns the runtime state.
+        """
+        with self._lock:
+            prev = self._lidar_block_enabled
+            self._lidar_block_enabled = bool(on)
+            if prev != self._lidar_block_enabled:
+                log("motion",
+                    f"lidar_block_enabled -> {self._lidar_block_enabled}")
+
+    def lidar_block_enabled(self) -> bool:
+        with self._lock:
+            return self._lidar_block_enabled
+
     def human_in_control(self) -> bool:
-        """True iff human is currently driving (handback open or AI gated off)."""
         with self._lock:
             return (time.monotonic() < self._human_active_until) or (not self._ai_enabled)
 
     def state(self) -> tuple[float, float, bool, bool]:
-        """Active source's pre-gate intent: (lin_x, ang_z, locked, braking).
-
-        Returns whichever source the arbiter currently selects — so a UI
-        overlay (speed badge, etc.) reflects whoever is actually driving.
-        Lock and brake are always reported from the human side, since AI
-        cannot unlock or un-brake.
-
-        Respects the watchdog: if the selected source's last packet is
-        older than watchdog_sec, returns 0 for lin/ang so the badge
-        matches what _compute_output actually publishes.
-
-        Do NOT pass this to the recorder. Use published_state().
-        """
         with self._lock:
             now = time.monotonic()
             h_lin, h_ang, h_locked, h_brake, h_t = self._latest_human
@@ -252,12 +235,6 @@ class MotionController:
             return src_lin, src_ang, h_locked, h_brake
 
     def published_state(self) -> tuple[float, float]:
-        """Last (lin_x, ang_z) actually sent to Docker — for the recorder.
-
-        Reflects whichever source was selected by the arbiter, post
-        ang_z_scale and post watchdog/lock/brake/lidar gates. Pass THIS
-        to the recorder, not state().
-        """
         with self._lock:
             return self._last_pub_lin, self._last_pub_ang
 
@@ -274,20 +251,12 @@ class MotionController:
             self._stop.wait(timeout=interval)
 
     def _compute_output(self) -> tuple[float, float]:
-        """Pick a source (human vs AI), then apply universal gates.
-
-        Returns (lin_x, ang_z) to publish this tick — ang_z already
-        scaled by ang_z_scale. Lidar gate applies to both sources.
-        """
         with self._lock:
             now = time.monotonic()
             h_lin, h_ang, h_locked, h_brake, h_t = self._latest_human
             a_lin, a_ang, _a_lk, _a_br,  a_t    = self._latest_ai
 
-            # ── Safety latch: no human packet for too long while AI is enabled ──
-            # Handles gamepad disconnect / network drop. Forces human to
-            # explicitly re-chord to re-enable AI. h_t > 0 guards against
-            # tripping at startup before any human packet has arrived.
+            # Safety latch: no human packet for too long while AI is enabled
             if (self._ai_enabled and h_t > 0.0
                     and (now - h_t) > self._human_stale_timeout):
                 log("motion",
@@ -298,8 +267,6 @@ class MotionController:
 
             ai_enabled      = self._ai_enabled
             handback_active = now < self._human_active_until
-
-            # Source selection. Human wins during handback OR when AI is gated off.
             human_in_control = handback_active or (not ai_enabled)
 
             if human_in_control:
@@ -310,22 +277,27 @@ class MotionController:
             # Per-source watchdog — if the selected source hasn't published
             # within _watchdog seconds, zero. We do NOT fall back to the
             # other source: the selected source going stale is suspicious
-            # and silence is the safe default.
+            # and silence is the safe default. NOTE: this zeroes velocity
+            # (i.e. "apply brake in place") — it does NOT latch robot_lock.
+            # In the new architecture the WS channel owns robot_lock; UDP
+            # silence just brakes so the operator can resume from browser or
+            # after restarting their gamepad.
             watchdog_ok = (now - src_t) < self._watchdog
 
             # Human is authoritative for lock + brake regardless of who drives.
-            # AI cannot unlock and cannot un-brake.
             locked  = h_locked
             braking = h_brake
 
             lin_x = src_lin
             ang_z = src_ang * self._ang_z_scale
 
+            lidar_gate_on = self._lidar_block_enabled
+
         if not watchdog_ok or locked or braking:
             return 0.0, 0.0
 
-        # Lidar safety gate applies to both sources — safety trumps origin.
-        if self._lidar_block_fn is not None:
+        # Lidar safety gate — runtime-togglable via set_lidar_block_enabled.
+        if self._lidar_block_fn is not None and lidar_gate_on:
             try:
                 if self._lidar_block_fn(lin_x):
                     return 0.0, 0.0

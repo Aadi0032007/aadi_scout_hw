@@ -8,30 +8,33 @@ from __future__ import annotations
 
 
 # -*- coding: utf-8 -*-
-"""LabConfig — REDESIGN.
+"""LabConfig — REDESIGN v3 (browser + bridge-server integration).
 
-Removed (from previous version):
-    - udp_events_port  (was 57000 UDP; now TCP)
-    - udp_tts_port     (was 57001; now folded into talk events on TCP)
-    - daily_*          (Daily WebRTC replaced by MediaMTX pull from local GstRtspServer)
-    - stream_*         (no compositor)
-    - pip_*, overlay_* (no compositor)
-    - mic_rtsp_*       (audio mic now handled by gst_rtsp audio branch)
-    - initial_main_source, camera_name_aliases (no source switching)
+Changes vs previous version:
+
+Removed:
+    - tcp_events_port          (was port 57000; events now arrive over the
+                                 fleet WebSocket that the robot connects OUT
+                                 to — see bridge_ws.py)
 
 Added:
-    - tcp_events_port         57000, unified event channel (length-prefixed JSON, acked)
-    - gst_rtsp_bind/_port     bind for the in-process GstRtspServer
-    - gst_hw_encode           true → nvv4l2h264enc, false → x264enc (for USB stream only)
-    - usb_stream_mount        mount name for the USB camera RTSP path
-    - usb_stream_bitrate_*    bitrates for the two encoder branches
-    - azure_telemetry_*       where telemetry UDP is pushed
-    - telemetry_hz            telemetry publish rate
+    - robot_id                 (loaded from ROBOT_ID / AZURE_DEVICE_ID in env)
+    - fleet_ws_url_template    (wss://streams.revobots.ai/api/ws/robot/{robot_id})
+    - fleet_register_url       (https://streams.revobots.ai/api/robots/register)
+    - heartbeat_interval_sec   (default 60s — matches util_robot_heartbeat.py)
+    - fleet_pilot_camera       (which camera the browser opens by default)
+    - fleet_camera_names       (list of camera names as seen by the fleet;
+                                 separate from the internal CameraConfig list)
+    - tailscale_ip_fallback    (used if `tailscale ip -4` fails at register)
 
-Camera list gains a `stream_only: bool` flag. Streaming-only cameras get an
-RTSP passthrough factory in cameras.py and are NEVER opened locally.
-USB (name="ai") stays with publish_frames=True and is the sole camera
-teleop reads directly for record + AI + push-to-mount.
+Unchanged:
+    - udp_motion_port = 55999  (bridge-server writes here; browser writes
+                                 events over WS; local dongle stays in-proc)
+
+Wire model after this redesign:
+    UDP :55999                     → motion only (bridge OR local dongle)
+    WSS → streams.revobots.ai/...  → all non-motion events from browser
+    HTTPS POST /api/robots/register → fleet visibility, every 60s
 """
 
 import os
@@ -52,7 +55,7 @@ class CameraConfig:
     pixel_format:       str  = "MJPG"
     hw_decode:          bool = False
     publish_frames:     bool = False
-    stream_only:        bool = False   # NEW — RTSP passthrough only, never opened locally
+    stream_only:        bool = False   # RTSP passthrough only, never opened locally
 
     @property
     def is_rtsp(self) -> bool:
@@ -72,7 +75,23 @@ class LabConfig:
     # ── Wire protocol ────────────────────────────────────────────────────────
     udp_listen_ip:          str = "0.0.0.0"
     udp_motion_port:        int = 55999      # trimmed motion payload, 50 Hz, unacked
-    tcp_events_port:        int = 57000      # unified event channel, length-prefixed, acked
+    # tcp_events_port removed — events now arrive over the fleet WebSocket.
+
+    # ── Fleet WebSocket + heartbeat ─────────────────────────────────────────
+    # robot_id is overridden from env at load (ROBOT_ID or AZURE_DEVICE_ID).
+    robot_id:               str = "iwu-scout-001"
+    fleet_ws_url_template:  str = "wss://streams.revobots.ai/api/ws/robot/{robot_id}"
+    fleet_register_url:     str = "https://streams.revobots.ai/api/robots/register"
+    heartbeat_interval_sec: int = 60
+    fleet_pilot_camera:     str = "iwu-scout-001-drive"
+    fleet_camera_names:     list = field(default_factory=lambda: [
+        "iwu-scout-001-orbital",
+        "iwu-scout-001-drive",
+        "iwu-scout-001-rear",
+        "iwu-scout-001-ai",
+        "iwu-scout-001-floor",
+    ])
+    tailscale_ip_fallback:  str = "100.109.21.91"
 
     # ── Source priority arbitration ──────────────────────────────────────────
     local_dongle_priority:  int  = 100
@@ -122,12 +141,7 @@ class LabConfig:
     ])
 
     # ── Cameras ──────────────────────────────────────────────────────────────
-    # stream_only=True → RTSP passthrough only, never opened by cameras.py
-    # publish_frames=True → USB, opened locally, frame bus + record + push to /usb-ai
     cameras: list = field(default_factory=lambda: [
-        # RTSP passthrough cameras. Names/IPs match util_rtsp_server.py so
-        # ffplay rtsp://<robot>:8556/<name> pulls the expected stream.
-        # `audio=True` adds the AAC→Opus branch; set audio=False for video-only.
         CameraConfig(
             name="orbital",
             source="rtsp://admin:revolabs123%40@192.168.10.50:554/cam/realmonitor?channel=1&subtype=1",
@@ -149,8 +163,6 @@ class LabConfig:
             audio=False,
             stream_only=True,
         ),
-        # USB AI camera. `audio` is ignored for USB (no audio branch in the
-        # appsrc pipeline); mic capture is handled elsewhere.
         CameraConfig(
             name="ai",
             source="/dev/video2",
@@ -164,19 +176,15 @@ class LabConfig:
     # ── GstRtspServer (in-process, port 8556) ────────────────────────────────
     gst_rtsp_bind:              str  = "0.0.0.0"
     gst_rtsp_port:              int  = 8556
-    gst_hw_encode:              bool = False           # true → nvv4l2h264enc, false → x264enc
-    usb_stream_mount:           str  = "ai"        # → rtsp://<robot>:8556/ai
-    usb_stream_bitrate_kbps:    int  = 1500            # x264enc bitrate (kbps)
-    usb_stream_bitrate_bps:     int  = 1500000         # nvv4l2h264enc bitrate (bps)
-    # Watchdog: found live that abandoned client TCP connections pile up in
-    # CLOSE_WAIT. Same threshold + os._exit(1) pattern as the standalone.
+    gst_hw_encode:              bool = False
+    usb_stream_mount:           str  = "ai"
+    usb_stream_bitrate_kbps:    int  = 1500
+    usb_stream_bitrate_bps:     int  = 1500000
     rtsp_close_wait_interval_sec: int = 30
     rtsp_close_wait_max:          int = 50
 
-    # ── Telemetry: plain UDP to a fixed endpoint (Azure VM via Tailscale) ────
-    # Cheap, no framing, drops-are-fine. Fields with no available source are
-    # omitted from the packet.
-    udp_telemetry_host:     str   = "100.94.48.1"   # Azure VM Tailscale IP
+    # ── Telemetry ────────────────────────────────────────────────────────────
+    udp_telemetry_host:     str   = "100.94.48.1"
     udp_telemetry_port:     int   = 57100
     udp_telemetry_hz:       int   = 5
 
@@ -224,6 +232,8 @@ class LabConfig:
     lidar_bubble_left_m:    float = 0.10
     lidar_bubble_right_m:   float = 0.10
     lidar_stale_after_sec:  float = 2.0
+    # Initial value of the lidar safety brake. Runtime-togglable by the
+    # browser via WS bubble_mode → motion.set_lidar_block_enabled().
     lidar_safety_brake:     bool  = False
 
     # ── Recording ────────────────────────────────────────────────────────────
@@ -246,7 +256,7 @@ class LabConfig:
 
     # ── Secrets ──────────────────────────────────────────────────────────────
     ptz_password:           str   = ""
-    camera_password:        str   = ""     # used by <camera-password> substitution
+    camera_password:        str   = ""
 
     @classmethod
     def load_secrets(cls, env_file: Optional[str] = None) -> "LabConfig":
@@ -256,6 +266,11 @@ class LabConfig:
         secrets = _read_env_file(env_file)
         cfg.ptz_password    = secrets.get("PTZ_PASSWORD", "")
         cfg.camera_password = secrets.get("CAMERA_PASSWORD", "")
+        # robot_id: prefer explicit ROBOT_ID, fall back to AZURE_DEVICE_ID,
+        # then keep the dataclass default. Same precedence as the utils.
+        cfg.robot_id        = (secrets.get("ROBOT_ID")
+                               or secrets.get("AZURE_DEVICE_ID")
+                               or cfg.robot_id)
         if secrets:
             print(f"[config] secrets loaded from {env_file}")
         else:
