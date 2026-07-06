@@ -38,6 +38,7 @@ RECEIVER_SERIAL_BAUD="${RECEIVER_SERIAL_BAUD:-115200}"
 POLARIS_HOSTNAME="${POLARIS_HOSTNAME:-virtualrtk.pointonenav.com}"
 
 POLARIS_BIN="${POLARIS_BIN:-$HOME/Revobots/Polaris/build/examples/serial_port_client}"
+POLARIS_LIB="${POLARIS_LIB:-$HOME/Revobots/Polaris/build}"
 
 MUX_PID=""
 RTK_PID=""
@@ -111,7 +112,11 @@ fi
 echo "[gps_rtk] gps_mux ready (PID ${MUX_PID})"
 
 # ── 2. Launch Polaris RTK client ─────────────────────────────────────────────
+# Polaris ships libpolaris_cpp_client.so and libpolaris_c_client.so in the
+# build tree. The binary was linked without an rpath, so we point the dynamic
+# linker at both directories here. Same pattern as util_um982_rtkgps_driver.sh.
 export GLOG_v="${GLOG_v:-0}"
+export LD_LIBRARY_PATH="${POLARIS_LIB}:${POLARIS_LIB}/c:${LD_LIBRARY_PATH:-}"
 
 HELP_TEXT="$(${POLARIS_BIN} --help 2>&1 || true)"
 EXTRA_ARGS=()
