@@ -359,6 +359,21 @@ def _make_dashboard_snapshot_fn(motion, temphum, gps, battery, speed_label_fn):
     return snapshot
 
 
+_DASHBOARD_EXPECTED_KEYS = (
+    "speed_pct",
+    "speed_mode",
+    "robot_battery_pct",
+    "box_temp_F",
+    "humidity_pct",
+    "cpu_temp_F",
+    "gps_lat",
+    "gps_lng",
+    "gps_alt",
+    "gps_orient",
+    "gps_fix",
+)
+
+
 def _debug_dump_snapshot_once(snap_fn: Callable[[], dict],
                               delay_sec: float = 3.0) -> None:
     def _run():
@@ -374,6 +389,14 @@ def _debug_dump_snapshot_once(snap_fn: Callable[[], dict],
         else:
             for k in sorted(snap.keys()):
                 log("teleop", f"    {k} = {snap[k]!r}")
+        # Highlight what's missing — dashboard columns without a source ready.
+        missing = [k for k in _DASHBOARD_EXPECTED_KEYS if k not in snap]
+        if missing:
+            log("teleop", "── snapshot MISSING ──")
+            for k in missing:
+                log("teleop", f"    {k}  (no source ready yet)")
+        else:
+            log("teleop", "── snapshot: all expected keys present ──")
         log("teleop", "──────────────────────")
     threading.Thread(target=_run, daemon=True, name="snapshot-dump").start()
 
@@ -456,9 +479,88 @@ def _handle_ttd(raw: str) -> None:
         return
     prefix, body = _split_prefix(raw, _TTD_PREFIXES)
     if prefix == "img":
-        log("teleop", f"TODO ttd wallpaper: {body!r}")
+        log("teleop", f"ws ttd wallpaper={body!r} (TODO: no display subsystem)")
     else:
-        log("teleop", f"TODO ttd display_text: {raw!r}")
+        log("teleop", f"ws ttd display_text={raw!r} (TODO: no display subsystem)")
+
+
+def _log_tts_intent(raw: str) -> None:
+    """One-line describe-what-this-tts-message-will-do log."""
+    if not raw:
+        log("teleop", "ws tts (empty)")
+        return
+    prefix, body = _split_prefix(raw, _TTS_PREFIXES)
+    if prefix == "text":
+        preview = body if len(body) <= 60 else body[:57] + "..."
+        log("teleop", f"ws tts speak={preview!r}")
+    elif prefix == "track":
+        log("teleop", f"ws tts music={body!r}")
+    else:
+        preview = raw if len(raw) <= 60 else raw[:57] + "..."
+        log("teleop", f"ws tts speak(free-form)={preview!r}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UDP flow tracker — one-line status transitions, no per-packet noise
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class UdpFlowTracker:
+    """Tracks whether UDP motion packets are actively arriving from a given
+    source label. Logs exactly two transitions:
+
+        [teleop] UDP motion FLOWING from <source> (<addr>)
+        [teleop] UDP motion STOPPED (no packet for <n>s)
+
+    A background watcher thread promotes the "stopped" edge; we don't wait
+    for the next packet to notice silence. Independent of motion.py's
+    per-tick watchdog — this is purely for human-visible logging.
+    """
+
+    def __init__(self, label: str, stall_sec: float = 1.0) -> None:
+        self._label = label
+        self._stall_sec = stall_sec
+        self._lock = threading.Lock()
+        self._last_t = 0.0
+        self._last_addr: Optional[tuple] = None
+        self._flowing = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._watch, daemon=True, name=f"udp-flow-{label}"
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def observe(self, addr: tuple) -> None:
+        """Call once per received UDP packet from this source."""
+        with self._lock:
+            was_flowing = self._flowing
+            self._last_t = now_mono()
+            self._last_addr = addr
+            self._flowing = True
+        if not was_flowing:
+            log("teleop",
+                f"UDP motion FLOWING from {self._label} ({addr[0]}:{addr[1]})")
+
+    def _watch(self) -> None:
+        while not self._stop.is_set():
+            self._stop.wait(timeout=0.25)
+            with self._lock:
+                if not self._flowing:
+                    continue
+                age = now_mono() - self._last_t
+                if age > self._stall_sec:
+                    self._flowing = False
+                    addr = self._last_addr
+            log("teleop",
+                f"UDP motion STOPPED "
+                f"(no packet from {self._label} for {age:.1f}s"
+                + (f", last={addr[0]}:{addr[1]}" if addr else "")
+                + ")")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -695,6 +797,13 @@ def main() -> None:
         "last_volume":      None,
     }
 
+    # UDP flow trackers — one per source label. Independent of motion.py's
+    # per-tick watchdog, purely for human-visible transition logging.
+    udp_flow_remote = UdpFlowTracker("remote (bridge)")
+    udp_flow_local  = UdpFlowTracker("local dongle")
+    udp_flow_remote.start()
+    udp_flow_local.start()
+
     # ──────────────────────────────────────────────────────────────────────
     #  Dispatchers
     # ──────────────────────────────────────────────────────────────────────
@@ -722,6 +831,8 @@ def main() -> None:
         dongle (in-process). Bridge sends a trimmed schema without
         robot_lock; the local dongle sends the richer schema."""
         source = "local" if pkt.get("_local") else "remote"
+        # Log flow transitions only, not per-packet spam.
+        (udp_flow_local if source == "local" else udp_flow_remote).observe(addr)
         arbiter.report(source)
         if not arbiter.is_active(source):
             return
@@ -800,15 +911,11 @@ def main() -> None:
         axis is kept at its current value; motion.py's watchdog zeros both
         on WS silence.
         """
-
         # ── Lock — WS is authoritative ──────────────────────────────────────
         if "lock" in msg:
             _apply_lock_change(truthy(msg["lock"]), "ws")
 
         # ── Drive (single-axis at a time) ───────────────────────────────────
-        # Don't default the missing axis to 0 — that would clobber the other
-        # axis every frame. Read what's present, keep the last-known other
-        # axis, and rely on motion.py's watchdog to zero on silence.
         if "lin_x" in msg or "ang_z" in msg:
             cur_lin, cur_ang_scaled = motion.published_state()
             cur_ang = (cur_ang_scaled / cfg.ang_z_scale
@@ -817,60 +924,67 @@ def main() -> None:
             ang = first_float(msg, ("ang_z",), default=cur_ang)
             motion.command(lin, ang, lock_state["locked"], False,
                            origin="human")
+            if "lin_x" in msg:
+                log("teleop", f"ws drive lin_x={lin:+.3f}")
+            if "ang_z" in msg:
+                log("teleop", f"ws drive ang_z={ang:+.3f}")
 
         # ── PTZ head ────────────────────────────────────────────────────────
         if "head" in msg and ptz is not None:
-            ptz.command(str(msg["head"] or "center"))
+            head_val = str(msg["head"] or "center")
+            ptz.command(head_val)
+            log("teleop", f"ws ptz head={head_val}")
 
-        # ── speed_mode — label only, passthrough to telemetry ───────────────
+        # ── speed_mode — label passthrough ──────────────────────────────────
         if "speed_mode" in msg:
             new_label = str(msg["speed_mode"])
             prev = shared.get("speed_label")
             shared["speed_label"] = new_label
+            log("teleop", f"ws speed_mode={new_label}")
             if prev is not None and prev != new_label and ptz is not None:
                 ptz.capture_home()
 
-        # ── bubble → lidar safety brake toggle ──────────────────────────────
+        # ── bubble → lidar safety brake ─────────────────────────────────────
         if "bubble" in msg:
             on = truthy(msg["bubble"])
             if on != ws_state["last_bubble_mode"]:
                 ws_state["last_bubble_mode"] = on
-                motion.set_lidar_block_enabled(on)
+                motion.set_lidar_block_enabled(on)   # logs internally
 
         # ── AI mode ─────────────────────────────────────────────────────────
         if "AI" in msg:
             on = truthy(msg["AI"])
             if on != ws_state["last_ai_mode"]:
                 ws_state["last_ai_mode"] = on
-                motion.set_ai_enabled(on)
+                motion.set_ai_enabled(on)   # logs internally
 
-        # ── xwalk — crosswalk mode. Log-only until subsystem is defined ────
+        # ── xwalk — log-only until subsystem is defined ────────────────────
         if "xwalk" in msg:
             on = truthy(msg["xwalk"])
             if on != ws_state["last_xwalk"]:
                 ws_state["last_xwalk"] = on
-                log("teleop", f"xwalk -> {on} (no subsystem wired yet)")
+                log("teleop", f"ws xwalk={on} (no subsystem wired yet)")
 
-        # ── yield — yield mode. Log-only until subsystem is defined ────────
+        # ── yield — log-only until subsystem is defined ─────────────────────
         if "yield" in msg:
             on = truthy(msg["yield"])
             if on != ws_state["last_yield"]:
                 ws_state["last_yield"] = on
-                log("teleop", f"yield -> {on} (no subsystem wired yet)")
+                log("teleop", f"ws yield={on} (no subsystem wired yet)")
 
         # ── left_turn / right_turn — turn signal indicators ────────────────
-        # Route through LightsController's indicator handler (same as the
-        # local dongle's flick behavior — 1 arms self-timing blink,
-        # 0 cancels).
         if "left_turn" in msg and lights is not None:
-            side = "left" if truthy(msg["left_turn"]) else "center"
+            on = truthy(msg["left_turn"])
+            side = "left" if on else "center"
             lights.command({"type": "indicator", "data": {"side": side}})
+            log("teleop", f"ws left_turn={'ON' if on else 'off'}")
         if "right_turn" in msg and lights is not None:
-            side = "right" if truthy(msg["right_turn"]) else "center"
+            on = truthy(msg["right_turn"])
+            side = "right" if on else "center"
             lights.command({"type": "indicator", "data": {"side": side}})
+            log("teleop", f"ws right_turn={'ON' if on else 'off'}")
 
-        # ── volume — direct pass to audio, deduped ─────────────────────────
-        # Browser fires the same value twice per slider change; skip repeats.
+        # ── volume ──────────────────────────────────────────────────────────
         if "volume" in msg and audio is not None:
             try:
                 vol = int(msg["volume"])
@@ -878,15 +992,18 @@ def main() -> None:
                 vol = None
             if vol is not None and vol != ws_state["last_volume"]:
                 ws_state["last_volume"] = vol
-                audio.set_volume(vol)
+                audio.set_volume(vol)   # logs internally
 
-        # ── tts — speak text (prefixed OR free-form) OR play music ─────────
+        # ── tts (speech or music) ───────────────────────────────────────────
         if "tts" in msg:
-            _handle_tts(str(msg["tts"] or "").strip(), audio, lights, cfg)
+            raw = str(msg["tts"] or "").strip()
+            _log_tts_intent(raw)
+            _handle_tts(raw, audio, lights, cfg)
 
-        # ── ttd — wallpaper OR display text. No subsystem yet, log only ────
+        # ── ttd (wallpaper or display text) ─────────────────────────────────
         if "ttd" in msg:
-            _handle_ttd(str(msg["ttd"] or "").strip())
+            raw = str(msg["ttd"] or "").strip()
+            _handle_ttd(raw)
 
     # ── Local dongle event dispatcher ──────────────────────────────────────
 
@@ -977,6 +1094,8 @@ def main() -> None:
     # subsystems start tearing down.
     log("teleop", "shutting down…")
     session_mgr.stop()
+    udp_flow_remote.stop()
+    udp_flow_local.stop()
     for name, sub in [
         ("udp_motion",    udp_motion),
         ("bridge_ws",     bridge_ws),
