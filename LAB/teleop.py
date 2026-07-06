@@ -379,6 +379,89 @@ def _debug_dump_snapshot_once(snap_fn: Callable[[], dict],
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  WS "tts" and "ttd" payload handlers
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# The browser overloads two field names:
+#
+#   tts: "text: <words>"       → speech
+#        "track: <file>.wav"   → music
+#        "<words>"             → speech (free-form textbox, no prefix)
+#
+#   ttd: "img: <file>.png"     → wallpaper (no display subsystem yet)
+#        "<words>"             → display text (no display subsystem yet)
+#
+# Prefix matching is case-insensitive and permissive: "text:hi", "text: hi",
+# "TEXT :  hi" all work. Anything not matching a known prefix is treated as
+# the free-form case.
+
+
+_TTS_PREFIXES = ("text", "track")
+_TTD_PREFIXES = ("img",)
+
+
+def _split_prefix(raw: str, known: tuple) -> tuple[str, str]:
+    """Return (prefix_lower, remainder) if the string starts with a known
+    prefix followed by ':'. Otherwise ("", raw) meaning "free-form"."""
+    if ":" not in raw:
+        return "", raw
+    head, tail = raw.split(":", 1)
+    head_l = head.strip().lower()
+    if head_l in known:
+        return head_l, tail.strip()
+    return "", raw
+
+
+def _play_music_by_filename(audio, cfg, filename: str) -> None:
+    """Map a filename from the browser to a track number in cfg.music_tracks,
+    then call audio.play_music(N). Match is case-insensitive on basename."""
+    import os as _os
+    target = _os.path.basename(filename).strip().lower()
+    for track_num, track_file in (cfg.music_tracks or {}).items():
+        if _os.path.basename(track_file).strip().lower() == target:
+            audio.play_music(int(track_num))
+            return
+    log("teleop",
+        f"music track {filename!r} not in cfg.music_tracks — add it to play")
+
+
+def _speak_and_blink(text: str, audio, lights, cfg) -> None:
+    if not text:
+        return
+    if audio is not None:
+        audio.speak(text)
+    if lights is not None:
+        lights.command({
+            "type": "talk",
+            "data": {"text": text, "duration": cfg.talk_default_duration},
+        })
+
+
+def _handle_tts(raw: str, audio, lights, cfg) -> None:
+    if not raw:
+        return
+    prefix, body = _split_prefix(raw, _TTS_PREFIXES)
+    if prefix == "text":
+        _speak_and_blink(body, audio, lights, cfg)
+    elif prefix == "track":
+        if audio is not None and body:
+            _play_music_by_filename(audio, cfg, body)
+    else:
+        # Free-form textbox — treat as speech.
+        _speak_and_blink(raw, audio, lights, cfg)
+
+
+def _handle_ttd(raw: str) -> None:
+    if not raw:
+        return
+    prefix, body = _split_prefix(raw, _TTD_PREFIXES)
+    if prefix == "img":
+        log("teleop", f"TODO ttd wallpaper: {body!r}")
+    else:
+        log("teleop", f"TODO ttd display_text: {raw!r}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Main
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -604,7 +687,13 @@ def main() -> None:
     # Bridge (remote UDP) does NOT touch it.
     lock_state = {"locked": True}
     prev_state = {"speed_label": None}
-    ws_state   = {"last_ai_mode": None, "last_bubble_mode": None}
+    ws_state   = {
+        "last_ai_mode":     None,
+        "last_bubble_mode": None,
+        "last_xwalk":       None,
+        "last_yield":       None,
+        "last_volume":      None,
+    }
 
     # ──────────────────────────────────────────────────────────────────────
     #  Dispatchers
@@ -674,30 +763,66 @@ def main() -> None:
     # ── Fleet WS dispatcher ─────────────────────────────────────────────────
 
     def on_ws_message(msg: dict) -> None:
-        """Flat dict from the browser via streams.revobots.ai relay."""
-        log("teleop", f"[ws-in] {msg}")
-        # 1) Lock — WS is authoritative for the network path.
-        if "robot_lock" in msg:
-            _apply_lock_change(truthy(msg["robot_lock"]), "ws")
+        """Flat dict from the browser via streams.revobots.ai relay.
 
-        # 2) Drive over WS — protocol allows it (see util_receive_browser_cmds
-        #    summarize()), current bridge doesn't send it, but this future-
-        #    proofs browser drive buttons with no extra code. Watchdog in
-        #    motion.py will zero if the browser stops sending.
+        Real observed schema (2026-07 browser build):
+
+          Speech / audio:
+            {"tts": "text: <words>"}         speak text (prefixed)
+            {"tts": "<words>"}               speak text (free-form textbox)
+            {"tts": "track: <file>.wav"}     play music by filename
+            {"volume": 0..100}               audio volume percent
+                                             (browser fires twice per change)
+
+          Display (no subsystem yet — log only):
+            {"ttd": "img: <file>.png"}       set wallpaper by filename
+            {"ttd": "<words>"}               display text (free-form textbox)
+
+          Drivetrain:
+            {"lock": 0|1}                    0=unlocked, 1=locked
+            {"lin_x": float}                 drive; sent alone, not paired
+            {"ang_z": float}                 drive; sent alone, not paired
+            {"speed_mode": "slow|medium|fast"}   label passthrough
+
+          Feature toggles:
+            {"AI": 0|1}                      ai mode on/off
+            {"bubble": 0|1}                  lidar safety brake on/off
+            {"xwalk": 0|1}                   crosswalk mode (subsystem TBD)
+            {"yield": 0|1}                   yield mode (subsystem TBD)
+            {"left_turn": 0|1}               left turn signal (via lights)
+            {"right_turn": 0|1}              right turn signal (via lights)
+            {"head": "left|right|up|down|center"}    PTZ direction
+
+        Every message carries {"seq", "t", "brain"} envelope fields.
+
+        Each button click sends ONLY the changed field — drive fields never
+        arrive paired, so lin_x and ang_z are handled independently. Missing
+        axis is kept at its current value; motion.py's watchdog zeros both
+        on WS silence.
+        """
+
+        # ── Lock — WS is authoritative ──────────────────────────────────────
+        if "lock" in msg:
+            _apply_lock_change(truthy(msg["lock"]), "ws")
+
+        # ── Drive (single-axis at a time) ───────────────────────────────────
+        # Don't default the missing axis to 0 — that would clobber the other
+        # axis every frame. Read what's present, keep the last-known other
+        # axis, and rely on motion.py's watchdog to zero on silence.
         if "lin_x" in msg or "ang_z" in msg:
-            lin = first_float(msg, ("lin_x",), default=0.0)
-            ang = first_float(msg, ("ang_z",), default=0.0)
-            brk = truthy(msg.get("brake", False))
-            motion.command(lin, ang, lock_state["locked"], brk, origin="human")
+            cur_lin, cur_ang_scaled = motion.published_state()
+            cur_ang = (cur_ang_scaled / cfg.ang_z_scale
+                       if cfg.ang_z_scale else 0.0)
+            lin = first_float(msg, ("lin_x",), default=cur_lin)
+            ang = first_float(msg, ("ang_z",), default=cur_ang)
+            motion.command(lin, ang, lock_state["locked"], False,
+                           origin="human")
 
-        # 3) PTZ head from browser. Separate from UDP-side head — last write
-        #    per tick wins in PtzController; acceptable because browser and
-        #    dongle aren't typically active simultaneously.
+        # ── PTZ head ────────────────────────────────────────────────────────
         if "head" in msg and ptz is not None:
-            head = msg["head"] or "center"
-            ptz.command(str(head))
+            ptz.command(str(msg["head"] or "center"))
 
-        # 4) speed_mode — label only, passthrough to telemetry.
+        # ── speed_mode — label only, passthrough to telemetry ───────────────
         if "speed_mode" in msg:
             new_label = str(msg["speed_mode"])
             prev = shared.get("speed_label")
@@ -705,49 +830,63 @@ def main() -> None:
             if prev is not None and prev != new_label and ptz is not None:
                 ptz.capture_home()
 
-        # 5) bubble_mode — toggle lidar safety brake at runtime.
-        if "bubble_mode" in msg:
-            on = truthy(msg["bubble_mode"])
+        # ── bubble → lidar safety brake toggle ──────────────────────────────
+        if "bubble" in msg:
+            on = truthy(msg["bubble"])
             if on != ws_state["last_bubble_mode"]:
                 ws_state["last_bubble_mode"] = on
                 motion.set_lidar_block_enabled(on)
 
-        # 6) ai_mode — direct on/off from browser (chord over gamepad also
-        #    works, they're two independent paths to the same setter).
-        if "ai_mode" in msg:
-            on = truthy(msg["ai_mode"])
+        # ── AI mode ─────────────────────────────────────────────────────────
+        if "AI" in msg:
+            on = truthy(msg["AI"])
             if on != ws_state["last_ai_mode"]:
                 ws_state["last_ai_mode"] = on
                 motion.set_ai_enabled(on)
 
-        # 7) high_visibility — reuse the lights all-on/all-off handler.
-        if "high_visibility" in msg and lights is not None:
-            on = truthy(msg["high_visibility"])
-            lights.command({
-                "type": "lights",
-                "data": {"headlights": on, "parklights": on, "strobe": on},
-            })
+        # ── xwalk — crosswalk mode. Log-only until subsystem is defined ────
+        if "xwalk" in msg:
+            on = truthy(msg["xwalk"])
+            if on != ws_state["last_xwalk"]:
+                ws_state["last_xwalk"] = on
+                log("teleop", f"xwalk -> {on} (no subsystem wired yet)")
 
-        # 8) TTS (browser sends type="stt") — speak + light blink.
-        if msg.get("type") == "stt":
-            text = str(msg.get("text", "") or "").strip()
-            if text:
-                if audio is not None:
-                    audio.speak(text)
-                if lights is not None:
-                    lights.command({
-                        "type": "talk",
-                        "data": {"text": text,
-                                 "duration": cfg.talk_default_duration},
-                    })
+        # ── yield — yield mode. Log-only until subsystem is defined ────────
+        if "yield" in msg:
+            on = truthy(msg["yield"])
+            if on != ws_state["last_yield"]:
+                ws_state["last_yield"] = on
+                log("teleop", f"yield -> {on} (no subsystem wired yet)")
 
-        # 9) charging — passthrough / log only for now.
-        if "charging" in msg:
-            log("teleop", f"charging state from browser: {msg['charging']}")
+        # ── left_turn / right_turn — turn signal indicators ────────────────
+        # Route through LightsController's indicator handler (same as the
+        # local dongle's flick behavior — 1 arms self-timing blink,
+        # 0 cancels).
+        if "left_turn" in msg and lights is not None:
+            side = "left" if truthy(msg["left_turn"]) else "center"
+            lights.command({"type": "indicator", "data": {"side": side}})
+        if "right_turn" in msg and lights is not None:
+            side = "right" if truthy(msg["right_turn"]) else "center"
+            lights.command({"type": "indicator", "data": {"side": side}})
 
-        # 10) display_text / set_wallpaper — no display subsystem yet.
-        if msg.get("type") in ("display_text", "set_wallpaper"):
-            log("teleop", f"TODO {msg.get('type')}: {msg}")
+        # ── volume — direct pass to audio, deduped ─────────────────────────
+        # Browser fires the same value twice per slider change; skip repeats.
+        if "volume" in msg and audio is not None:
+            try:
+                vol = int(msg["volume"])
+            except (TypeError, ValueError):
+                vol = None
+            if vol is not None and vol != ws_state["last_volume"]:
+                ws_state["last_volume"] = vol
+                audio.set_volume(vol)
+
+        # ── tts — speak text (prefixed OR free-form) OR play music ─────────
+        if "tts" in msg:
+            _handle_tts(str(msg["tts"] or "").strip(), audio, lights, cfg)
+
+        # ── ttd — wallpaper OR display text. No subsystem yet, log only ────
+        if "ttd" in msg:
+            _handle_ttd(str(msg["ttd"] or "").strip())
 
     # ── Local dongle event dispatcher ──────────────────────────────────────
 
