@@ -675,7 +675,7 @@ def main() -> None:
 
     def on_ws_message(msg: dict) -> None:
         """Flat dict from the browser via streams.revobots.ai relay."""
-
+        log("teleop", f"[ws-in] {msg}")
         # 1) Lock — WS is authoritative for the network path.
         if "robot_lock" in msg:
             _apply_lock_change(truthy(msg["robot_lock"]), "ws")
