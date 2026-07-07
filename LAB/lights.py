@@ -7,24 +7,32 @@ Created on Wed Jun  3 20:04:03 2026
 from __future__ import annotations
 
 """
-lights.py — REDESIGN v4 (xmas + xwalk-until-off + auto-on-unlock).
+lights.py — REDESIGN v5 (xwalk-until-off + speaker amp on ch6).
 
-Relay wiring (dcttech HID relay, VID 0x16c0 PID 0x05df):
+Relay wiring (dcttech USBRelay8, VID 0x16c0 PID 0x05df, 8 channels).
+The same physical board hosts lights AND the speaker amplifier — the
+amp powers on only when the robot is unlocked, so a locked robot is
+silent as well as dark.
 
     channel 1  →  right taillight + right halo
     channel 2  →  left  taillight + left  halo
     channel 3  →  headlights (with strobe wiring — one on/off)
-    channel 4  →  xmas lights
+    channel 4  →  xmas lights                 (xwalk-exclusive)
+    channel 5  →  (unused — leave off)
+    channel 6  →  speaker amplifier           (unlock-gated)
+    channel 7  →  (unused — leave off)
+    channel 8  →  (unused — leave off)
 
 Behavior:
 
     UNLOCK EDGE (robot goes unlocked)
         - channels 1, 2, 3 latch STEADY ON automatically
         - channel 4 (xmas) stays off
-        - Same as pressing lights-ON, but automatic.
+        - channel 6 (speaker amp) turns ON            ← NEW
+        - channels 5, 7, 8 stay off
 
     LOCK EDGE (robot goes locked)
-        - all channels off
+        - all channels off (including channel 6 → amp powered down)
         - all pending signals/blinks cancelled
 
     Turn signals (from indicator envelope)
@@ -33,20 +41,20 @@ Behavior:
         - Flick same side again while active → cancel
         - Suppressed while xwalk-blink is running
 
-    Xwalk (from xwalk envelope) — CHANGED
-        - on=True  → all 4 channels (1, 2, 3, 4) blink together and STAY
-                     blinking until explicitly turned off
+    Xwalk (from xwalk envelope)
+        - on=True  → all 4 light channels (1, 2, 3, 4) blink together and
+                     STAY blinking until explicitly turned off
         - on=False → cancel immediately, restore prior steady state
+        - Never touches channel 6 (amp) — speaker stays on through xwalk.
 
     Talk (from talk envelope)
         - Channels 1, 2, 3 blink for the talk duration
         - Then restore prior state (channels 1,2,3 back to steady-on-if-unlocked)
-        - Xmas (channel 4) NOT part of talk-blink — talk is a smaller subset
+        - Xmas (ch 4) and amp (ch 6) NOT part of talk-blink.
 
     Lights ON/OFF envelope (from browser high_visibility)
         - Only meaningful while LOCKED — since unlock already turns 1,2,3 on
-        - While unlocked: lights follow lock state, high_visibility ignored
-          (prevents accidentally killing safety lights while driving)
+        - While unlocked: lights follow lock state, high_visibility ignored.
 
 Wire schema (TCP/WS event envelope):
 
@@ -55,12 +63,16 @@ Wire schema (TCP/WS event envelope):
     {"type":"talk",      "data":{"text":str,"duration":float}}
     {"type":"xwalk",     "data":{"on":bool}}
 
-Precedence per channel (highest wins):
+Precedence per LIGHT channel (highest wins):
     1. robot_locked            → all off
-    2. xwalk-blink             → all 4 blink (includes xmas), persists until off
+    2. xwalk-blink             → ch 1,2,3,4 blink (persists until off)
     3. Turn signal (ch 1 or 2) → that side blinks
     4. Talk-blink              → channels 1,2,3 blink
     5. Steady lights_on flag   → channels 1,2,3 on/off (auto from lock state)
+
+Channel 6 (amp) does NOT participate in the precedence stack — it is a
+plain function of `_robot_locked`. Any lock edge writes ch 6; nothing
+else touches it.
 
 Note on strobe: shares channel 3 wiring with headlights. Not independently
 controllable. Field is accepted but only participates in the all-three-True
@@ -86,17 +98,25 @@ PRODUCT_ID = 0x05df
 CH_TAIL_HALO_RIGHT = 1
 CH_TAIL_HALO_LEFT  = 2
 CH_HEADLIGHTS      = 3
-CH_XMAS            = 4      # used by xwalk only
+CH_XMAS            = 4      # xwalk-exclusive
+# channel 5 unused
+CH_SPEAKER_AMP     = 6      # unlock-gated — audio amp power
+# channels 7, 8 unused
 
 # Channels that participate in "lights on" (unlock-auto-on) and talk-blink.
 # Xmas is intentionally excluded — it's xwalk-exclusive.
 LIGHTS_ON_CHANNELS = (CH_HEADLIGHTS, CH_TAIL_HALO_LEFT, CH_TAIL_HALO_RIGHT)
 
-# Channels that blink together on xwalk — ALL four including xmas.
+# Channels that blink together on xwalk — the four light channels.
+# Amp (ch 6) does NOT blink; audio should stay usable during xwalk.
 XWALK_CHANNELS = (CH_HEADLIGHTS, CH_TAIL_HALO_LEFT, CH_TAIL_HALO_RIGHT, CH_XMAS)
 
-# All channels ever written to (used only for all_off shutdown).
-ALL_CHANNELS = (CH_HEADLIGHTS, CH_TAIL_HALO_LEFT, CH_TAIL_HALO_RIGHT, CH_XMAS)
+# Every channel this driver ever writes to. Used only for all_off shutdown.
+# Includes the amp so LOCK / stop() / crash cleanup all power the amp down.
+ALL_CHANNELS = (
+    CH_HEADLIGHTS, CH_TAIL_HALO_LEFT, CH_TAIL_HALO_RIGHT, CH_XMAS,
+    CH_SPEAKER_AMP,
+)
 
 
 class LightsController:
@@ -128,15 +148,15 @@ class LightsController:
         self._lights_on      = False   # channels 1,2,3 steady on (driven by unlock)
         self._left_until:  float = 0.0
         self._right_until: float = 0.0
-        self._robot_locked   = True    # start locked
+        self._robot_locked   = True    # start locked → amp off, lights off
         self._last_combo_at  = 0.0
 
         # Talk-blink (3-channel: 1, 2, 3). Time-bounded. Restores prior state
         # when done.
         self._talk_blink_until:   float = 0.0
 
-        # Xwalk-blink (4-channel: 1, 2, 3, 4). CHANGED: latched boolean, not
-        # a deadline. Stays True until an explicit {"on": False} arrives (or
+        # Xwalk-blink (4-channel: 1, 2, 3, 4). Latched boolean, not a
+        # deadline. Stays True until an explicit {"on": False} arrives (or
         # until the robot locks, which clears everything).
         self._xwalk_active: bool = False
 
@@ -148,9 +168,12 @@ class LightsController:
 
     def start(self) -> None:
         self._open_hid()
+        # all_off() writes every channel — including the amp — so we come up
+        # in a known-safe state: lights off, amp off. Unlock will turn them
+        # on together.
         self.all_off()
         self._blink_thread.start()
-        log("lights", "ready")
+        log("lights", "ready (8-ch relay, amp=ch6 unlock-gated)")
 
     def stop(self) -> None:
         self._stop.set()
@@ -158,6 +181,8 @@ class LightsController:
             self._blink_thread.join(timeout=2.0)
         except Exception:
             pass
+        # Powers amp down along with everything else — matches the physical
+        # test procedure that the amp must be OFF when the driver exits.
         self.all_off()
         with self._dev_lock:
             if self._dev is not None:
@@ -172,7 +197,9 @@ class LightsController:
     def set_robot_lock(self, locked: bool) -> None:
         """
         UNLOCK → channels 1,2,3 latch steady on automatically.
-        LOCK   → all channels off, all pending signals/blinks cancelled.
+                 Channel 6 (amp) turns ON — speaker becomes usable.
+        LOCK   → all channels off (including amp), all pending signals/
+                 blinks cancelled.
         """
         with self._state_lock:
             changed = locked != self._robot_locked
@@ -192,10 +219,16 @@ class LightsController:
                 self._right_until = 0.0
                 self._talk_blink_until = 0.0
                 self._xwalk_active = False
+
         if changed:
             log("lights",
                 f"robot_lock={'ON' if locked else 'OFF'}"
-                + (" — auto-on ch1,2,3" if not locked else ""))
+                + (" — auto-on ch1,2,3 + amp ch6" if not locked else " — amp ch6 off"))
+
+        # Amp is a direct function of lock state — no precedence stack, no
+        # blink loop involvement. Drive it here on every edge.
+        self._write_relay(CH_SPEAKER_AMP, not locked)
+
         if locked:
             self._apply_all_off()
         else:
@@ -237,9 +270,6 @@ class LightsController:
         effectively cosmetic while unlocked — steady lights are already on.
         We deliberately ignore it here to prevent the operator from
         accidentally killing safety lights while driving.
-
-        Envelope is only dispatched when unlocked (command() blocks it while
-        locked), so both "all True" and "all False" become no-ops.
         """
         hl = truthy(data.get("headlights"))
         pk = truthy(data.get("parklights"))
@@ -274,8 +304,9 @@ class LightsController:
     def _handle_xwalk(self, data: dict) -> None:
         """Xwalk envelope from browser.
 
-        {"data":{"on":True}}  → all 4 channels blink together, and STAY
-                                blinking until an explicit off arrives.
+        {"data":{"on":True}}  → all 4 light channels blink together, and
+                                STAY blinking until an explicit off arrives.
+                                Amp (ch 6) is left alone.
         {"data":{"on":False}} → cancel immediately, restore steady state.
         """
         on = truthy(data.get("on"))
@@ -299,7 +330,7 @@ class LightsController:
         duration = max(0.5, min(30.0, duration))
         now = time.monotonic()
         with self._state_lock:
-            # 3-channel blink (headlights + tails/halos). Xmas not included.
+            # 3-channel blink (headlights + tails/halos). Xmas + amp untouched.
             self._talk_blink_until = now + duration
         log("lights", f"talk blink {duration:.1f}s (ch 1,2,3)")
 
@@ -354,6 +385,8 @@ class LightsController:
         return None
 
     def _write_relay(self, channel: int, on: bool) -> None:
+        # 3-byte report: [report_id=0x00, cmd, channel]. cmd 0xFF = ON,
+        # 0xFD = OFF. Matches test_speaker.py's Relay.set() bit-for-bit.
         cmd = 0xFF if on else 0xFD
         payload = bytes([0x00, cmd, channel & 0xFF])
         with self._dev_lock:
@@ -398,7 +431,11 @@ class LightsController:
     # ── relay state application ─────────────────────────────────────────────
 
     def _apply_steady(self) -> None:
-        """Assert the current steady state on channels 1–3."""
+        """Assert the current steady state on channels 1–3.
+
+        Channel 6 (amp) is NOT written here — set_robot_lock() owns it.
+        Channels 4, 5, 7, 8 are xwalk-owned or unused; not touched.
+        """
         with self._state_lock:
             on             = self._lights_on
             now = time.monotonic()
@@ -420,30 +457,34 @@ class LightsController:
             self._write_relay(CH_TAIL_HALO_RIGHT, on)
 
     def _apply_all_off(self) -> None:
-        """Drive every relay channel low, including xmas."""
+        """Drive every channel this driver owns low, including amp + xmas.
+
+        Also explicitly clears channels 5, 7, 8 so if some future code path
+        ever left them latched, they don't stay stuck on.
+        """
         for ch in ALL_CHANNELS:
+            self._write_relay(ch, False)
+        # Belt-and-braces: unused channels forced off too.
+        for ch in (5, 7, 8):
             self._write_relay(ch, False)
 
     # ── blink loop ──────────────────────────────────────────────────────────
 
     def _blink_loop(self) -> None:
-        """One thread drives every blinking animation.
+        """One thread drives every blinking animation on channels 1-4.
 
-        Precedence per channel (highest wins):
+        Precedence per light channel (highest wins):
             1. robot_locked            → nothing here runs (all_off elsewhere)
-            2. xwalk_active (latched)  → all 4 channels blink together
+            2. xwalk_active (latched)  → ch 1,2,3,4 blink together
             3. Turn signal (ch1 or 2) → that side blinks
-            4. Talk-blink              → channels 1, 2, 3 blink (xmas untouched)
-            5. Steady lights_on flag   → channels 1, 2, 3 on/off
+            4. Talk-blink              → ch 1, 2, 3 blink (xmas untouched)
+            5. Steady lights_on flag   → ch 1, 2, 3 on/off
 
-        Xmas (ch4) is xwalk-only: it's ON iff xwalk is active. When xwalk
-        ends we explicitly drive xmas off. All other paths leave it alone.
-
-        Duty cycle is symmetric: on for blink_half, off for blink_half.
+        Channel 6 (amp) is untouched by this loop — it's a plain function
+        of lock state, written directly in set_robot_lock().
         """
         phase = False
         prev_xwalk_active = False
-        prev_talk_active  = False
 
         while not self._stop.is_set():
             now = time.monotonic()
@@ -465,15 +506,13 @@ class LightsController:
             # Xwalk edge (latched → False transition):
             just_ended_xwalk = prev_xwalk_active and not xwalk_active
             prev_xwalk_active = xwalk_active
-            prev_talk_active  = talk_active
 
             phase = not phase
 
-            # ── XWALK: all 4 channels blink together (highest precedence) ──
+            # ── XWALK: 4 light channels blink together (highest precedence) ─
             if xwalk_active:
                 for ch in XWALK_CHANNELS:
                     self._write_relay(ch, phase)
-                # Skip everything else this tick.
                 self._stop.wait(timeout=self._blink_half)
                 continue
 
@@ -487,7 +526,7 @@ class LightsController:
             if just_ended_talk:
                 self._apply_steady()
 
-            # ── TALK: channels 1, 2, 3 blink; xmas untouched ────────────────
+            # ── TALK: channels 1, 2, 3 blink; xmas + amp untouched ─────────
             if talk_active:
                 for ch in LIGHTS_ON_CHANNELS:
                     self._write_relay(ch, phase)
