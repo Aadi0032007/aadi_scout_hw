@@ -135,6 +135,9 @@ class LabConfig:
     startup_volume_pct:     int   = 100
     preferred_sink_patterns: list = field(default_factory=lambda: [
         "ugreen", "u_green", "usb_audio", "usb-audio", "emeet", "alsa_output.usb-",
+        "c-media",
+        "usb",
+        "usb_audio_device",
     ])
     preferred_source_patterns: list = field(default_factory=lambda: [
         "ugreen", "u_green", "usb_audio", "usb-audio", "emeet", "alsa_input.usb-",
