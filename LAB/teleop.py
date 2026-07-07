@@ -958,12 +958,14 @@ def main() -> None:
                 ws_state["last_ai_mode"] = on
                 motion.set_ai_enabled(on)   # logs internally
 
-        # ── xwalk — log-only until subsystem is defined ────────────────────
+        # ── xwalk — 4-channel blink for 10s (headlights + tails + halos + xmas)
         if "xwalk" in msg:
             on = truthy(msg["xwalk"])
             if on != ws_state["last_xwalk"]:
                 ws_state["last_xwalk"] = on
-                log("teleop", f"ws xwalk={on} (no subsystem wired yet)")
+                log("teleop", f"ws xwalk={on}")
+                if lights is not None:
+                    lights.command({"type": "xwalk", "data": {"on": on}})
 
         # ── yield — log-only until subsystem is defined ─────────────────────
         if "yield" in msg:
