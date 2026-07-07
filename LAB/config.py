@@ -143,6 +143,15 @@ class LabConfig:
         "ugreen", "u_green", "usb_audio", "usb-audio", "emeet", "alsa_input.usb-",
     ])
 
+    # ── Display / touchscreen ───────────────────────────────────────────────
+    display_enabled:          bool = True
+    display_name:             Optional[str] = None   # e.g. ":0"; auto-detect if None
+    display_asset_dir:        str  = str(Path.home() / "Revobots" / "development" / "display")
+    display_default_wallpaper: str = "STOP.png"
+    display_rotate:           int  = 90      # portrait-mounted monitor on landscape framebuffer
+    display_fullscreen:       bool = True
+    display_fps:              int  = 30
+
     # ── Cameras ──────────────────────────────────────────────────────────────
     cameras: list = field(default_factory=lambda: [
         CameraConfig(

@@ -411,8 +411,8 @@ def _debug_dump_snapshot_once(snap_fn: Callable[[], dict],
 #        "track: <file>.wav"   → music
 #        "<words>"             → speech (free-form textbox, no prefix)
 #
-#   ttd: "img: <file>.png"     → wallpaper (no display subsystem yet)
-#        "<words>"             → display text (no display subsystem yet)
+#   ttd: "img: <file>.png"     → wallpaper on the display subsystem
+#        "<words>"             → display text on the display subsystem
 #
 # Prefix matching is case-insensitive and permissive: "text:hi", "text: hi",
 # "TEXT :  hi" all work. Anything not matching a known prefix is treated as
@@ -474,14 +474,19 @@ def _handle_tts(raw: str, audio, lights, cfg) -> None:
         _speak_and_blink(raw, audio, lights, cfg)
 
 
-def _handle_ttd(raw: str) -> None:
+def _handle_ttd(raw: str, display) -> None:
     if not raw:
         return
     prefix, body = _split_prefix(raw, _TTD_PREFIXES)
     if prefix == "img":
-        log("teleop", f"ws ttd wallpaper={body!r} (TODO: no display subsystem)")
+        if display is not None:
+            display.set_wallpaper(body)
+        log("teleop", f"ws ttd wallpaper={body!r}" + ("" if display is not None else " (display disabled)"))
     else:
-        log("teleop", f"ws ttd display_text={raw!r} (TODO: no display subsystem)")
+        if display is not None:
+            display.show_text(raw)
+        preview = raw if len(raw) <= 60 else raw[:57] + "..."
+        log("teleop", f"ws ttd display_text={preview!r}" + ("" if display is not None else " (display disabled)"))
 
 
 def _log_tts_intent(raw: str) -> None:
@@ -599,6 +604,7 @@ def main() -> None:
     from .sensors       import GpsReader, TempHumReader, BatteryReader, LidarReader
     from .bridge_ws     import BridgeWsClient
     from .heartbeat     import HeartbeatPublisher
+    from .display       import DisplayController
 
     # ── Cameras ─────────────────────────────────────────────────────────────
     cameras = CamerasManager(cfg)
@@ -704,6 +710,25 @@ def main() -> None:
     except Exception as exc:
         log("teleop", f"audio init failed: {exc} — disabled")
         audio = None
+
+    display: Optional[DisplayController] = None
+    if getattr(cfg, "display_enabled", True):
+        try:
+            display = DisplayController(
+                display=getattr(cfg, "display_name", None),
+                asset_dir=cfg.display_asset_dir,
+                default_wallpaper=cfg.display_default_wallpaper,
+                rotate=cfg.display_rotate,
+                fullscreen=cfg.display_fullscreen,
+                fps=cfg.display_fps,
+                enabled=cfg.display_enabled,
+            )
+            display.start()
+        except Exception as exc:
+            log("teleop", f"display init failed: {exc} — disabled")
+            display = None
+    else:
+        log("teleop", "display disabled by config")
 
     # ── Sensors ─────────────────────────────────────────────────────────────
     gps: Optional[GpsReader] = None
@@ -889,9 +914,11 @@ def main() -> None:
             {"volume": 0..100}               audio volume percent
                                              (browser fires twice per change)
 
-          Display (no subsystem yet — log only):
+          Display:
             {"ttd": "img: <file>.png"}       set wallpaper by filename
             {"ttd": "<words>"}               display text (free-form textbox)
+            {"type":"display_text","text":"..."}     display text
+            {"type":"set_wallpaper","image":"..."}   set wallpaper
 
           Drivetrain:
             {"lock": 0|1}                    0=unlocked, 1=locked
@@ -1006,10 +1033,21 @@ def main() -> None:
             _log_tts_intent(raw)
             _handle_tts(raw, audio, lights, cfg)
 
+        # ── typed display commands (bridge_ws.py documented shape) ──────────
+        msg_type = str(msg.get("type") or "").strip().lower()
+        if msg_type == "display_text":
+            raw = str(msg.get("text") or msg.get("data") or "").strip()
+            if raw:
+                _handle_ttd(raw, display)
+        elif msg_type == "set_wallpaper":
+            raw = str(msg.get("image") or msg.get("text") or msg.get("data") or "").strip()
+            if raw:
+                _handle_ttd(f"img: {raw}", display)
+
         # ── ttd (wallpaper or display text) ─────────────────────────────────
         if "ttd" in msg:
             raw = str(msg["ttd"] or "").strip()
-            _handle_ttd(raw)
+            _handle_ttd(raw, display)
 
     # ── Local dongle event dispatcher ──────────────────────────────────────
 
@@ -1111,6 +1149,7 @@ def main() -> None:
         ("ptz",           ptz),
         ("lights",        lights),
         ("audio",         audio),
+        ("display",       display),
         ("motion",        motion),
         ("gps",           gps),
         ("temphum",       temphum),

@@ -37,8 +37,8 @@ Message shapes we forward to on_message (from util_receive_browser_cmds.py):
     {"high_visibility": bool}
     {"charging": bool}
     {"type": "stt", "text": "..."}
-    {"type": "display_text", "text": "..."}          (TODO subsystem)
-    {"type": "set_wallpaper", "image": "..."}        (TODO subsystem)
+    {"type": "display_text", "text": "..."}          (display subsystem)
+    {"type": "set_wallpaper", "image": "..."}        (display subsystem)
 """
 
 import asyncio
