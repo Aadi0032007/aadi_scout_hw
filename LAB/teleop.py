@@ -549,18 +549,22 @@ class UdpFlowTracker:
     def _watch(self) -> None:
         while not self._stop.is_set():
             self._stop.wait(timeout=0.25)
+            addr: Optional[tuple] = None
+            age: float = 0.0
+            transition = False
             with self._lock:
-                if not self._flowing:
-                    continue
-                age = now_mono() - self._last_t
-                if age > self._stall_sec:
-                    self._flowing = False
-                    addr = self._last_addr
-            log("teleop",
-                f"UDP motion STOPPED "
-                f"(no packet from {self._label} for {age:.1f}s"
-                + (f", last={addr[0]}:{addr[1]}" if addr else "")
-                + ")")
+                if self._flowing:
+                    age = now_mono() - self._last_t
+                    if age > self._stall_sec:
+                        self._flowing = False
+                        addr = self._last_addr
+                        transition = True
+            if transition:
+                log("teleop",
+                    f"UDP motion STOPPED "
+                    f"(no packet from {self._label} for {age:.1f}s"
+                    + (f", last={addr[0]}:{addr[1]}" if addr else "")
+                    + ")")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
