@@ -7,7 +7,7 @@ Created on Wed Jun  3 20:04:03 2026
 from __future__ import annotations
 
 """
-lights.py — REDESIGN v3 (xmas + xwalk + auto-on-unlock).
+lights.py — REDESIGN v4 (xmas + xwalk-until-off + auto-on-unlock).
 
 Relay wiring (dcttech HID relay, VID 0x16c0 PID 0x05df):
 
@@ -33,10 +33,10 @@ Behavior:
         - Flick same side again while active → cancel
         - Suppressed while xwalk-blink is running
 
-    Xwalk (from xwalk envelope) — NEW
-        - All 4 channels (1, 2, 3, 4) blink together for xwalk_duration_sec
-        - Then restore prior steady state (unlocked → 1,2,3 on; 4 off)
-        - xwalk=0 cancels immediately
+    Xwalk (from xwalk envelope) — CHANGED
+        - on=True  → all 4 channels (1, 2, 3, 4) blink together and STAY
+                     blinking until explicitly turned off
+        - on=False → cancel immediately, restore prior steady state
 
     Talk (from talk envelope)
         - Channels 1, 2, 3 blink for the talk duration
@@ -53,11 +53,11 @@ Wire schema (TCP/WS event envelope):
     {"type":"lights",    "data":{"headlights":bool,"parklights":bool,"strobe":bool}}
     {"type":"indicator", "data":{"side":"left"|"right"|"center"}}
     {"type":"talk",      "data":{"text":str,"duration":float}}
-    {"type":"xwalk",     "data":{"on":bool}}                        NEW
+    {"type":"xwalk",     "data":{"on":bool}}
 
 Precedence per channel (highest wins):
     1. robot_locked            → all off
-    2. xwalk-blink             → all 4 blink (includes xmas)
+    2. xwalk-blink             → all 4 blink (includes xmas), persists until off
     3. Turn signal (ch 1 or 2) → that side blinks
     4. Talk-blink              → channels 1,2,3 blink
     5. Steady lights_on flag   → channels 1,2,3 on/off (auto from lock state)
@@ -86,7 +86,7 @@ PRODUCT_ID = 0x05df
 CH_TAIL_HALO_RIGHT = 1
 CH_TAIL_HALO_LEFT  = 2
 CH_HEADLIGHTS      = 3
-CH_XMAS            = 4      # NEW — used by xwalk only
+CH_XMAS            = 4      # used by xwalk only
 
 # Channels that participate in "lights on" (unlock-auto-on) and talk-blink.
 # Xmas is intentionally excluded — it's xwalk-exclusive.
@@ -107,17 +107,17 @@ class LightsController:
         talk_default_duration:   float,
         all_lights_cooldown_sec: float,
         all_lights_blink_sec:    float,
-        xwalk_duration_sec:      float = 10.0,
+        xwalk_duration_sec:      float = 10.0,   # kept for API compat, unused
     ) -> None:
         self._blink_half       = max(0.05, blink_period_sec / 2.0)
         self._signal_timeout   = signal_timeout_sec
         self._talk_default     = talk_default_duration
         self._combo_cooldown   = all_lights_cooldown_sec
         self._combo_blink_sec  = all_lights_blink_sec
-        self._xwalk_duration   = xwalk_duration_sec
+        # xwalk_duration_sec kept as a constructor arg for backwards compat
+        # with teleop wiring, but xwalk is no longer time-bounded.
 
         # HID device — self._dev is an int fd (os.open) or None.
-        # No hidapi dependency; same raw-write approach as test_relay.py.
         self._dev:      Optional[int] = None
         self._dev_path: Optional[str] = None
         self._dev_lock = threading.Lock()
@@ -131,12 +131,14 @@ class LightsController:
         self._robot_locked   = True    # start locked
         self._last_combo_at  = 0.0
 
-        # Talk-blink (3-channel: 1, 2, 3). Restores prior state when done.
+        # Talk-blink (3-channel: 1, 2, 3). Time-bounded. Restores prior state
+        # when done.
         self._talk_blink_until:   float = 0.0
 
-        # Xwalk-blink (4-channel: 1, 2, 3, 4) — NEW.
-        # Xmas is xwalk-exclusive; talk-blink does not include it.
-        self._xwalk_blink_until: float = 0.0
+        # Xwalk-blink (4-channel: 1, 2, 3, 4). CHANGED: latched boolean, not
+        # a deadline. Stays True until an explicit {"on": False} arrives (or
+        # until the robot locks, which clears everything).
+        self._xwalk_active: bool = False
 
         # Lifecycle
         self._stop = threading.Event()
@@ -181,7 +183,7 @@ class LightsController:
                 self._left_until = 0.0
                 self._right_until = 0.0
                 self._talk_blink_until = 0.0
-                self._xwalk_blink_until = 0.0
+                self._xwalk_active = False
             else:
                 # Unlock → auto-on channels 1,2,3 (steady). Xmas stays off.
                 self._lights_on = True
@@ -189,7 +191,7 @@ class LightsController:
                 self._left_until = 0.0
                 self._right_until = 0.0
                 self._talk_blink_until = 0.0
-                self._xwalk_blink_until = 0.0
+                self._xwalk_active = False
         if changed:
             log("lights",
                 f"robot_lock={'ON' if locked else 'OFF'}"
@@ -223,7 +225,7 @@ class LightsController:
             self._left_until = 0.0
             self._right_until = 0.0
             self._talk_blink_until = 0.0
-            self._xwalk_blink_until = 0.0
+            self._xwalk_active = False
         self._apply_all_off()
 
     # ── event handlers ──────────────────────────────────────────────────────
@@ -242,24 +244,12 @@ class LightsController:
         hl = truthy(data.get("headlights"))
         pk = truthy(data.get("parklights"))
         st = truthy(data.get("strobe"))
-        # Log for observability, but take no action — lock state owns lights.
         log("lights",
             f"lights envelope ignored (unlock owns lights): "
             f"hl={hl} pk={pk} st={st}")
 
     def _handle_indicator(self, data: dict) -> None:
-        """Single `side` field: left | right | center.
-
-        Turn signals are self-timing and toggled:
-
-          • Flick a side once  → that side blinks hands-free for
-            signal_timeout_sec, then stops on its own (self-expiry).
-          • Flick the SAME side again while it's active → cancel it now.
-          • Flick the OPPOSITE side → switch: the new side arms, the old
-            side stops.
-          • center — the spring-loaded stick snapping back after a flick — is
-            a NO-OP. It's the *release* of the flick, not a cancel request.
-        """
+        """Single `side` field: left | right | center."""
         side = (data.get("side") or "center").strip().lower()
         now = time.monotonic()
         with self._state_lock:
@@ -284,20 +274,22 @@ class LightsController:
     def _handle_xwalk(self, data: dict) -> None:
         """Xwalk envelope from browser.
 
-        {"data":{"on":True}}  → all 4 channels blink together for xwalk_duration_sec
-        {"data":{"on":False}} → cancel immediately, restore steady state
+        {"data":{"on":True}}  → all 4 channels blink together, and STAY
+                                blinking until an explicit off arrives.
+        {"data":{"on":False}} → cancel immediately, restore steady state.
         """
         on = truthy(data.get("on"))
-        now = time.monotonic()
         with self._state_lock:
             if on:
-                self._xwalk_blink_until = now + self._xwalk_duration
-                log("lights", f"xwalk: 4-channel blink {self._xwalk_duration:.0f}s")
+                if not self._xwalk_active:
+                    self._xwalk_active = True
+                    log("lights", "xwalk: 4-channel blink ON (persists until off)")
+                # else: already blinking — nothing to do
             else:
-                if self._xwalk_blink_until > 0.0:
-                    self._xwalk_blink_until = 0.0
+                if self._xwalk_active:
+                    self._xwalk_active = False
                     log("lights", "xwalk: cancelled")
-                # else: already off, nothing to do
+                # else: already off — nothing to do
 
     def _handle_talk(self, data: dict) -> None:
         try:
@@ -308,19 +300,12 @@ class LightsController:
         now = time.monotonic()
         with self._state_lock:
             # 3-channel blink (headlights + tails/halos). Xmas not included.
-            # Restores prior steady state when done (i.e. back to unlocked-on).
             self._talk_blink_until = now + duration
         log("lights", f"talk blink {duration:.1f}s (ch 1,2,3)")
 
-    # ── relay write with reconnect (unchanged) ──────────────────────────────
+    # ── relay write with reconnect ──────────────────────────────────────────
 
     def _open_hid(self) -> None:
-        """Find the dcttech relay's /dev/hidraw* node by scanning sysfs.
-
-        No hidapi/pyusb dependency — this uses the same raw file I/O the
-        test_relay.py bench tool uses (os.open + os.write). Report format
-        is 3 bytes: [report_id, command, channel].
-        """
         path = self._find_hidraw_node()
         if path is None:
             log("lights",
@@ -351,12 +336,6 @@ class LightsController:
 
     @staticmethod
     def _find_hidraw_node() -> Optional[str]:
-        """Scan /sys/class/hidraw/*/device/uevent for the matching VID:PID.
-
-        `HID_ID=0003:000016C0:000005DF` uniquely identifies the dcttech relay.
-        Preferred over a hardcoded /dev/hidraw2 — the number changes with
-        USB enumeration order.
-        """
         vid_hex = f"{VENDOR_ID:04X}"
         pid_hex = f"{PRODUCT_ID:04X}"
         try:
@@ -402,7 +381,6 @@ class LightsController:
                         return
 
     def _reopen_hid_locked(self, attempt: int) -> None:
-        """Called while self._dev_lock is held. Try to reopen the hidraw node."""
         now = time.time()
         if now - self._last_reconnect_log >= 1.0:
             log("lights", f"HID reconnect attempt {attempt}")
@@ -420,23 +398,14 @@ class LightsController:
     # ── relay state application ─────────────────────────────────────────────
 
     def _apply_steady(self) -> None:
-        """Assert the current steady state on channels 1–3.
-
-        Halos/tails are shared between "lights on" (steady) and turn signal
-        (blinking). While a signal or blink is active, the blink loop owns
-        that channel; this method leaves it alone.
-
-        Xmas (channel 4) is xwalk-exclusive — never touched here. If a
-        previous xwalk-blink finished it's already been driven off inside
-        the blink loop's just-ended path.
-        """
+        """Assert the current steady state on channels 1–3."""
         with self._state_lock:
             on             = self._lights_on
             now = time.monotonic()
             left_active    = self._left_until       > now
             right_active   = self._right_until      > now
             talk_active    = self._talk_blink_until > now
-            xwalk_active   = self._xwalk_blink_until > now
+            xwalk_active   = self._xwalk_active
 
         # Headlights (ch3): steady unless a blink owns it.
         if not (talk_active or xwalk_active):
@@ -462,7 +431,7 @@ class LightsController:
 
         Precedence per channel (highest wins):
             1. robot_locked            → nothing here runs (all_off elsewhere)
-            2. xwalk-blink             → all 4 channels blink together
+            2. xwalk_active (latched)  → all 4 channels blink together
             3. Turn signal (ch1 or 2) → that side blinks
             4. Talk-blink              → channels 1, 2, 3 blink (xmas untouched)
             5. Steady lights_on flag   → channels 1, 2, 3 on/off
@@ -473,6 +442,9 @@ class LightsController:
         Duty cycle is symmetric: on for blink_half, off for blink_half.
         """
         phase = False
+        prev_xwalk_active = False
+        prev_talk_active  = False
+
         while not self._stop.is_set():
             now = time.monotonic()
 
@@ -480,19 +452,20 @@ class LightsController:
                 left_active   = now < self._left_until
                 right_active  = now < self._right_until
                 talk_active   = now < self._talk_blink_until
-                xwalk_active  = now < self._xwalk_blink_until
+                xwalk_active  = self._xwalk_active
                 on            = self._lights_on
 
-                # Edges: talk / xwalk just ended
+                # Talk edge: talk was time-bounded; clear the deadline once
+                # it elapses so future logic doesn't keep checking.
                 just_ended_talk = False
                 if not talk_active and self._talk_blink_until != 0.0:
                     self._talk_blink_until = 0.0
                     just_ended_talk = True
 
-                just_ended_xwalk = False
-                if not xwalk_active and self._xwalk_blink_until != 0.0:
-                    self._xwalk_blink_until = 0.0
-                    just_ended_xwalk = True
+            # Xwalk edge (latched → False transition):
+            just_ended_xwalk = prev_xwalk_active and not xwalk_active
+            prev_xwalk_active = xwalk_active
+            prev_talk_active  = talk_active
 
             phase = not phase
 
