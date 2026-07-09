@@ -147,7 +147,7 @@ class LabConfig:
     display_enabled:          bool = True
     display_name:             Optional[str] = None   # e.g. ":0"; auto-detect if None
     display_asset_dir:        str  = str(Path.home() / "Revobots" / "development" / "display")
-    display_default_wallpaper: str = "STOP.png"
+    display_default_wallpaper: str = "REVOBOTS_LOGO_1.png"
     display_rotate:           int  = 90      # portrait-mounted monitor on landscape framebuffer
     display_fullscreen:       bool = True
     display_fps:              int  = 30

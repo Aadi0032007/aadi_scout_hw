@@ -44,7 +44,7 @@ class DisplayController:
         self,
         display: Optional[str] = None,
         asset_dir: str = "",
-        default_wallpaper: str = "STOP.png",
+        default_wallpaper: str = "REVOBOTS_LOGO_1.png",
         rotate: int = 90,
         fullscreen: bool = True,
         fps: int = 30,
