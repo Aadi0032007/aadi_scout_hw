@@ -756,10 +756,8 @@ def main() -> None:
     if cfg.battery_enabled:
         try:
             battery = BatteryReader(
-                container=cfg.battery_container,
-                topic=cfg.battery_topic,
-                ros_setup=cfg.battery_ros_setup,
-                ws_setup=cfg.battery_ws_setup,
+                udp_host=cfg.battery_udp_host,
+                udp_port=cfg.battery_udp_port,
                 stale_after_sec=cfg.battery_stale_after_sec,
             )
             battery.start()

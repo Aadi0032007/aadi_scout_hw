@@ -213,14 +213,14 @@ class LabConfig:
     temphum_poll_sec:       float = 2.0
     temphum_stale_after_sec: float = 10.0
 
-    # ── Battery ──────────────────────────────────────────────────────────────
-    battery_enabled:        bool  = True
-    battery_container:      str   = "segway_ros1"
-    battery_topic:          str   = "/bms_fb"
-    battery_ros_setup:      str   = "/opt/ros/noetic/setup.bash"
-    battery_ws_setup:       str   = "/root/catkin_ws/devel/setup.bash"
-    battery_poll_sec:       float = 5.0
-    battery_cmd_timeout_sec: float = 3.0
+    # ── Battery / chassis status (from aadi_segway_can_wrapper) ─────────────
+    # Wrapper publishes JSON at 1 Hz over UDP; BatteryReader binds this
+    # port and updates its snapshot dict. Same public keys as before
+    # (bat_soc / bat_charging / bat_vol / bat_current / bat_temp / age_sec),
+    # plus new chassis_mode / host_err for future dashboard use.
+    battery_enabled:         bool  = True
+    battery_udp_host:        str   = "127.0.0.1"
+    battery_udp_port:        int   = 56500
     battery_stale_after_sec: float = 30.0
 
     # ── Lidar ────────────────────────────────────────────────────────────────

@@ -536,75 +536,61 @@ class TempHumReader:
             self._stop.wait(timeout=self._poll_sec)
 
 
-# ═══ Battery (Segway BMS via Docker ROS1, streaming) ══════════════════════════
+# ═══ Battery / chassis status (from aadi_segway_can_wrapper via UDP) ══════════
 #
-# Previous design shelled out to `rostopic echo -n 1 /bms_fb` every 2 s. That
-# waited for the *next* message and paid the ROS-source + rostopic-startup
-# cost per poll — which is exactly why the 3 s timeouts fired constantly.
+# The CAN wrapper publishes JSON to 127.0.0.1:56500 at 1 Hz. Payload keys:
+#   ts, chassis_mode, chassis_mode_name, host_err, central_err,
+#   bat_soc, bat_charging, bat_vol, bat_current, bat_temp, mileage_m
 #
-# New design: one persistent `docker exec rostopic echo` subprocess streams
-# messages continuously. Each YAML record (separated by `---`) is parsed and
-# used to update the snapshot dict. `stdbuf -oL` inside the container forces
-# line-buffered stdout so we see records as they arrive rather than in 4 KB
-# chunks. Log spam is throttled to one line on stream start and one on stream
-# loss / respawn.
-#
-# Fields exposed via get():
-#   bat_soc       - state of charge, %
-#   bat_charging  - True if charging, False if discharging
-#   bat_vol       - voltage, mV
-#   bat_current   - current, mA
-#   bat_temp      - temperature, °C
-#   age_sec       - seconds since the last successful read
-
-_BMS_FIELD_RE = re.compile(
-    r"^\s*(bat_soc|bat_charging|bat_vol|bat_current|bat_temp)\s*:\s*(-?[0-9.]+)\s*$"
-)
-
+# BatteryReader exposes the battery keys via get() with the same names it
+# used in the old Docker/ROS design, so _make_dashboard_snapshot_fn in
+# teleop.py doesn't need to change. Extra keys (chassis_mode, host_err,
+# mileage_m) are also stashed in the snapshot dict.
 
 class BatteryReader:
-    """Reads Segway BMS state from /bms_fb inside the segway_ros1 container.
+    """Reads battery + chassis status from aadi_segway_can_wrapper's UDP feed.
 
-    Runs ONE persistent `docker exec ... rostopic echo` subprocess and parses
-    its streaming output. This avoids the fresh-exec overhead per poll (which
-    caused the 3 s timeouts in the previous design — most of the budget was
-    spent sourcing ROS and starting rostopic, not waiting for a message).
+    Snapshot dict keys (same as previous Docker-based reader):
+      bat_soc       - state of charge, %
+      bat_charging  - True if charging, False if discharging
+      bat_vol       - voltage, mV
+      bat_current   - current, mA
+      bat_temp      - temperature, C
+      age_sec       - seconds since the last successful read
 
-    Snapshot dict keys are unchanged: bat_soc, bat_charging, bat_vol,
-    bat_current, bat_temp, age_sec.
-
-    If the subprocess dies or the topic goes silent for `stale_after_sec`,
-    the reader tears it down and respawns with exponential backoff.
+    Plus new fields (safe to ignore in code that predates them):
+      chassis_mode, chassis_mode_name, host_err, central_err, mileage_m
     """
 
     def __init__(
         self,
-        container:       str   = "segway_ros1",
-        topic:           str   = "/bms_fb",
-        ros_setup:       str   = "/opt/ros/noetic/setup.bash",
-        ws_setup:        str   = "/root/catkin_ws/devel/setup.bash",
+        udp_host:        str   = "127.0.0.1",
+        udp_port:        int   = 56500,
         stale_after_sec: float = 30.0,
-        # kept for back-compat with existing callers — no-ops in this design.
-        poll_sec:        float = 2.0,
-        cmd_timeout:     float = 3.0,
+        # kept for back-compat with any existing call sites — no-ops now.
+        container:       str   = "",
+        topic:           str   = "",
+        ros_setup:       str   = "",
+        ws_setup:        str   = "",
+        poll_sec:        float = 0.0,
+        cmd_timeout:     float = 0.0,
     ) -> None:
-        self._container       = container
-        self._topic           = topic
-        self._ros_setup       = ros_setup
-        self._ws_setup        = ws_setup
-        self._stale_after_sec = stale_after_sec
+        self._host             = udp_host
+        self._port             = udp_port
+        self._stale_after_sec  = stale_after_sec
 
         self._data: dict = {}
         self._last_msg_t: float = 0.0
         self._lock   = threading.Lock()
         self._stop   = threading.Event()
-        self._proc:  Optional[subprocess.Popen] = None
-        self._thread = threading.Thread(target=self._run, daemon=True, name="battery-reader")
+        self._sock:  Optional[_socket.socket] = None
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="battery-reader")
 
     def start(self) -> None:
         self._thread.start()
         log("sensors",
-            f"Battery reader started (container={self._container}, topic={self._topic})")
+            f"Battery reader started (udp://{self._host}:{self._port})")
 
     def get(self) -> dict:
         with self._lock:
@@ -615,122 +601,66 @@ class BatteryReader:
 
     def stop(self) -> None:
         self._stop.set()
-        self._kill_proc()
+        if self._sock is not None:
+            try: self._sock.close()
+            except Exception: pass
 
     # ── internals ─────────────────────────────────────────────────────────
 
     def _run(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
-            proc = self._spawn()
-            if proc is None:
+            try:
+                s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+                s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+                s.bind((self._host, self._port))
+                s.settimeout(0.5)
+                self._sock = s
+            except OSError as exc:
+                log("sensors",
+                    f"Battery UDP bind {self._host}:{self._port} failed: {exc}")
                 self._stop.wait(timeout=backoff)
-                backoff = min(backoff * 2, 30.0)
+                backoff = min(backoff * 2, 10.0)
                 continue
-
-            self._proc = proc
-            log("sensors", "Battery: stream started")
             backoff = 1.0
 
-            # One YAML "record" per message. rostopic separates them with "---".
-            buf: list = []
-            stream_alive = True
-            last_stale_check = time.monotonic()
-
             try:
-                assert proc.stdout is not None
-                for raw in proc.stdout:
-                    if self._stop.is_set():
-                        break
-                    line = raw.rstrip("\n")
-                    if line.strip() == "---":
-                        self._flush_record(buf)
-                        buf.clear()
-                    else:
-                        buf.append(line)
-
-                    # Cheap stale check between messages — if the topic dies
-                    # mid-stream, we notice within stale_after_sec instead of
-                    # blocking on readline forever.
-                    now = time.monotonic()
-                    if now - last_stale_check > 5.0:
-                        last_stale_check = now
-                        if (self._last_msg_t > 0
-                                and (now - self._last_msg_t) > self._stale_after_sec):
-                            log("sensors",
-                                f"Battery: no message for "
-                                f"{now - self._last_msg_t:.0f}s — respawning")
-                            stream_alive = False
-                            break
+                while not self._stop.is_set():
+                    try:
+                        data, _ = s.recvfrom(2048)
+                    except _socket.timeout:
+                        continue
+                    if not data:
+                        continue
+                    self._handle_packet(data)
             except Exception as exc:
-                log("sensors", f"Battery: stream read error: {exc}")
-                stream_alive = False
+                log("sensors", f"Battery recv error: {exc}")
+            finally:
+                try: s.close()
+                except Exception: pass
+                self._sock = None
 
-            if stream_alive and not self._stop.is_set():
-                log("sensors", "Battery: stream ended — respawning")
-
-            self._kill_proc()
-
-    def _spawn(self) -> Optional[subprocess.Popen]:
-        """Start a persistent `docker exec rostopic echo` subprocess.
-
-        `stdbuf -oL` forces rostopic to line-buffer inside the container so we
-        get messages as they arrive, not in 4 KB chunks.
-        """
-        cmd = [
-            "docker", "exec", "-i", self._container, "bash", "-c",
-            f"source {self._ros_setup} && source {self._ws_setup} && "
-            f"exec stdbuf -oL rostopic echo {self._topic}",
-        ]
+    def _handle_packet(self, data: bytes) -> None:
+        import json
         try:
-            return subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,   # line-buffered on the Python side
-            )
-        except Exception as exc:
-            log("sensors", f"Battery: docker exec failed: {exc}")
-            return None
-
-    def _kill_proc(self) -> None:
-        proc = self._proc
-        self._proc = None
-        if proc is None:
-            return
-        try:
-            proc.terminate()
-            try:
-                proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            body = json.loads(data.decode("utf-8", errors="replace"))
         except Exception:
-            pass
+            return
+        if not isinstance(body, dict):
+            return
 
-    def _flush_record(self, lines: list) -> None:
-        """Parse one YAML record (a full message between `---` separators)."""
         upd: dict = {}
-        for line in lines:
-            m = _BMS_FIELD_RE.match(line)
-            if not m:
-                continue
-            field, raw = m.group(1), m.group(2)
-            try:
-                value = float(raw)
-            except ValueError:
-                continue
-
-            if field == "bat_charging":
-                upd["bat_charging"] = value > 0.5
-            elif field == "bat_soc":
-                upd["bat_soc"] = value
-            elif field == "bat_vol":
-                upd["bat_vol"] = value
-            elif field == "bat_current":
-                upd["bat_current"] = value
-            elif field == "bat_temp":
-                upd["bat_temp"] = value
+        # Battery fields (must match old public API for teleop snapshot)
+        if "bat_soc"      in body: upd["bat_soc"]      = float(body["bat_soc"])
+        if "bat_charging" in body: upd["bat_charging"] = bool(body["bat_charging"])
+        if "bat_vol"      in body: upd["bat_vol"]      = float(body["bat_vol"])
+        if "bat_current"  in body: upd["bat_current"]  = float(body["bat_current"])
+        if "bat_temp"     in body: upd["bat_temp"]     = float(body["bat_temp"])
+        # New chassis fields — safe to publish, callers ignore what they don't use
+        for k in ("chassis_mode", "chassis_mode_name",
+                  "host_err", "central_err", "mileage_m"):
+            if k in body:
+                upd[k] = body[k]
 
         if not upd:
             return
