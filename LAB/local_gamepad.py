@@ -247,10 +247,12 @@ class LocalGamepad:
         return pygame
 
     def _wait_for_joystick(self, pygame_mod, retry_sec=JOYSTICK_RETRY_SEC):
+        logged_waiting = False
         while not self._stop.is_set():
             pygame_mod.joystick.quit()
             pygame_mod.joystick.init()
-            if pygame_mod.joystick.get_count() > 0:
+            count = pygame_mod.joystick.get_count()
+            if count > 0:
                 try:
                     js = pygame_mod.joystick.Joystick(0)
                     js.init()
@@ -263,6 +265,11 @@ class LocalGamepad:
                     f"(axes={js.get_numaxes()} btns={js.get_numbuttons()} "
                     f"hats={js.get_numhats()})")
                 return js
+            if not logged_waiting:
+                log("local_gp",
+                    f"no joystick detected — retrying every {retry_sec:.1f}s "
+                    "(check dongle, joydev module, 'input' group)")
+                logged_waiting = True
             self._stop.wait(timeout=retry_sec)
         return None
 
