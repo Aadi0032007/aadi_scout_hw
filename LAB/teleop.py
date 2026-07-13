@@ -369,7 +369,7 @@ _DASHBOARD_EXPECTED_KEYS = (
     "speed_pct",
     "speed_mode",
     "robot_battery_pct",
-    
+    "mileage_m",
     "box_temp_F",
     "humidity_pct",
     "cpu_temp_F",
