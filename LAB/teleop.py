@@ -4,7 +4,6 @@ Created on Wed Jun  3 20:04:03 2026
 
 @author: Aadi
 """
-from LAB import heartbeat
 from __future__ import annotations
 
 """
@@ -44,6 +43,9 @@ from typing import Any, Callable, Optional
 
 from .common import first_float, log, now_mono, truthy
 from .config import LabConfig
+
+from LAB import heartbeat
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -367,7 +369,7 @@ _DASHBOARD_EXPECTED_KEYS = (
     "speed_pct",
     "speed_mode",
     "robot_battery_pct",
-    "mileage_m",      
+    
     "box_temp_F",
     "humidity_pct",
     "cpu_temp_F",
