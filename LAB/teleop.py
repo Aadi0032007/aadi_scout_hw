@@ -327,7 +327,7 @@ def _make_dashboard_snapshot_fn(motion, temphum, gps, battery, speed_label_fn):
                 soc = battery.get().get("bat_soc")
                 if soc is not None:
                     out["robot_battery_pct"] = round(float(soc), 1)
-                mileage = bat.get("mileage_m")
+                mileage = battery.get("mileage_m")
                 if mileage is not None:
                     out["mileage_m"] = round(float(mileage), 2)
         except Exception:
