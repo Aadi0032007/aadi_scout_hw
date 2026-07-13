@@ -144,7 +144,7 @@ class LabConfig:
     ])
 
     # ── Display / touchscreen ───────────────────────────────────────────────
-    display_enabled:          bool = True
+    display_enabled:          bool = False
     display_name:             Optional[str] = None   # e.g. ":0"; auto-detect if None
     display_asset_dir:        str  = str(Path.home() / "Revobots" / "development" / "display")
     display_default_wallpaper: str = "REVOBOTS_LOGO_1.png"
