@@ -317,17 +317,17 @@ class LightsController:
         log("lights", f"xwalk: xmas (ch 4) {'ON' if on else 'OFF'}")
         self._write_relay(CH_XMAS, on)
 
-        def _handle_talk(self, data: dict) -> None:
-            try:
-                duration = float(data.get("duration", self._talk_default))
-            except (TypeError, ValueError):
-                duration = self._talk_default
-            duration = max(0.5, min(30.0, duration))
-            now = time.monotonic()
-            with self._state_lock:
-                # 3-channel blink (headlights + tails/halos). Xmas + amp untouched.
-                self._talk_blink_until = now + duration
-            log("lights", f"talk blink {duration:.1f}s (ch 1,2,3)")
+    def _handle_talk(self, data: dict) -> None:
+        try:
+            duration = float(data.get("duration", self._talk_default))
+        except (TypeError, ValueError):
+            duration = self._talk_default
+        duration = max(0.5, min(30.0, duration))
+        now = time.monotonic()
+        with self._state_lock:
+            # 3-channel blink (headlights + tails/halos). Xmas + amp untouched.
+            self._talk_blink_until = now + duration
+        log("lights", f"talk blink {duration:.1f}s (ch 1,2,3)")
 
     # ── relay write with reconnect ──────────────────────────────────────────
 
