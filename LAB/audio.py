@@ -435,18 +435,20 @@ class AudioController:
 
     @staticmethod
     def _play_wav(path: str) -> None:
+        errors = []
         for player in ("paplay", "pw-play", "aplay"):
             try:
                 res = subprocess.run(
                     [player, "-q", path] if player == "aplay" else [player, path],
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     timeout=30,
                 )
                 if res.returncode == 0:
                     return
+                errors.append(f"{player} rc={res.returncode} err={(res.stderr or b'').decode(errors='ignore').strip()[:120]}")
             except FileNotFoundError:
-                continue
-            except Exception:
-                continue
-        log("audio", "no working player found")
+                errors.append(f"{player} not installed")
+            except Exception as exc:
+                errors.append(f"{player} exc={exc}")
+        log("audio", "no working player found; " + " | ".join(errors))

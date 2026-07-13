@@ -584,7 +584,7 @@ class UdpTeleopController:
 
     def build_packet(self, seq: int) -> dict[str, Any]:
         lin_x = 0.0 if self.brake else self.lin_x
-        ang_z = 0.0 if self.brake else self._last_left_x
+        ang_z = 0.0 if self.brake else -self._last_left_x
         return {
             "seq": seq,
             "t": int(time.time()),
