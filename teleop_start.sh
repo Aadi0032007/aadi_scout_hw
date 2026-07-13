@@ -37,6 +37,10 @@ STATUS_PORT="${STATUS_PORT:-56500}"
 # Python
 PYTHON="${PYTHON:-/usr/bin/python3}"
 
+# CANalyst-II USB IDs (for stray-holder cleanup)
+CANALYST_VID="04d8"
+CANALYST_PID="0053"
+
 # ── Tracking ─────────────────────────────────────────────────────────────
 
 WRAPPER_PID=""
@@ -46,6 +50,61 @@ TELEOP_PID=""
 
 log()        { echo -e "\n[ros_teleop_start $(date '+%H:%M:%S')] $*\n"; }
 log_inline() { echo   "[ros_teleop_start $(date '+%H:%M:%S')] $*"; }
+
+# ── Pre-launch cleanup: kill any stray wrapper + free the CANalyst ────────
+#
+# The vendor Segway SDK segfaults if two processes try to touch the CANalyst
+# at once. A previous run that hung inside `exit_control_ctrl()` or died
+# with the enable half-initialized will leave a python3 zombie holding the
+# USB fd, and every subsequent launch segfaults until it's killed.
+#
+# So before spawning: kill anything named aadi_segway_can_wrapper.py, then
+# double-check the USB node itself is free (belt-and-braces for cases where
+# a non-wrapper process somehow grabbed it).
+
+kill_stray_wrappers() {
+  if pgrep -f "aadi_segway_can_wrapper.py" > /dev/null 2>&1; then
+    STRAY_PIDS=$(pgrep -f "aadi_segway_can_wrapper.py" | tr '\n' ' ')
+    log_inline "found stray wrapper process(es): ${STRAY_PIDS}— SIGKILL"
+    pkill -9 -f "aadi_segway_can_wrapper.py" || true
+    sleep 1
+  fi
+}
+
+free_canalyst_usb() {
+  # Find the current CANalyst USB devnode (e.g. /dev/bus/usb/001/021)
+  local canalyst_line
+  canalyst_line=$(lsusb -d "${CANALYST_VID}:${CANALYST_PID}" 2>/dev/null || true)
+  if [[ -z "${canalyst_line}" ]]; then
+    log_inline "CANalyst not enumerated on USB — skipping free-check"
+    return 0
+  fi
+
+  # Parse "Bus 001 Device 021: ..."
+  local bus dev node
+  bus=$(echo "${canalyst_line}" | awk '{print $2}')
+  dev=$(echo "${canalyst_line}" | awk '{print $4}' | tr -d ':')
+  node="/dev/bus/usb/${bus}/${dev}"
+
+  if [[ ! -e "${node}" ]]; then
+    log_inline "CANalyst node ${node} not found — skipping free-check"
+    return 0
+  fi
+
+  if fuser -s "${node}" 2>/dev/null; then
+    HOLDERS=$(fuser "${node}" 2>/dev/null | tr -s ' ')
+    log_inline "CANalyst ${node} still in use by:${HOLDERS} — SIGKILL"
+    fuser -k -9 "${node}" 2>/dev/null || true
+    sleep 1
+    # One more check — if it's still held, we can't safely proceed.
+    if fuser -s "${node}" 2>/dev/null; then
+      echo "[ros_teleop_start] ERROR: CANalyst ${node} still held after kill — aborting" >&2
+      echo "[ros_teleop_start] Investigate with: fuser -v ${node}" >&2
+      exit 4
+    fi
+    log_inline "CANalyst ${node} now free"
+  fi
+}
 
 # ── Cleanup: reverse of startup ──────────────────────────────────────────
 
@@ -73,6 +132,14 @@ cleanup() {
     WRAPPER_PID=""
   fi
 
+  # Belt-and-braces: nuke any other wrapper processes that might have been
+  # spawned outside our tracking (e.g. by a previous supervisor). Without
+  # this, a leaked wrapper will segfault the next launch.
+  if pgrep -f "aadi_segway_can_wrapper.py" > /dev/null 2>&1; then
+    log_inline "Killing residual wrapper process(es) on exit"
+    pkill -9 -f "aadi_segway_can_wrapper.py" 2>/dev/null || true
+  fi
+
   # Clean up the ready file if the wrapper crashed before removing it
   rm -f "$READY_FILE" 2>/dev/null || true
 
@@ -94,6 +161,12 @@ fi
 # Purge any stale ready file from a previous run — otherwise we'd think
 # the new wrapper is ready before it's actually started.
 rm -f "$READY_FILE" 2>/dev/null || true
+
+# ── 0. Pre-launch cleanup ────────────────────────────────────────────────
+
+log "Pre-launch cleanup: killing strays + freeing CANalyst..."
+kill_stray_wrappers
+free_canalyst_usb
 
 # ── 1. Spawn CAN wrapper ─────────────────────────────────────────────────
 
