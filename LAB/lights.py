@@ -304,35 +304,30 @@ class LightsController:
     def _handle_xwalk(self, data: dict) -> None:
         """Xwalk envelope from browser.
 
-        {"data":{"on":True}}  → all 4 light channels blink together, and
-                                STAY blinking until an explicit off arrives.
-                                Amp (ch 6) is left alone.
-        {"data":{"on":False}} → cancel immediately, restore steady state.
+        {"data":{"on":True}}  → xmas lights (ch 4) steady ON
+        {"data":{"on":False}} → xmas lights (ch 4) OFF
+
+        No blink, no other channels touched.
         """
         on = truthy(data.get("on"))
         with self._state_lock:
-            if on:
-                if not self._xwalk_active:
-                    self._xwalk_active = True
-                    log("lights", "xwalk: 4-channel blink ON (persists until off)")
-                # else: already blinking — nothing to do
-            else:
-                if self._xwalk_active:
-                    self._xwalk_active = False
-                    log("lights", "xwalk: cancelled")
-                # else: already off — nothing to do
+            if on == self._xwalk_active:
+                return  # no-op if already in this state
+            self._xwalk_active = on
+        log("lights", f"xwalk: xmas (ch 4) {'ON' if on else 'OFF'}")
+        self._write_relay(CH_XMAS, on)
 
-    def _handle_talk(self, data: dict) -> None:
-        try:
-            duration = float(data.get("duration", self._talk_default))
-        except (TypeError, ValueError):
-            duration = self._talk_default
-        duration = max(0.5, min(30.0, duration))
-        now = time.monotonic()
-        with self._state_lock:
-            # 3-channel blink (headlights + tails/halos). Xmas + amp untouched.
-            self._talk_blink_until = now + duration
-        log("lights", f"talk blink {duration:.1f}s (ch 1,2,3)")
+        def _handle_talk(self, data: dict) -> None:
+            try:
+                duration = float(data.get("duration", self._talk_default))
+            except (TypeError, ValueError):
+                duration = self._talk_default
+            duration = max(0.5, min(30.0, duration))
+            now = time.monotonic()
+            with self._state_lock:
+                # 3-channel blink (headlights + tails/halos). Xmas + amp untouched.
+                self._talk_blink_until = now + duration
+            log("lights", f"talk blink {duration:.1f}s (ch 1,2,3)")
 
     # ── relay write with reconnect ──────────────────────────────────────────
 
@@ -397,6 +392,7 @@ class LightsController:
                         return
                 try:
                     os.write(self._dev, payload)
+                    time.sleep(0.002)
                     return
                 except OSError as exc:
                     msg = str(exc).lower()
@@ -508,19 +504,6 @@ class LightsController:
             prev_xwalk_active = xwalk_active
 
             phase = not phase
-
-            # ── XWALK: 4 light channels blink together (highest precedence) ─
-            if xwalk_active:
-                for ch in XWALK_CHANNELS:
-                    self._write_relay(ch, phase)
-                self._stop.wait(timeout=self._blink_half)
-                continue
-
-            # xwalk just ended → make sure xmas is off; then fall through to
-            # restore steady state on channels 1-3.
-            if just_ended_xwalk:
-                self._write_relay(CH_XMAS, False)
-                self._apply_steady()
 
             # talk just ended → restore steady on channels 1-3.
             if just_ended_talk:
