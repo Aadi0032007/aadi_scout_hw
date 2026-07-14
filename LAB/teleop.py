@@ -1059,10 +1059,9 @@ def main() -> None:
 
     def on_local_event(envelope: dict, addr, port: int) -> None:
         type_ = (envelope.get("type") or "").strip().lower()
-        event_ = (envelope.get("event") or "").strip().lower()   # ← new-style events
         data  = envelope.get("data") or {}
         try:
-            # Existing TCP-envelope handlers ...
+            # Existing envelope handlers — unchanged
             if type_ in ("lights", "indicator", "talk") and lights is not None:
                 lights.command(envelope)
             if type_ == "talk" and audio is not None:
@@ -1086,69 +1085,27 @@ def main() -> None:
                 elif action == "goto_home":
                     ptz.goto_home()
 
-            # ── NEW: flat "event" envelopes from local gamepad ─────────────
-            if event_ == "ai_mode":
-                on = truthy(envelope.get("on"))
+            # ── NEW: ABXY toggle envelopes ────────────────────────────────
+            if type_ == "ai_mode":
+                on = truthy(data.get("on"))
                 log("teleop", f"local ai_mode → {on}")
                 motion.set_ai_enabled(on)
 
-            elif event_ == "bubble":
-                on = truthy(envelope.get("on"))
+            elif type_ == "bubble":
+                on = truthy(data.get("on"))
                 log("teleop", f"local bubble → {on}")
                 motion.set_lidar_block_enabled(on)
 
-            elif event_ == "xwalk":
-                on = truthy(envelope.get("on"))
+            elif type_ == "xwalk":
+                on = truthy(data.get("on"))
                 log("teleop", f"local xwalk → {on}")
                 if lights is not None:
                     lights.command({"type": "xwalk", "data": {"on": on}})
 
-            elif event_ == "yield":
-                on = truthy(envelope.get("on"))
-                log("teleop", f"local yield → {on} (no subsystem wired yet)")
-                # No yield subsystem yet — mirrors what ws does.
-
-            elif event_ == "audio":
-                vol = envelope.get("volume_pct")
-                if audio is not None and vol is not None:
-                    audio.set_volume(int(vol))
-
-            elif event_ == "talk":
-                # local gamepad emits {"event":"talk","duration":X}
-                # bundled with a preceding "audio" volume set; the actual
-                # spoken text arrives via on_tts.
-                pass  # nothing to do — text comes via _emit_tts
-
-            elif event_ == "music":
-                action = (envelope.get("action") or "").strip().lower()
-                if action == "play" and audio is not None:
-                    track = envelope.get("track")
-                    if track is not None:
-                        audio.play_music(int(track))
-
-            elif event_ == "tts":
-                # local gamepad emits {"event":"tts","text":...} when no
-                # on_tts callback was wired
-                text = envelope.get("text")
-                if text:
-                    _speak_and_blink(str(text), audio, lights, cfg)
-
-            elif event_ == "signals":
-                if lights is not None:
-                    if envelope.get("left"):
-                        lights.command({"type": "indicator", "data": {"side": "left"}})
-                    elif envelope.get("right"):
-                        lights.command({"type": "indicator", "data": {"side": "right"}})
-                    else:
-                        lights.command({"type": "indicator", "data": {"side": "center"}})
-
-            elif event_ == "lights":
-                if lights is not None:
-                    lights.command({"type": "lights", "data": {
-                        "headlights": envelope.get("headlights"),
-                        "parklights": envelope.get("parklights"),
-                        "strobe":     envelope.get("strobe"),
-                    }})
+            elif type_ == "yield":
+                on = truthy(data.get("on"))
+                log("teleop", f"local yield → {on}")
+                # No yield subsystem yet — matches how WS handles it.
 
         except Exception as exc:
             log("teleop", f"local event handler error: {exc}")
