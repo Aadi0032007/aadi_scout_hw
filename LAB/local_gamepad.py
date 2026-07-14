@@ -438,28 +438,21 @@ class LocalGamepad:
                 next_t = time.time()
                 continue
 
-        # ── inputs ──────────────────────────────────────────────────
-        try:
-            raw_steer   = -self._read_axis(js, gp["axis_steer"], pygame_mod)
-            head_lr     = self._read_axis(js, gp["axis_head_lr"], pygame_mod)
-            head_ud     = self._read_axis(js, gp["axis_head_ud"], pygame_mod)
-            signal_axis = self._read_axis_counts(js, gp["axis_signal"], pygame_mod)
-            sound_axis  = self._read_axis_counts(js, gp["axis_sound"], pygame_mod)
-        except pygame_mod.error as exc:
-            log("local_gp", f"axis read failed ({exc}) — treating as disconnect")
-            js = self._wait_for_joystick(pygame_mod)
-            if js is None:
-                return
-            gp = self._get_mapping(js)
-            next_t = time.time()
-            continue
-
             # ── inputs ──────────────────────────────────────────────────
-            raw_steer   = -self._read_axis(js, gp["axis_steer"], pygame_mod)
-            head_lr     = self._read_axis(js, gp["axis_head_lr"], pygame_mod)
-            head_ud     = self._read_axis(js, gp["axis_head_ud"], pygame_mod)
-            signal_axis = self._read_axis_counts(js, gp["axis_signal"], pygame_mod)
-            sound_axis  = self._read_axis_counts(js, gp["axis_sound"], pygame_mod)
+            try:
+                raw_steer   = -self._read_axis(js, gp["axis_steer"], pygame_mod)
+                head_lr     = self._read_axis(js, gp["axis_head_lr"], pygame_mod)
+                head_ud     = self._read_axis(js, gp["axis_head_ud"], pygame_mod)
+                signal_axis = self._read_axis_counts(js, gp["axis_signal"], pygame_mod)
+                sound_axis  = self._read_axis_counts(js, gp["axis_sound"], pygame_mod)
+            except pygame_mod.error as exc:
+                log("local_gp", f"axis read failed ({exc}) — treating as disconnect")
+                js = self._wait_for_joystick(pygame_mod)
+                if js is None:
+                    return
+                gp = self._get_mapping(js)
+                next_t = time.time()
+                continue
 
             # Fall back to hat pad for head direction if right stick idle
             if abs(head_lr) < 0.01 and abs(head_ud) < 0.01 and js.get_numhats() > 0:
