@@ -208,6 +208,18 @@ while [[ ! -f "$READY_FILE" ]]; do
 done
 log "Chassis green — wrapper reports ready."
 
+# ── 2b. Wake 8BitDo XInput stream (Jetson xpad has LEDs disabled) ─────────
+# Without the Xbox LED/start OUT packet the dongle enumerates but sends no
+# button/axis reports. Harmless if the pad/dongle is absent.
+if lsusb -d 2dc8:310b >/dev/null 2>&1; then
+  log_inline "Waking 8BitDo XInput (2dc8:310b)…"
+  if "$PYTHON" "${CAN_DIR}/wake_8bitdo_xinput.py"; then
+    log_inline "8BitDo XInput stream awake"
+  else
+    log_inline "8BitDo wake failed (pad off / dongle idle?) — teleop continues"
+  fi
+fi
+
 # ── 3. Start teleop in the foreground ────────────────────────────────────
 
 log "Starting LAB/teleop.py..."
@@ -223,4 +235,3 @@ RC=$?
 TELEOP_PID=""
 
 log_inline "teleop exited rc=${RC}"
-exit "$RC"
