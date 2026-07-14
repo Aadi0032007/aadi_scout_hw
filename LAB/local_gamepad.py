@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Created on Sun Jul  5 07:09:45 2026
-Updated: ABXY feature parity + buffered A/B lock disambiguation + 8BitDo reconnect
+Updated: ABXY feature parity + buffered A/B lock disambiguation + safe 8BitDo reconnect
 
 @author: Aadi
 """
@@ -104,12 +104,12 @@ SWAP_XY_BUTTONS       = False
 # Joystick reconnect
 JOYSTICK_RETRY_SEC = 1.0
 
-# 8BitDo Ultimate 2 XInput wake/recovery.
-# The USB dongle can remain enumerated as /dev/input/js0 even when the
-# physical controller has powered off or gone idle. On Jetson, the dongle
-# may need an Xbox LED/start OUT packet before it resumes interrupt reports.
+# 8BitDo XInput dongle wake/reconnect
+# Jetson xpad may keep the dongle enumerated while the physical controller
+# sleeps, and sometimes needs the OUT/LED start packet again after wake.
 WAKE_8BITDO_SCRIPT = "/home/revolabs/Revobots/Segway/CAN/wake_8bitdo_xinput.py"
-REWAKE_MIN_INTERVAL_SEC = 5.0
+REWAKE_MIN_INTERVAL_SEC = 6.0
+WAKE_8BITDO_TIMEOUT_SEC = 5.0
 JOYSTICK_SOFT_REINIT_SEC = 3.0
 
 
@@ -204,9 +204,6 @@ class LocalGamepad:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._local_event_seq = 0
-
-        # Last time we ran wake_8bitdo_xinput.py. Used to avoid hammering
-        # USB/xpad while the controller is off or reconnecting.
         self._last_8bitdo_wake_t = 0.0
 
     # ── lifecycle ───────────────────────────────────────────────────────────
@@ -263,19 +260,19 @@ class LocalGamepad:
             return None
         return pygame
 
+    def _wake_8bitdo(self, reason: str = "") -> bool:
+        """Kick the 8BitDo XInput dongle so reports start flowing again.
 
-    def _wake_8bitdo(self, reason: str = "") -> None:
-        """Kick the 8BitDo XInput dongle so it starts sending reports again.
-
-        The dongle can stay visible to pygame while the physical controller
-        is asleep/off. Running the wake helper sends the OUT packet this
-        Jetson/xpad setup needs, then reattaches the kernel xpad driver.
+        Important: call this only from the local-gamepad worker thread, and
+        preferably after pygame.joystick.quit(). The helper can briefly detach
+        and reattach the kernel xpad driver; continuing to use an old pygame
+        Joystick object after this is unsafe.
         """
         now = time.time()
         if now - self._last_8bitdo_wake_t < REWAKE_MIN_INTERVAL_SEC:
-            return
+            return False
         if not os.path.exists(WAKE_8BITDO_SCRIPT):
-            return
+            return False
 
         self._last_8bitdo_wake_t = now
         suffix = f" ({reason})" if reason else ""
@@ -285,19 +282,76 @@ class LocalGamepad:
                 ["/usr/bin/python3", WAKE_8BITDO_SCRIPT],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=8,
+                timeout=WAKE_8BITDO_TIMEOUT_SEC,
                 check=False,
             )
+            return True
+        except subprocess.TimeoutExpired:
+            log("local_gp", f"8BitDo wake timed out after {WAKE_8BITDO_TIMEOUT_SEC:.1f}s")
+            return False
         except Exception as exc:
             log("local_gp", f"8BitDo wake failed: {exc}")
+            return False
+
+    def _safe_reopen_joystick(self, pygame_mod, reason: str, do_wake: bool = True):
+        """Drop any stale pygame joystick object and open a fresh one.
+
+        Returns (js, mapping) or (None, None). This is the only safe thing to
+        do after the 8BitDo wake helper runs, because the helper may detach /
+        reattach the USB kernel driver underneath pygame.
+        """
+        log("local_gp", f"reopening joystick ({reason})")
+        try:
+            pygame_mod.joystick.quit()
+        except Exception:
+            pass
+
+        if do_wake:
+            self._wake_8bitdo(reason)
+
+        # Give xpad/udev a short moment to recreate the event/js node.
+        self._stop.wait(timeout=0.25)
+        if self._stop.is_set():
+            return None, None
+
+        try:
+            pygame_mod.joystick.init()
+            try:
+                pygame_mod.event.pump()
+            except Exception:
+                pass
+            count = pygame_mod.joystick.get_count()
+        except Exception as exc:
+            log("local_gp", f"joystick reinit failed: {exc}")
+            return None, None
+
+        if count <= 0:
+            return None, None
+
+        try:
+            js = pygame_mod.joystick.Joystick(0)
+            js.init()
+            gp = self._get_mapping(js)
+            log("local_gp", "joystick reopened")
+            return js, gp
+        except Exception as exc:
+            log("local_gp", f"joystick reopen failed: {exc}")
+            return None, None
 
     def _wait_for_joystick(self, pygame_mod, retry_sec=JOYSTICK_RETRY_SEC):
         logged_waiting = False
         while not self._stop.is_set():
+            try:
+                pygame_mod.joystick.quit()
+            except Exception:
+                pass
             self._wake_8bitdo("before joystick scan")
-            pygame_mod.joystick.quit()
-            pygame_mod.joystick.init()
-            count = pygame_mod.joystick.get_count()
+            try:
+                pygame_mod.joystick.init()
+                count = pygame_mod.joystick.get_count()
+            except Exception as exc:
+                log("local_gp", f"joystick scan failed: {exc}")
+                count = 0
             if count > 0:
                 try:
                     js = pygame_mod.joystick.Joystick(0)
@@ -342,15 +396,21 @@ class LocalGamepad:
     def _read_button(js, idx):
         if idx is None or idx < 0:
             return 0
-        return js.get_button(idx) if js.get_numbuttons() > idx else 0
+        try:
+            return js.get_button(idx) if js.get_numbuttons() > idx else 0
+        except Exception:
+            # Stale pygame Joystick object after USB/xpad reattach.
+            raise
 
     def _read_axis(self, js, idx, pygame_mod):
-        if js.get_numaxes() <= idx:
-            return 0.0
         try:
+            if js.get_numaxes() <= idx:
+                return 0.0
             v = js.get_axis(idx)
         except pygame_mod.error:
-            return 0.0
+            raise
+        except Exception:
+            raise
         if abs(v) > 1.5:
             v = v / 32767.0
         return _clamp(v, -1.0, 1.0)
@@ -418,13 +478,20 @@ class LocalGamepad:
             next_t += period
 
             # ── joystick health ─────────────────────────────────────────
-            if pygame_mod.joystick.get_count() == 0:
-                log("local_gp", "joystick disconnected, re-waking/waiting…")
-                self._wake_8bitdo("joystick count is zero")
-                js = self._wait_for_joystick(pygame_mod)
+            try:
+                joy_count = pygame_mod.joystick.get_count()
+            except Exception as exc:
+                log("local_gp", f"joystick count error: {exc}")
+                joy_count = 0
+
+            if joy_count == 0:
+                js, gp = self._safe_reopen_joystick(
+                    pygame_mod, "joystick count is zero", do_wake=True
+                )
                 if js is None:
-                    return
-                gp = self._get_mapping(js)
+                    self._stop.wait(timeout=JOYSTICK_RETRY_SEC)
+                    next_t = time.time()
+                    continue
                 next_t = time.time()
                 last_soft_reinit_t = time.time()
                 continue
@@ -432,49 +499,58 @@ class LocalGamepad:
             try:
                 pygame_mod.event.pump()
             except pygame_mod.error:
-                log("local_gp", "event pump error, re-waking/re-detecting")
-                self._wake_8bitdo("after pygame event error")
-                js = self._wait_for_joystick(pygame_mod)
+                js, gp = self._safe_reopen_joystick(
+                    pygame_mod, "pygame event pump error", do_wake=True
+                )
                 if js is None:
-                    return
-                gp = self._get_mapping(js)
+                    self._stop.wait(timeout=JOYSTICK_RETRY_SEC)
+                    next_t = time.time()
+                    continue
                 next_t = time.time()
                 last_soft_reinit_t = time.time()
                 continue
 
-            # The 8BitDo USB dongle can remain visible as one joystick while
-            # the physical controller has gone to sleep. In that case the
-            # get_count()==0 path never fires. Periodically re-wake/reinit
-            # while the robot is LOCKED so the pad can come back without a
-            # full teleop restart. We avoid doing this while unlocked to keep
-            # driving control stable.
+            # The 8BitDo dongle may stay visible while the controller sleeps.
+            # Re-open only while LOCKED so we never interrupt active driving.
+            # After any wake/reopen we immediately continue; never read inputs
+            # from a joystick object that existed before the USB reattach.
             if self._robot_lock and (time.time() - last_soft_reinit_t > JOYSTICK_SOFT_REINIT_SEC):
+                js2, gp2 = self._safe_reopen_joystick(
+                    pygame_mod, "periodic while locked", do_wake=True
+                )
                 last_soft_reinit_t = time.time()
-                try:
-                    self._wake_8bitdo("periodic while locked")
-                    pygame_mod.joystick.quit()
-                    pygame_mod.joystick.init()
-                    if pygame_mod.joystick.get_count() > 0:
-                        js = pygame_mod.joystick.Joystick(0)
-                        js.init()
-                        gp = self._get_mapping(js)
-                        next_t = time.time()
-                        continue
-                except Exception as exc:
-                    log("local_gp", f"periodic joystick reinit failed: {exc}")
+                if js2 is not None:
+                    js, gp = js2, gp2
+                next_t = time.time()
+                continue
 
             # ── inputs ──────────────────────────────────────────────────
-            raw_steer   = -self._read_axis(js, gp["axis_steer"], pygame_mod)
-            head_lr     = self._read_axis(js, gp["axis_head_lr"], pygame_mod)
-            head_ud     = self._read_axis(js, gp["axis_head_ud"], pygame_mod)
-            signal_axis = self._read_axis_counts(js, gp["axis_signal"], pygame_mod)
-            sound_axis  = self._read_axis_counts(js, gp["axis_sound"], pygame_mod)
+            try:
+                raw_steer   = -self._read_axis(js, gp["axis_steer"], pygame_mod)
+                head_lr     = self._read_axis(js, gp["axis_head_lr"], pygame_mod)
+                head_ud     = self._read_axis(js, gp["axis_head_ud"], pygame_mod)
+                signal_axis = self._read_axis_counts(js, gp["axis_signal"], pygame_mod)
+                sound_axis  = self._read_axis_counts(js, gp["axis_sound"], pygame_mod)
 
-            # Fall back to hat pad for head direction if right stick idle
-            if abs(head_lr) < 0.01 and abs(head_ud) < 0.01 and js.get_numhats() > 0:
-                hx, hy = js.get_hat(0)
-                head_lr = float(hx)
-                head_ud = float(-hy)
+                # Fall back to hat pad for head direction if right stick idle
+                if abs(head_lr) < 0.01 and abs(head_ud) < 0.01:
+                    try:
+                        if js.get_numhats() > 0:
+                            hx, hy = js.get_hat(0)
+                            head_lr = float(hx)
+                            head_ud = float(-hy)
+                    except pygame_mod.error:
+                        raise
+            except Exception as exc:
+                log("local_gp", f"joystick read failed, reopening: {exc}")
+                js, gp = self._safe_reopen_joystick(
+                    pygame_mod, "joystick read failed", do_wake=True
+                )
+                if js is None:
+                    self._stop.wait(timeout=JOYSTICK_RETRY_SEC)
+                next_t = time.time()
+                last_soft_reinit_t = time.time()
+                continue
 
             # ── Axis 3 → indicator event ────────────────────────────────
             if signal_axis < -AXIS_ACTION_THRESHOLD_COUNTS:
@@ -530,17 +606,28 @@ class LocalGamepad:
                 axis4_state = new_axis4
 
             # ── buttons ─────────────────────────────────────────────────
-            a_pressed = self._read_button(js, gp["btn_a"])
-            b_pressed = self._read_button(js, gp["btn_b"])
-            y_pressed = self._read_button(js, gp["btn_y"])
-            x_pressed = self._read_button(js, gp["btn_x"])
-            cruise_up = self._read_button(js, gp["btn_cruise_up"])
-            cruise_down = self._read_button(js, gp["btn_cruise_down"])
-            lights_on_pressed  = self._read_button(js, gp["btn_lights_on"])
-            lights_off_pressed = self._read_button(js, gp["btn_lights_off"])
+            try:
+                a_pressed = self._read_button(js, gp["btn_a"])
+                b_pressed = self._read_button(js, gp["btn_b"])
+                y_pressed = self._read_button(js, gp["btn_y"])
+                x_pressed = self._read_button(js, gp["btn_x"])
+                cruise_up = self._read_button(js, gp["btn_cruise_up"])
+                cruise_down = self._read_button(js, gp["btn_cruise_down"])
+                lights_on_pressed  = self._read_button(js, gp["btn_lights_on"])
+                lights_off_pressed = self._read_button(js, gp["btn_lights_off"])
 
-            lift_pos_axis = self._read_axis(js, gp["axis_lift_pos"], pygame_mod)
-            lift_neg_axis = self._read_axis(js, gp["axis_lift_neg"], pygame_mod)
+                lift_pos_axis = self._read_axis(js, gp["axis_lift_pos"], pygame_mod)
+                lift_neg_axis = self._read_axis(js, gp["axis_lift_neg"], pygame_mod)
+            except Exception as exc:
+                log("local_gp", f"button/trigger read failed, reopening: {exc}")
+                js, gp = self._safe_reopen_joystick(
+                    pygame_mod, "button/trigger read failed", do_wake=True
+                )
+                if js is None:
+                    self._stop.wait(timeout=JOYSTICK_RETRY_SEC)
+                next_t = time.time()
+                last_soft_reinit_t = time.time()
+                continue
             lift_pos_cmd = _lift_axis_to_cmd(lift_pos_axis)
             lift_neg_cmd = _lift_axis_to_cmd(lift_neg_axis)
             if lift_pos_cmd > lift_neg_cmd:
