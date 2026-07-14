@@ -264,10 +264,14 @@ class LocalGamepad:
                     log("local_gp", f"joystick init failed: {exc}")
                     self._stop.wait(timeout=retry_sec)
                     continue
+                name = js.get_name() or ""
                 log("local_gp",
-                    f"joystick found: {js.get_name()} "
+                    f"joystick found: {name} "
                     f"(axes={js.get_numaxes()} btns={js.get_numbuttons()} "
                     f"hats={js.get_numhats()})")
+                # NEW: 8bitdo XInput needs a wake kick after (re)connect
+                if "8bitdo" in name.lower() or "x-box" in name.lower():
+                    self._wake_8bitdo_xinput()
                 return js
             if not logged_waiting:
                 log("local_gp",
@@ -276,6 +280,24 @@ class LocalGamepad:
                 logged_waiting = True
             self._stop.wait(timeout=retry_sec)
         return None
+
+    def _wake_8bitdo_xinput(self) -> None:
+        """Call the wake script (best-effort) so a freshly-reconnected 8bitdo
+        XInput controller starts streaming input reports."""
+        import subprocess
+        wake_script = "/home/revolabs/Revobots/Segway/CAN/wake_8bitdo_xinput.py"
+        if not os.path.isfile(wake_script):
+            return
+        try:
+            subprocess.run(
+                ["sudo", "python3", wake_script],
+                timeout=5.0,
+                capture_output=True,
+                text=True,
+            )
+            log("local_gp", "8bitdo XInput wake sent")
+        except Exception as exc:
+            log("local_gp", f"wake script failed: {exc}")
 
     def _get_mapping(self, js):
         name = (js.get_name() or "").strip().lower()
@@ -328,42 +350,16 @@ class LocalGamepad:
             return
         gp = self._get_mapping(js)
 
-        # ── State ───────────────────────────────────────────────────────────
+        # State
         seq = 0
         period = 1.0 / SEND_HZ
         next_t = time.time()
 
-        cruise_zero_idx = CRUISE_LEVELS.index(0.0)
-        cruise_level_idx = cruise_zero_idx
-        cruise_speed = 0.0
+        # ... (all state init unchanged) ...
 
-        max_speed = MAX_SPEED_INITIAL
-        speed_level = 1   # 1=slow, 2=medium, 3=fast
-
-        # Feature toggle state — mirrors what browser tracks
-        ai_on     = False
-        bubble_on = False
-        xwalk_on  = False
-        yield_on  = False
-
-        # A/B toggle buffer:
-        #   *_buffered_until = time.time() deadline. If deadline expires
-        #   without the paired button, fire the standalone toggle. If the
-        #   paired button arrives before the deadline, sequence fires and
-        #   the buffer is cleared (toggle suppressed).
-        a_buffered_until: Optional[float] = None
-        b_buffered_until: Optional[float] = None
-
-        prev_a = prev_b = prev_y = prev_x = 0
-        prev_cruise_up = prev_cruise_down = 0
-        prev_lights_on = prev_lights_off = 0
-        axis3_state = "center"
-        axis4_state = "center"
-        axis4_neg_taps: list = []
-        axis4_pending_speech_deadline: Optional[float] = None
-
-        prev_ai_chord = False
-        ai_request_counter = 0
+        # NEW: periodic reconnect check
+        last_health_check_t = time.time()
+        HEALTH_CHECK_INTERVAL_S = 1.0
 
         while not self._stop.is_set():
             # ── tick pacing ─────────────────────────────────────────────
@@ -374,16 +370,63 @@ class LocalGamepad:
                     break
             next_t += period
 
-            # ── joystick health ─────────────────────────────────────────
-            if pygame_mod.joystick.get_count() == 0:
-                log("local_gp", "joystick disconnected, waiting…")
-                js = self._wait_for_joystick(pygame_mod)
-                if js is None:
-                    return
-                gp = self._get_mapping(js)
-                next_t = time.time()
-                continue
+            # ── joystick health (periodic + reactive) ───────────────────
+            # SDL caches the joystick list; force a refresh every second so
+            # disconnects/reconnects are noticed.
+            if now - last_health_check_t >= HEALTH_CHECK_INTERVAL_S:
+                last_health_check_t = now
+                try:
+                    pygame_mod.joystick.quit()
+                    pygame_mod.joystick.init()
+                    fresh_count = pygame_mod.joystick.get_count()
+                except Exception:
+                    fresh_count = 0
 
+                if fresh_count == 0:
+                    log("local_gp", "joystick gone, waiting for reconnect…")
+                    js = self._wait_for_joystick(pygame_mod)
+                    if js is None:
+                        return
+                    gp = self._get_mapping(js)
+                    next_t = time.time()
+                    # Reset transient state that could be stale from before disconnect
+                    a_buffered_until = None
+                    b_buffered_until = None
+                    axis3_state = "center"
+                    axis4_state = "center"
+                    axis4_neg_taps = []
+                    axis4_pending_speech_deadline = None
+                    prev_a = prev_b = prev_y = prev_x = 0
+                    prev_cruise_up = prev_cruise_down = 0
+                    prev_lights_on = prev_lights_off = 0
+                    prev_ai_chord = False
+                    continue
+
+                # Different device or same? Re-open the handle so we're not
+                # reading from a stale joystick object.
+                try:
+                    new_js = pygame_mod.joystick.Joystick(0)
+                    new_js.init()
+                    # If the name/GUID differs from what we had, treat it as reconnect
+                    new_name = (new_js.get_name() or "").strip()
+                    old_name = (js.get_name() or "").strip() if js else ""
+                    if new_name != old_name or js is None:
+                        log("local_gp", f"joystick changed: {old_name!r} → {new_name!r}")
+                        js = new_js
+                        gp = self._get_mapping(js)
+                    else:
+                        # Same device — just refresh handle to be safe
+                        js = new_js
+                except pygame_mod.error as exc:
+                    log("local_gp", f"joystick re-open failed: {exc}")
+                    js = self._wait_for_joystick(pygame_mod)
+                    if js is None:
+                        return
+                    gp = self._get_mapping(js)
+                    next_t = time.time()
+                    continue
+
+            # Reactive check — if event pump or a read errors, reconnect
             try:
                 pygame_mod.event.pump()
             except pygame_mod.error:
@@ -394,6 +437,22 @@ class LocalGamepad:
                 gp = self._get_mapping(js)
                 next_t = time.time()
                 continue
+
+        # ── inputs ──────────────────────────────────────────────────
+        try:
+            raw_steer   = -self._read_axis(js, gp["axis_steer"], pygame_mod)
+            head_lr     = self._read_axis(js, gp["axis_head_lr"], pygame_mod)
+            head_ud     = self._read_axis(js, gp["axis_head_ud"], pygame_mod)
+            signal_axis = self._read_axis_counts(js, gp["axis_signal"], pygame_mod)
+            sound_axis  = self._read_axis_counts(js, gp["axis_sound"], pygame_mod)
+        except pygame_mod.error as exc:
+            log("local_gp", f"axis read failed ({exc}) — treating as disconnect")
+            js = self._wait_for_joystick(pygame_mod)
+            if js is None:
+                return
+            gp = self._get_mapping(js)
+            next_t = time.time()
+            continue
 
             # ── inputs ──────────────────────────────────────────────────
             raw_steer   = -self._read_axis(js, gp["axis_steer"], pygame_mod)

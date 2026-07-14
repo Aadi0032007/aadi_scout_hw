@@ -99,7 +99,7 @@ CH_TAIL_HALO_RIGHT = 1
 CH_TAIL_HALO_LEFT  = 2
 CH_HEADLIGHTS      = 3
 CH_XMAS            = 4      # xwalk-exclusive
-# channel 5 unused
+CH_FAN             = 5 
 CH_SPEAKER_AMP     = 6      # unlock-gated — audio amp power
 # channels 7, 8 unused
 
@@ -172,6 +172,7 @@ class LightsController:
         # in a known-safe state: lights off, amp off. Unlock will turn them
         # on together.
         self.all_off()
+        self._write_relay(CH_FAN, True)
         self._blink_thread.start()
         log("lights", "ready (8-ch relay, amp=ch6 unlock-gated)")
 
@@ -453,16 +454,18 @@ class LightsController:
             self._write_relay(CH_TAIL_HALO_RIGHT, on)
 
     def _apply_all_off(self) -> None:
-        """Drive every channel this driver owns low, including amp + xmas.
+    """Drive normal robot outputs low.
 
-        Also explicitly clears channels 5, 7, 8 so if some future code path
-        ever left them latched, they don't stay stuck on.
-        """
-        for ch in ALL_CHANNELS:
-            self._write_relay(ch, False)
-        # Belt-and-braces: unused channels forced off too.
-        for ch in (5, 7, 8):
-            self._write_relay(ch, False)
+    Fan on channel 5 is intentionally NOT turned off here because it should
+    keep cooling whenever teleop is running, even while the robot is locked.
+    """
+    for ch in ALL_CHANNELS:
+        self._write_relay(ch, False)
+
+    # Belt-and-braces: unused channels forced off too.
+    # Do not include CH_FAN here.
+    for ch in (7, 8):
+        self._write_relay(ch, False)
 
     # ── blink loop ──────────────────────────────────────────────────────────
 
