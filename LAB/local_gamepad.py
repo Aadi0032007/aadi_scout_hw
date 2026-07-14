@@ -98,6 +98,8 @@ AI_REQUEST_REPEAT_PACKETS = 5
 
 # Lock sequence + A/B toggle buffer window (same value — they use one clock)
 LOCK_SEQUENCE_TIMEOUT = 2.0
+AB_UNLOCK_HOLD_SEC    = 0.12   # while locked, A+B held this long unlocks immediately
+LOCKED_AB_SINGLE_IGNORES = True  # avoid accidental AI/bubble while trying to unlock
 MAX_SPEED_INITIAL     = 1.0
 SWAP_XY_BUTTONS       = False
 
@@ -110,7 +112,7 @@ JOYSTICK_RETRY_SEC = 1.0
 WAKE_8BITDO_SCRIPT = "/home/revolabs/Revobots/Segway/CAN/wake_8bitdo_xinput.py"
 REWAKE_MIN_INTERVAL_SEC = 6.0
 WAKE_8BITDO_TIMEOUT_SEC = 5.0
-JOYSTICK_SOFT_REINIT_SEC = 3.0
+JOYSTICK_SOFT_REINIT_SEC = 0.0  # 0 disables periodic reopen; reopen only on disconnect/error
 
 
 # ── Gamepad mappings (identical to pilot) ────────────────────────────────────
@@ -456,6 +458,8 @@ class LocalGamepad:
         #   the buffer is cleared (toggle suppressed).
         a_buffered_until: Optional[float] = None
         b_buffered_until: Optional[float] = None
+        ab_down_since: Optional[float] = None
+        ab_combo_latched = False
 
         prev_a = prev_b = prev_y = prev_x = 0
         prev_cruise_up = prev_cruise_down = 0
@@ -514,7 +518,11 @@ class LocalGamepad:
             # Re-open only while LOCKED so we never interrupt active driving.
             # After any wake/reopen we immediately continue; never read inputs
             # from a joystick object that existed before the USB reattach.
-            if self._robot_lock and (time.time() - last_soft_reinit_t > JOYSTICK_SOFT_REINIT_SEC):
+            # Do NOT periodically reopen while locked. It was interrupting the
+            # 50 Hz local motion stream and could make fast A/B unlock presses
+            # unreliable. We only reopen on real joystick errors or when the
+            # joystick count drops to zero.
+            if JOYSTICK_SOFT_REINIT_SEC > 0 and self._robot_lock and (time.time() - last_soft_reinit_t > JOYSTICK_SOFT_REINIT_SEC):
                 js2, gp2 = self._safe_reopen_joystick(
                     pygame_mod, "periodic while locked", do_wake=True
                 )
@@ -659,6 +667,30 @@ class LocalGamepad:
             lights_on_edge  = lights_on_pressed  and not prev_lights_on
             lights_off_edge = lights_off_pressed and not prev_lights_off
 
+            # ── Locked-state A+B chord: unlock immediately ──────────────
+            # This makes unlock work with a normal quick press/hold instead of
+            # requiring slow A-then-B edge timing. It also prevents single A/B
+            # from accidentally becoming AI/bubble while the robot is locked.
+            both_ab_down = bool(a_pressed and b_pressed)
+            ab_chord_fired = False
+            if both_ab_down:
+                if ab_down_since is None:
+                    ab_down_since = now_t
+                if (self._robot_lock
+                        and not ab_combo_latched
+                        and (now_t - ab_down_since) >= AB_UNLOCK_HOLD_SEC):
+                    self._robot_lock = False
+                    max_speed = 1.0
+                    speed_level = 1
+                    a_buffered_until = None
+                    b_buffered_until = None
+                    ab_combo_latched = True
+                    ab_chord_fired = True
+                    log("local_gp", "robot UNLOCKED (A+B hold)")
+            else:
+                ab_down_since = None
+                ab_combo_latched = False
+
             # ── Lights buttons (all three fields together) ──────────────
             if lights_on_edge:
                 self._emit_envelope("lights", {
@@ -683,9 +715,9 @@ class LocalGamepad:
             # ── A / B buffered sequence + toggle resolution ─────────────
             # Sequence detection happens first. If A→B or B→A is completed,
             # clear both buffers and DO NOT fire the standalone toggle.
-            sequence_fired = False
+            sequence_fired = ab_chord_fired
 
-            if a_edge:
+            if a_edge and not sequence_fired:
                 # A pressed. Does a recent B mean this is a B→A lock sequence?
                 if b_buffered_until is not None and now_t <= b_buffered_until:
                     # B→A within window → LOCK
@@ -720,15 +752,21 @@ class LocalGamepad:
 
             # Buffer expiration → fire the standalone toggles
             if a_buffered_until is not None and now_t > a_buffered_until:
-                ai_on = not ai_on
-                log("local_gp", f"A → AI toggle: {ai_on}")
-                self._emit_envelope("ai_mode", {"on": ai_on})
+                if self._robot_lock and LOCKED_AB_SINGLE_IGNORES:
+                    log("local_gp", "A ignored while locked (waiting for A+B unlock)")
+                else:
+                    ai_on = not ai_on
+                    log("local_gp", f"A → AI toggle: {ai_on}")
+                    self._emit_envelope("ai_mode", {"on": ai_on})
                 a_buffered_until = None
 
             if b_buffered_until is not None and now_t > b_buffered_until:
-                bubble_on = not bubble_on
-                log("local_gp", f"B → bubble toggle: {bubble_on}")
-                self._emit_envelope("bubble", {"on": bubble_on})
+                if self._robot_lock and LOCKED_AB_SINGLE_IGNORES:
+                    log("local_gp", "B ignored while locked (waiting for A+B unlock)")
+                else:
+                    bubble_on = not bubble_on
+                    log("local_gp", f"B → bubble toggle: {bubble_on}")
+                    self._emit_envelope("bubble", {"on": bubble_on})
                 b_buffered_until = None
 
             prev_a, prev_b = a_pressed, b_pressed
