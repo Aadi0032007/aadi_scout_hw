@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Created on Sun Jul  5 07:09:45 2026
-Updated: ABXY feature parity + buffered A/B lock disambiguation
+Updated: ABXY feature parity + buffered A/B lock disambiguation + 8BitDo reconnect
 
 @author: Aadi
 """
@@ -51,6 +51,7 @@ Behaviors:
 import math
 import os
 import platform
+import subprocess
 import threading
 import time
 from typing import Callable, Optional
@@ -102,6 +103,14 @@ SWAP_XY_BUTTONS       = False
 
 # Joystick reconnect
 JOYSTICK_RETRY_SEC = 1.0
+
+# 8BitDo Ultimate 2 XInput wake/recovery.
+# The USB dongle can remain enumerated as /dev/input/js0 even when the
+# physical controller has powered off or gone idle. On Jetson, the dongle
+# may need an Xbox LED/start OUT packet before it resumes interrupt reports.
+WAKE_8BITDO_SCRIPT = "/home/revolabs/Revobots/Segway/CAN/wake_8bitdo_xinput.py"
+REWAKE_MIN_INTERVAL_SEC = 5.0
+JOYSTICK_SOFT_REINIT_SEC = 3.0
 
 
 # ── Gamepad mappings (identical to pilot) ────────────────────────────────────
@@ -196,6 +205,10 @@ class LocalGamepad:
         self._thread: Optional[threading.Thread] = None
         self._local_event_seq = 0
 
+        # Last time we ran wake_8bitdo_xinput.py. Used to avoid hammering
+        # USB/xpad while the controller is off or reconnecting.
+        self._last_8bitdo_wake_t = 0.0
+
     # ── lifecycle ───────────────────────────────────────────────────────────
 
     def start(self) -> None:
@@ -250,9 +263,38 @@ class LocalGamepad:
             return None
         return pygame
 
+
+    def _wake_8bitdo(self, reason: str = "") -> None:
+        """Kick the 8BitDo XInput dongle so it starts sending reports again.
+
+        The dongle can stay visible to pygame while the physical controller
+        is asleep/off. Running the wake helper sends the OUT packet this
+        Jetson/xpad setup needs, then reattaches the kernel xpad driver.
+        """
+        now = time.time()
+        if now - self._last_8bitdo_wake_t < REWAKE_MIN_INTERVAL_SEC:
+            return
+        if not os.path.exists(WAKE_8BITDO_SCRIPT):
+            return
+
+        self._last_8bitdo_wake_t = now
+        suffix = f" ({reason})" if reason else ""
+        log("local_gp", f"waking 8BitDo XInput stream{suffix}")
+        try:
+            subprocess.run(
+                ["/usr/bin/python3", WAKE_8BITDO_SCRIPT],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+                check=False,
+            )
+        except Exception as exc:
+            log("local_gp", f"8BitDo wake failed: {exc}")
+
     def _wait_for_joystick(self, pygame_mod, retry_sec=JOYSTICK_RETRY_SEC):
         logged_waiting = False
         while not self._stop.is_set():
+            self._wake_8bitdo("before joystick scan")
             pygame_mod.joystick.quit()
             pygame_mod.joystick.init()
             count = pygame_mod.joystick.get_count()
@@ -327,6 +369,7 @@ class LocalGamepad:
         if js is None:
             return
         gp = self._get_mapping(js)
+        last_soft_reinit_t = time.time()
 
         # ── State ───────────────────────────────────────────────────────────
         seq = 0
@@ -376,24 +419,49 @@ class LocalGamepad:
 
             # ── joystick health ─────────────────────────────────────────
             if pygame_mod.joystick.get_count() == 0:
-                log("local_gp", "joystick disconnected, waiting…")
+                log("local_gp", "joystick disconnected, re-waking/waiting…")
+                self._wake_8bitdo("joystick count is zero")
                 js = self._wait_for_joystick(pygame_mod)
                 if js is None:
                     return
                 gp = self._get_mapping(js)
                 next_t = time.time()
+                last_soft_reinit_t = time.time()
                 continue
 
             try:
                 pygame_mod.event.pump()
             except pygame_mod.error:
-                log("local_gp", "event pump error, re-detecting")
+                log("local_gp", "event pump error, re-waking/re-detecting")
+                self._wake_8bitdo("after pygame event error")
                 js = self._wait_for_joystick(pygame_mod)
                 if js is None:
                     return
                 gp = self._get_mapping(js)
                 next_t = time.time()
+                last_soft_reinit_t = time.time()
                 continue
+
+            # The 8BitDo USB dongle can remain visible as one joystick while
+            # the physical controller has gone to sleep. In that case the
+            # get_count()==0 path never fires. Periodically re-wake/reinit
+            # while the robot is LOCKED so the pad can come back without a
+            # full teleop restart. We avoid doing this while unlocked to keep
+            # driving control stable.
+            if self._robot_lock and (time.time() - last_soft_reinit_t > JOYSTICK_SOFT_REINIT_SEC):
+                last_soft_reinit_t = time.time()
+                try:
+                    self._wake_8bitdo("periodic while locked")
+                    pygame_mod.joystick.quit()
+                    pygame_mod.joystick.init()
+                    if pygame_mod.joystick.get_count() > 0:
+                        js = pygame_mod.joystick.Joystick(0)
+                        js.init()
+                        gp = self._get_mapping(js)
+                        next_t = time.time()
+                        continue
+                except Exception as exc:
+                    log("local_gp", f"periodic joystick reinit failed: {exc}")
 
             # ── inputs ──────────────────────────────────────────────────
             raw_steer   = -self._read_axis(js, gp["axis_steer"], pygame_mod)
