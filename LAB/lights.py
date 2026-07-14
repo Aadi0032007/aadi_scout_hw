@@ -99,9 +99,9 @@ CH_TAIL_HALO_RIGHT = 1
 CH_TAIL_HALO_LEFT  = 2
 CH_HEADLIGHTS      = 3
 CH_XMAS            = 4      # xwalk-exclusive
-CH_FAN             = 5 
 CH_SPEAKER_AMP     = 6      # unlock-gated — audio amp power
-# channels 7, 8 unused
+CH_FAN             = 7 
+# channels 5, 8 unused
 
 # Channels that participate in "lights on" (unlock-auto-on) and talk-blink.
 # Xmas is intentionally excluded — it's xwalk-exclusive.
