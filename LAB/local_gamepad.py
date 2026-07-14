@@ -1,30 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Created on Sun Jul  5 07:09:45 2026
-Updated: ABXY feature parity + buffered A/B lock disambiguation
+local_gamepad.py — REDESIGN v4.
 
-@author: Aadi
-"""
-from __future__ import annotations
+Adds robust reconnect handling on top of v3:
+    - Periodic joystick health check (SDL caches, need forced refresh)
+    - Reactive error catching on axis reads (disconnect during read)
+    - Auto-wake of 8BitDo XInput controllers on every fresh detection
+      (via wake_8bitdo_xinput.py — requires NOPASSWD sudo entry)
+    - Full state reset on reconnect to avoid stale prev_* / buffer values
 
-"""
-local_gamepad.py — REDESIGN v3.
-
-Local dongle handler. Same driving behavior as the pilot gamepad
-(same profiles, same axis mappings, same state machines) but calls
-teleop's in-process dispatchers instead of going over the wire.
-
-Wire equivalence:
-    - Motion packets: trimmed 12-field schema (same as pilot's UDP
-      payload) plus "_local": True for the source arbiter.
-    - Event packets: unified TCP envelope {seq, t, type, data}.
-    - Both handed to teleop's dispatchers directly (on_motion, on_events).
-      No sockets involved.
+Wire equivalence (unchanged from v3):
+    - Motion packets: trimmed schema + "_local": True
+    - Event packets: unified TCP envelope {seq, t, type, data}
+    - Handed to teleop dispatchers in-process — no sockets
 
 Behaviors:
     Driving — identical to pilot bridge:
         - Steering:  deadzone → expo → gain → yaw limit
-        - Cruise ±:  buttons cycle CRUISE_LEVELS into lin_x
+        - Cruise ±:  cycle CRUISE_LEVELS into lin_x
         - Both cruise buttons: brake, zero yaw, reset cruise
         - Turn signals: axis 3 threshold → indicator event
         - Sound axis 4: neg-tap speech, neg double-tap music, pos speech
@@ -33,13 +26,11 @@ Behaviors:
         - Head direction: hat pad or right stick → head field
         - Lights ON/OFF buttons → all three lights fields together
 
-    Local-only lock/speed (WS not in the loop):
+    Local-only lock/speed:
         - A → B within 2s while locked   → UNLOCK
         - A → B within 2s while unlocked → cycle speed level 1→2→3→1
         - B → A within 2s                → LOCK
-        - A and B are BUFFERED. If the paired button comes within 2s,
-          the sequence fires and standalone toggles are SUPPRESSED.
-          If it doesn't come, the toggle fires when the buffer expires.
+        - A and B are BUFFERED. Standalone toggles suppressed if pair fires.
 
     ABXY as browser-feature toggles:
         - A (buffered 2s) → toggle AI mode          (event: ai_mode)
@@ -48,9 +39,12 @@ Behaviors:
         - Y (immediate)   → toggle yield            (event: yield)
 """
 
+from __future__ import annotations
+
 import math
 import os
 import platform
+import subprocess
 import threading
 import time
 from typing import Callable, Optional
@@ -59,7 +53,7 @@ from .common import log
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONFIG (parity with pilot)
+#  CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
 SEND_HZ = 50
@@ -73,7 +67,7 @@ MUSIC_TRACK_ID              = 1
 MUSIC_TALK_DURATION_SEC     = 60.0
 AUDIO_FULL_VOLUME_PCT       = 100
 
-# Steering behavior
+# Steering
 MAX_YAW_MOVING   = 2.0
 MAX_YAW_INPLACE = 3.5
 STEER_DEADZONE  = 0.1
@@ -95,13 +89,16 @@ LIFT_AXIS_DEADBAND  = 0.02
 AI_ENABLE_PRESS_THRESHOLD = 0.95
 AI_REQUEST_REPEAT_PACKETS = 5
 
-# Lock sequence + A/B toggle buffer window (same value — they use one clock)
+# Lock sequence + A/B toggle buffer (same window)
 LOCK_SEQUENCE_TIMEOUT = 2.0
 MAX_SPEED_INITIAL     = 1.0
 SWAP_XY_BUTTONS       = False
 
-# Joystick reconnect
-JOYSTICK_RETRY_SEC = 1.0
+# Reconnect
+JOYSTICK_RETRY_SEC        = 1.0
+HEALTH_CHECK_INTERVAL_S   = 1.0
+WAKE_SCRIPT_PATH          = "/home/revolabs/Revobots/Segway/CAN/wake_8bitdo_xinput.py"
+WAKE_SCRIPT_TIMEOUT_S     = 5.0
 
 
 # ── Gamepad mappings (identical to pilot) ────────────────────────────────────
@@ -213,7 +210,7 @@ class LocalGamepad:
     # ── envelope emission ───────────────────────────────────────────────────
 
     def _emit_envelope(self, type_: str, data: dict) -> None:
-        """Emit one event envelope in the same shape TCP produces."""
+        """Emit one event envelope in the TCP-server shape."""
         self._local_event_seq += 1
         pkt = {
             "seq":    self._local_event_seq,
@@ -226,13 +223,43 @@ class LocalGamepad:
         except Exception as exc:
             log("local_gp", f"events dispatch error: {exc}")
 
+    # ── 8BitDo XInput wake ──────────────────────────────────────────────────
+
+    def _wake_8bitdo_xinput(self) -> None:
+        """Best-effort wake of 8BitDo XInput controllers.
+
+        The 8BitDo Ultimate 2 XInput dongle doesn't start streaming input
+        reports until it receives an XInput LED-set command. On fresh
+        connect/reconnect the controller is asleep — SDL sees a joystick
+        but reads always return zeros. Sending the LED command wakes it.
+
+        Requires a passwordless sudo entry:
+            /etc/sudoers.d/wake_8bitdo:
+              <user> ALL=(ALL) NOPASSWD: /usr/bin/python3 <WAKE_SCRIPT_PATH>
+        """
+        if not os.path.isfile(WAKE_SCRIPT_PATH):
+            return
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "python3", WAKE_SCRIPT_PATH],
+                timeout=WAKE_SCRIPT_TIMEOUT_S,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                log("local_gp", "8bitdo XInput wake sent")
+            else:
+                stderr = (result.stderr or "").strip()[:120]
+                log("local_gp", f"wake script rc={result.returncode} err={stderr}")
+        except subprocess.TimeoutExpired:
+            log("local_gp", "wake script timed out")
+        except Exception as exc:
+            log("local_gp", f"wake script failed: {exc}")
+
     # ── pygame init helpers ─────────────────────────────────────────────────
 
     def _init_pygame(self):
-        """Lazy pygame import + init. Kept inside the worker thread so a
-        missing pygame doesn't crash teleop startup, and to avoid touching
-        SDL from the main thread.
-        """
+        """Lazy pygame import + init inside the worker thread."""
         try:
             import pygame
         except ImportError:
@@ -251,6 +278,7 @@ class LocalGamepad:
         return pygame
 
     def _wait_for_joystick(self, pygame_mod, retry_sec=JOYSTICK_RETRY_SEC):
+        """Block until a joystick appears. Wakes 8BitDo XInput on connect."""
         logged_waiting = False
         while not self._stop.is_set():
             pygame_mod.joystick.quit()
@@ -269,8 +297,9 @@ class LocalGamepad:
                     f"joystick found: {name} "
                     f"(axes={js.get_numaxes()} btns={js.get_numbuttons()} "
                     f"hats={js.get_numhats()})")
-                # NEW: 8bitdo XInput needs a wake kick after (re)connect
-                if "8bitdo" in name.lower() or "x-box" in name.lower():
+                # 8BitDo XInput needs a wake kick after every fresh detection
+                name_lower = name.lower()
+                if "8bitdo" in name_lower or "x-box" in name_lower or "xbox" in name_lower:
                     self._wake_8bitdo_xinput()
                 return js
             if not logged_waiting:
@@ -280,24 +309,6 @@ class LocalGamepad:
                 logged_waiting = True
             self._stop.wait(timeout=retry_sec)
         return None
-
-    def _wake_8bitdo_xinput(self) -> None:
-        """Call the wake script (best-effort) so a freshly-reconnected 8bitdo
-        XInput controller starts streaming input reports."""
-        import subprocess
-        wake_script = "/home/revolabs/Revobots/Segway/CAN/wake_8bitdo_xinput.py"
-        if not os.path.isfile(wake_script):
-            return
-        try:
-            subprocess.run(
-                ["sudo", "python3", wake_script],
-                timeout=5.0,
-                capture_output=True,
-                text=True,
-            )
-            log("local_gp", "8bitdo XInput wake sent")
-        except Exception as exc:
-            log("local_gp", f"wake script failed: {exc}")
 
     def _get_mapping(self, js):
         name = (js.get_name() or "").strip().lower()
@@ -350,16 +361,60 @@ class LocalGamepad:
             return
         gp = self._get_mapping(js)
 
-        # State
+        # ── State ───────────────────────────────────────────────────────────
         seq = 0
         period = 1.0 / SEND_HZ
         next_t = time.time()
 
-        # ... (all state init unchanged) ...
+        cruise_zero_idx = CRUISE_LEVELS.index(0.0)
+        cruise_level_idx = cruise_zero_idx
+        cruise_speed = 0.0
 
-        # NEW: periodic reconnect check
+        max_speed = MAX_SPEED_INITIAL
+        speed_level = 1
+
+        # Feature toggle state
+        ai_on     = False
+        bubble_on = False
+        xwalk_on  = False
+        yield_on  = False
+
+        # A/B toggle buffers
+        a_buffered_until: Optional[float] = None
+        b_buffered_until: Optional[float] = None
+
+        prev_a = prev_b = prev_y = prev_x = 0
+        prev_cruise_up = prev_cruise_down = 0
+        prev_lights_on = prev_lights_off = 0
+        axis3_state = "center"
+        axis4_state = "center"
+        axis4_neg_taps: list = []
+        axis4_pending_speech_deadline: Optional[float] = None
+
+        prev_ai_chord = False
+        ai_request_counter = 0
+
+        # Reconnect health check
         last_health_check_t = time.time()
-        HEALTH_CHECK_INTERVAL_S = 1.0
+
+        def _reset_transient_state():
+            """Called after reconnect — clear stale edges and buffers."""
+            nonlocal a_buffered_until, b_buffered_until
+            nonlocal axis3_state, axis4_state, axis4_neg_taps, axis4_pending_speech_deadline
+            nonlocal prev_a, prev_b, prev_y, prev_x
+            nonlocal prev_cruise_up, prev_cruise_down
+            nonlocal prev_lights_on, prev_lights_off
+            nonlocal prev_ai_chord
+            a_buffered_until = None
+            b_buffered_until = None
+            axis3_state = "center"
+            axis4_state = "center"
+            axis4_neg_taps = []
+            axis4_pending_speech_deadline = None
+            prev_a = prev_b = prev_y = prev_x = 0
+            prev_cruise_up = prev_cruise_down = 0
+            prev_lights_on = prev_lights_off = 0
+            prev_ai_chord = False
 
         while not self._stop.is_set():
             # ── tick pacing ─────────────────────────────────────────────
@@ -370,9 +425,10 @@ class LocalGamepad:
                     break
             next_t += period
 
-            # ── joystick health (periodic + reactive) ───────────────────
-            # SDL caches the joystick list; force a refresh every second so
-            # disconnects/reconnects are noticed.
+            # ── periodic joystick health check ──────────────────────────
+            # SDL caches the joystick list. Force-refresh every second so
+            # disconnect/reconnect is noticed even when get_count() would
+            # otherwise return a stale value.
             if now - last_health_check_t >= HEALTH_CHECK_INTERVAL_S:
                 last_health_check_t = now
                 try:
@@ -388,45 +444,38 @@ class LocalGamepad:
                     if js is None:
                         return
                     gp = self._get_mapping(js)
+                    _reset_transient_state()
                     next_t = time.time()
-                    # Reset transient state that could be stale from before disconnect
-                    a_buffered_until = None
-                    b_buffered_until = None
-                    axis3_state = "center"
-                    axis4_state = "center"
-                    axis4_neg_taps = []
-                    axis4_pending_speech_deadline = None
-                    prev_a = prev_b = prev_y = prev_x = 0
-                    prev_cruise_up = prev_cruise_down = 0
-                    prev_lights_on = prev_lights_off = 0
-                    prev_ai_chord = False
                     continue
 
-                # Different device or same? Re-open the handle so we're not
-                # reading from a stale joystick object.
+                # Re-open the handle so we're not reading from a stale one
                 try:
                     new_js = pygame_mod.joystick.Joystick(0)
                     new_js.init()
-                    # If the name/GUID differs from what we had, treat it as reconnect
                     new_name = (new_js.get_name() or "").strip()
                     old_name = (js.get_name() or "").strip() if js else ""
                     if new_name != old_name or js is None:
                         log("local_gp", f"joystick changed: {old_name!r} → {new_name!r}")
                         js = new_js
                         gp = self._get_mapping(js)
+                        _reset_transient_state()
+                        # Wake if it's an 8bitdo
+                        nlow = new_name.lower()
+                        if "8bitdo" in nlow or "x-box" in nlow or "xbox" in nlow:
+                            self._wake_8bitdo_xinput()
                     else:
-                        # Same device — just refresh handle to be safe
-                        js = new_js
+                        js = new_js  # refresh handle
                 except pygame_mod.error as exc:
                     log("local_gp", f"joystick re-open failed: {exc}")
                     js = self._wait_for_joystick(pygame_mod)
                     if js is None:
                         return
                     gp = self._get_mapping(js)
+                    _reset_transient_state()
                     next_t = time.time()
                     continue
 
-            # Reactive check — if event pump or a read errors, reconnect
+            # ── reactive event pump check ───────────────────────────────
             try:
                 pygame_mod.event.pump()
             except pygame_mod.error:
@@ -435,10 +484,11 @@ class LocalGamepad:
                 if js is None:
                     return
                 gp = self._get_mapping(js)
+                _reset_transient_state()
                 next_t = time.time()
                 continue
 
-            # ── inputs ──────────────────────────────────────────────────
+            # ── inputs (wrapped for reactive disconnect) ────────────────
             try:
                 raw_steer   = -self._read_axis(js, gp["axis_steer"], pygame_mod)
                 head_lr     = self._read_axis(js, gp["axis_head_lr"], pygame_mod)
@@ -451,14 +501,18 @@ class LocalGamepad:
                 if js is None:
                     return
                 gp = self._get_mapping(js)
+                _reset_transient_state()
                 next_t = time.time()
                 continue
 
             # Fall back to hat pad for head direction if right stick idle
             if abs(head_lr) < 0.01 and abs(head_ud) < 0.01 and js.get_numhats() > 0:
-                hx, hy = js.get_hat(0)
-                head_lr = float(hx)
-                head_ud = float(-hy)
+                try:
+                    hx, hy = js.get_hat(0)
+                    head_lr = float(hx)
+                    head_ud = float(-hy)
+                except pygame_mod.error:
+                    pass
 
             # ── Axis 3 → indicator event ────────────────────────────────
             if signal_axis < -AXIS_ACTION_THRESHOLD_COUNTS:
@@ -482,7 +536,7 @@ class LocalGamepad:
 
             axis4_now = time.time()
 
-            # Deferred single-tap-neg speech, fires once the tap window closes
+            # Deferred single-tap-neg speech
             if (axis4_pending_speech_deadline is not None
                     and axis4_now >= axis4_pending_speech_deadline):
                 self._emit_envelope("audio", {"volume_pct": AUDIO_FULL_VOLUME_PCT})
@@ -514,17 +568,28 @@ class LocalGamepad:
                 axis4_state = new_axis4
 
             # ── buttons ─────────────────────────────────────────────────
-            a_pressed = self._read_button(js, gp["btn_a"])
-            b_pressed = self._read_button(js, gp["btn_b"])
-            y_pressed = self._read_button(js, gp["btn_y"])
-            x_pressed = self._read_button(js, gp["btn_x"])
-            cruise_up = self._read_button(js, gp["btn_cruise_up"])
-            cruise_down = self._read_button(js, gp["btn_cruise_down"])
-            lights_on_pressed  = self._read_button(js, gp["btn_lights_on"])
-            lights_off_pressed = self._read_button(js, gp["btn_lights_off"])
+            try:
+                a_pressed = self._read_button(js, gp["btn_a"])
+                b_pressed = self._read_button(js, gp["btn_b"])
+                y_pressed = self._read_button(js, gp["btn_y"])
+                x_pressed = self._read_button(js, gp["btn_x"])
+                cruise_up = self._read_button(js, gp["btn_cruise_up"])
+                cruise_down = self._read_button(js, gp["btn_cruise_down"])
+                lights_on_pressed  = self._read_button(js, gp["btn_lights_on"])
+                lights_off_pressed = self._read_button(js, gp["btn_lights_off"])
 
-            lift_pos_axis = self._read_axis(js, gp["axis_lift_pos"], pygame_mod)
-            lift_neg_axis = self._read_axis(js, gp["axis_lift_neg"], pygame_mod)
+                lift_pos_axis = self._read_axis(js, gp["axis_lift_pos"], pygame_mod)
+                lift_neg_axis = self._read_axis(js, gp["axis_lift_neg"], pygame_mod)
+            except pygame_mod.error as exc:
+                log("local_gp", f"button read failed ({exc}) — treating as disconnect")
+                js = self._wait_for_joystick(pygame_mod)
+                if js is None:
+                    return
+                gp = self._get_mapping(js)
+                _reset_transient_state()
+                next_t = time.time()
+                continue
+
             lift_pos_cmd = _lift_axis_to_cmd(lift_pos_axis)
             lift_neg_cmd = _lift_axis_to_cmd(lift_neg_axis)
             if lift_pos_cmd > lift_neg_cmd:
@@ -556,7 +621,7 @@ class LocalGamepad:
             lights_on_edge  = lights_on_pressed  and not prev_lights_on
             lights_off_edge = lights_off_pressed and not prev_lights_off
 
-            # ── Lights buttons (all three fields together) ──────────────
+            # ── Lights buttons ─────────────────────────────────────────
             if lights_on_edge:
                 self._emit_envelope("lights", {
                     "headlights": True, "parklights": True, "strobe": True,
@@ -566,7 +631,7 @@ class LocalGamepad:
                     "headlights": False, "parklights": False, "strobe": False,
                 })
 
-            # ── X / Y toggles fire IMMEDIATELY (never part of sequences) ─
+            # ── X / Y toggles fire IMMEDIATELY ─────────────────────────
             if x_edge:
                 xwalk_on = not xwalk_on
                 log("local_gp", f"X → xwalk toggle: {xwalk_on}")
@@ -577,28 +642,23 @@ class LocalGamepad:
                 log("local_gp", f"Y → yield toggle: {yield_on}")
                 self._emit_envelope("yield", {"on": yield_on})
 
-            # ── A / B buffered sequence + toggle resolution ─────────────
-            # Sequence detection happens first. If A→B or B→A is completed,
-            # clear both buffers and DO NOT fire the standalone toggle.
+            # ── A / B buffered sequence + toggle resolution ────────────
             sequence_fired = False
 
             if a_edge:
-                # A pressed. Does a recent B mean this is a B→A lock sequence?
                 if b_buffered_until is not None and now_t <= b_buffered_until:
-                    # B→A within window → LOCK
+                    # B→A → LOCK
                     self._robot_lock = True
                     log("local_gp", "robot LOCKED (B→A)")
                     b_buffered_until = None
                     a_buffered_until = None
                     sequence_fired = True
                 else:
-                    # Buffer A — either an A→B sequence follows, or A→AI toggle
                     a_buffered_until = now_t + LOCK_SEQUENCE_TIMEOUT
 
             if b_edge and not sequence_fired:
-                # B pressed. Does a recent A mean this is an A→B sequence?
                 if a_buffered_until is not None and now_t <= a_buffered_until:
-                    # A→B within window → UNLOCK or cycle speed
+                    # A→B → UNLOCK or cycle speed
                     if self._robot_lock:
                         self._robot_lock = False
                         max_speed = 1.0
@@ -612,10 +672,9 @@ class LocalGamepad:
                     b_buffered_until = None
                     sequence_fired = True
                 else:
-                    # Buffer B — either a B→A sequence follows, or B→bubble toggle
                     b_buffered_until = now_t + LOCK_SEQUENCE_TIMEOUT
 
-            # Buffer expiration → fire the standalone toggles
+            # Buffer expiration → standalone toggles fire
             if a_buffered_until is not None and now_t > a_buffered_until:
                 ai_on = not ai_on
                 log("local_gp", f"A → AI toggle: {ai_on}")
@@ -633,7 +692,7 @@ class LocalGamepad:
             prev_lights_on  = lights_on_pressed
             prev_lights_off = lights_off_pressed
 
-            # ── Cruise / lin_x computation ──────────────────────────────
+            # ── Cruise / lin_x ─────────────────────────────────────────
             both_cruise_pressed = bool(cruise_up and cruise_down)
             pedal_signed = 0.0
             brake = 1.0 if both_cruise_pressed else 0.0
@@ -669,7 +728,7 @@ class LocalGamepad:
             else:
                 lin_x = cruise_speed
 
-            # ── Head direction ──────────────────────────────────────────
+            # ── Head direction ─────────────────────────────────────────
             head = "center"
             axis_head_threshold = 0.5
             if head_lr < -axis_head_threshold:
@@ -681,7 +740,7 @@ class LocalGamepad:
             elif head_ud > axis_head_threshold:
                 head = "down"
 
-            # ── Steering → ang_z ────────────────────────────────────────
+            # ── Steering → ang_z ───────────────────────────────────────
             s = _apply_deadzone(raw_steer, STEER_DEADZONE)
             s = _expo_curve(s, STEER_EXPO)
             s *= STEER_GAIN
@@ -694,7 +753,7 @@ class LocalGamepad:
             if both_cruise_pressed:
                 ang_z = 0.0
 
-            # ── Motion payload (trimmed schema, same as pilot) ──────────
+            # ── Motion payload ─────────────────────────────────────────
             speed_label = {1: "slow", 2: "medium", 3: "fast"}.get(speed_level, "slow")
             pkt = {
                 "seq":         seq,
