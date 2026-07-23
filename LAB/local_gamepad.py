@@ -241,22 +241,31 @@ class LocalGamepad:
     # ── pygame init helpers ─────────────────────────────────────────────────
 
     def _init_pygame(self):
-        """Lazy pygame import + init. Kept inside the worker thread so a
-        missing pygame doesn't crash teleop startup, and to avoid touching
-        SDL from the main thread.
-        """
+        """Init pygame's joystick subsystem only. Do NOT touch pygame.display
+        or pygame.init() — that would conflict with LAB.display which owns the
+        video subsystem in this process."""
         try:
             import pygame
         except ImportError:
             log("local_gp", "pygame not installed — local gamepad disabled")
             return None
         try:
-            if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+            # If pygame hasn't been initialized at all yet (display_enabled=False
+            # case), we still need a video subsystem for the event loop to work.
+            # Use dummy driver so we don't conflict with anyone else.
+            if not pygame.get_init():
+                os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+                # Only force dummy video if nobody else is going to init it
                 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-                log("local_gp", "no display — using SDL_VIDEODRIVER=dummy for joystick")
-            os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
-            pygame.init()
-            pygame.joystick.init()
+                pygame.init()
+                log("local_gp", "pygame init (standalone, dummy video)")
+            else:
+                log("local_gp", "pygame already initialized by another subsystem")
+
+            # Joystick subsystem is safe to init independently — it doesn't
+            # touch the video subsystem.
+            if not pygame.joystick.get_init():
+                pygame.joystick.init()
         except Exception as exc:
             log("local_gp", f"pygame init failed: {exc}")
             return None
