@@ -20,7 +20,7 @@ silent as well as dark.
     channel 4  →  xmas lights                 (xwalk-exclusive)
     channel 5  →  (unused — leave off)
     channel 6  →  speaker amplifier           (unlock-gated)
-    channel 7  →  (unused — leave off)
+    channel 7  →  cooling fan                 (always on while teleop runs)
     channel 8  →  (unused — leave off)
 
 Behavior:
@@ -28,12 +28,14 @@ Behavior:
     UNLOCK EDGE (robot goes unlocked)
         - channels 1, 2, 3 latch STEADY ON automatically
         - channel 4 (xmas) stays off
-        - channel 6 (speaker amp) turns ON            ← NEW
-        - channels 5, 7, 8 stay off
+        - channel 6 (speaker amp) turns ON
+        - channel 7 (fan) stays ON
+        - channels 5, 8 stay off
 
     LOCK EDGE (robot goes locked)
-        - all channels off (including channel 6 → amp powered down)
-        - all pending signals/blinks cancelled
+        - channels 1–4 and 6 off (amp powered down); blinks/signals cancelled
+        - channel 7 (fan) stays ON
+        - channels 5, 8 stay off
 
     Turn signals (from indicator envelope)
         - Left  → channel 2 blinks for signal_timeout_sec, self-expires
@@ -170,11 +172,12 @@ class LightsController:
         self._open_hid()
         # all_off() writes every channel — including the amp — so we come up
         # in a known-safe state: lights off, amp off. Unlock will turn them
-        # on together.
+        # on together. Fan (ch7) is re-asserted after all_off and stays on
+        # for the life of this process (lock/unlock do not touch it).
         self.all_off()
-        self._write_relay(CH_FAN, True)
+        self._ensure_fan_on()
         self._blink_thread.start()
-        log("lights", "ready (8-ch relay, amp=ch6 unlock-gated)")
+        log("lights", "ready (8-ch relay, amp=ch6 unlock-gated, fan=ch7 always-on)")
 
     def stop(self) -> None:
         self._stop.set()
@@ -184,7 +187,9 @@ class LightsController:
             pass
         # Powers amp down along with everything else — matches the physical
         # test procedure that the amp must be OFF when the driver exits.
+        # Fan goes off only when teleop exits (not on lock).
         self.all_off()
+        self._write_relay(CH_FAN, False)
         with self._dev_lock:
             if self._dev is not None:
                 try:
@@ -234,6 +239,9 @@ class LightsController:
             self._apply_all_off()
         else:
             self._apply_steady()
+
+        # Fan stays on through lock and unlock.
+        self._ensure_fan_on()
 
     def command(self, envelope: dict) -> None:
         """Dispatch one parsed envelope {seq, t, type, data}."""
@@ -453,19 +461,21 @@ class LightsController:
         if not (right_active or talk_active or xwalk_active):
             self._write_relay(CH_TAIL_HALO_RIGHT, on)
 
+    def _ensure_fan_on(self) -> None:
+        """Cooling fan (ch7): always on while teleop is running."""
+        self._write_relay(CH_FAN, True)
+
     def _apply_all_off(self) -> None:
         """Drive normal robot outputs low.
 
-        Fan on channel 5 is intentionally NOT turned off here because it should
-        keep cooling whenever teleop is running, even while the robot is locked.
+        Fan (CH_FAN / ch7) is intentionally NOT turned off here — it must keep
+        cooling whenever teleop is running, locked or unlocked.
         """
         for ch in ALL_CHANNELS:
             self._write_relay(ch, False)
 
-        # Belt-and-braces: unused channels forced off too.
-        # Do not include CH_FAN here.
-        for ch in (7, 8):
-            self._write_relay(ch, False)
+        # Unused channel 8 forced off. Do not include CH_FAN (7).
+        self._write_relay(8, False)
 
     # ── blink loop ──────────────────────────────────────────────────────────
 

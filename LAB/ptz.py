@@ -25,13 +25,29 @@ Return-to-home:
 
 PTZ motion is intentionally independent of drivetrain robot_lock so the
 operator can still look around while the robot is locked.
+
+Offline cameras (no NTP) can drift relative to the Jetson and fail ONVIF
+login with WSSE time errors. On connect, if that happens we authenticate
+with adjust_time=True, push Jetson UTC via SetSystemDateAndTime, then
+reconnect normally.
 """
 
+import datetime as dt
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 from .common import log
+
+
+def _is_wsse_time_error(exc: BaseException) -> bool:
+    """True if ONVIF/zeep rejected the request due to WS-Security clock skew."""
+    text = str(exc).lower()
+    return (
+        "wsse" in text
+        or "authorized time" in text
+        or "time check" in text
+    )
 
 
 class PtzController:
@@ -91,20 +107,88 @@ class PtzController:
 
     def start(self) -> None:
         try:
-            from onvif import ONVIFCamera   # type: ignore
-            cam = ONVIFCamera(self._ip, self._port, self._user, self._password)
-            self._ptz = cam.create_ptz_service()
-            media = cam.create_media_service()
-            profiles = media.GetProfiles()
-            if not profiles:
-                raise RuntimeError("no ONVIF profiles found")
-            self._token = profiles[0].token
+            try:
+                _cam, ptz, token = self._open_camera(adjust_time=False)
+            except Exception as exc:
+                if not _is_wsse_time_error(exc):
+                    raise
+                log(
+                    "ptz",
+                    f"WSSE/time error on connect — syncing camera clock "
+                    f"from Jetson ({exc})",
+                )
+                cam_skewed, _ptz_tmp, _token_tmp = self._open_camera(
+                    adjust_time=True
+                )
+                self._push_system_time(cam_skewed)
+                # Drop skewed session; reconnect with Jetson-aligned clock.
+                _cam, ptz, token = self._open_camera(adjust_time=False)
+
+            self._ptz = ptz
+            self._token = token
             self._send_stop()
             self._thread.start()
             log("ptz", f"connected {self._ip}:{self._port}")
         except Exception as exc:
             log("ptz", f"disabled — {exc}")
             self._ptz = None
+            self._token = None
+
+    def _open_camera(
+        self, adjust_time: bool
+    ) -> Tuple[Any, Any, str]:
+        """Open ONVIF camera and return (cam, ptz_service, profile_token)."""
+        from onvif import ONVIFCamera  # type: ignore
+
+        cam = ONVIFCamera(
+            self._ip,
+            self._port,
+            self._user,
+            self._password,
+            adjust_time=adjust_time,
+        )
+        ptz = cam.create_ptz_service()
+        media = cam.create_media_service()
+        profiles = media.GetProfiles()
+        if not profiles:
+            raise RuntimeError("no ONVIF profiles found")
+        token = profiles[0].token
+        return cam, ptz, token
+
+    def _push_system_time(self, cam: Any) -> None:
+        """Push Jetson UTC to the camera via SetSystemDateAndTime."""
+        now = dt.datetime.utcnow()
+        params: dict = {
+            "DateTimeType": "Manual",
+            "DaylightSavings": False,
+            "UTCDateTime": {
+                "Date": {
+                    "Year": now.year,
+                    "Month": now.month,
+                    "Day": now.day,
+                },
+                "Time": {
+                    "Hour": now.hour,
+                    "Minute": now.minute,
+                    "Second": now.second,
+                },
+            },
+        }
+        try:
+            current = cam.devicemgmt.GetSystemDateAndTime()
+            tz = getattr(current, "TimeZone", None)
+            tz_str = getattr(tz, "TZ", None) if tz is not None else None
+            if tz_str:
+                params["TimeZone"] = {"TZ": tz_str}
+        except Exception as exc:
+            log("ptz", f"GetSystemDateAndTime for TZ failed — continuing: {exc}")
+
+        cam.devicemgmt.SetSystemDateAndTime(params)
+        log(
+            "ptz",
+            f"SetSystemDateAndTime pushed Jetson UTC "
+            f"{now.isoformat(timespec='seconds')}Z",
+        )
 
     def stop(self) -> None:
         self._stop.set()

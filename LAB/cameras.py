@@ -84,8 +84,35 @@ class UsbCameraCapture:
 
     # ── public API ──────────────────────────────────────────────────────────
 
-    def start(self) -> bool:
-        cap = self._open_capture()
+    def start(self, open_timeout_sec: float = 12.0) -> bool:
+        # GStreamer CAP_GSTREAMER can block forever on a wedged UVC device.
+        # Open on a helper thread and abandon if it does not return in time so
+        # the rest of teleop (telemetry, PTZ, fleet WS) can still come up.
+        result: dict = {}
+
+        def _open() -> None:
+            try:
+                result["cap"] = self._open_capture()
+            except Exception as exc:
+                result["err"] = exc
+
+        opener = threading.Thread(
+            target=_open, daemon=True, name=f"cam-open-{self.name}")
+        opener.start()
+        opener.join(timeout=max(1.0, float(open_timeout_sec)))
+        if opener.is_alive():
+            log("cameras",
+                f"{self.name}: open timed out after {open_timeout_sec:.0f}s "
+                f"({self._cfg.source!r}) — skipping USB capture")
+            return False
+        if "err" in result:
+            log("cameras",
+                f"{self.name}: open error: {result['err']} — skipping")
+            return False
+        cap = result.get("cap")
+        if cap is None:
+            log("cameras", f"{self.name}: open returned nothing — skipping")
+            return False
         ok = cap.isOpened()
         cap.release()
         if not ok:

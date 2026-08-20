@@ -223,6 +223,16 @@ class LabConfig:
     battery_udp_port:        int   = 56500
     battery_stale_after_sec: float = 30.0
 
+    # ── Peplink cellular WAN (read-only status → cloud telemetry) ───────────
+    # Polls https://<host>/api/status.wan.connection for carrier / bars /
+    # 5G|LTE. Disabled when peplink_password is empty.
+    peplink_enabled:         bool  = True
+    peplink_host:            str   = "192.168.10.1"
+    peplink_user:            str   = "admin"
+    peplink_password:        str   = ""
+    peplink_poll_sec:        float = 5.0
+    peplink_stale_after_sec: float = 30.0
+
     # ── Lidar ────────────────────────────────────────────────────────────────
     lidar_enabled:          bool  = True
     lidar_symlink:          str   = "/dev/rplidar_s2"
@@ -269,6 +279,7 @@ class LabConfig:
     # ── Secrets ──────────────────────────────────────────────────────────────
     ptz_password:           str   = ""
     camera_password:        str   = ""
+    # peplink_password is also a secret; declared above with peplink_* knobs.
 
     @classmethod
     def load_secrets(cls, env_file: Optional[str] = None) -> "LabConfig":
@@ -278,6 +289,11 @@ class LabConfig:
         secrets = _read_env_file(env_file)
         cfg.ptz_password    = secrets.get("PTZ_PASSWORD", "")
         cfg.camera_password = secrets.get("CAMERA_PASSWORD", "")
+        cfg.peplink_password = secrets.get("PEPLINK_PASSWORD", "")
+        if secrets.get("PEPLINK_HOST"):
+            cfg.peplink_host = secrets["PEPLINK_HOST"]
+        if secrets.get("PEPLINK_USER"):
+            cfg.peplink_user = secrets["PEPLINK_USER"]
         # robot_id: prefer explicit ROBOT_ID, fall back to AZURE_DEVICE_ID,
         # then keep the dataclass default. Same precedence as the utils.
         cfg.robot_id        = (secrets.get("ROBOT_ID")

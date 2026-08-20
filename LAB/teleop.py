@@ -43,6 +43,7 @@ from typing import Any, Callable, Optional
 
 from .common import first_float, log, now_mono, truthy
 from .config import LabConfig
+from .odometer import JetsonOdometer
 
 from LAB import heartbeat
 
@@ -304,7 +305,32 @@ def _read_cpu_temp_f() -> Optional[float]:
     return chosen_c * 9.0 / 5.0 + 32.0
 
 
-def _make_dashboard_snapshot_fn(motion, temphum, gps, battery, speed_label_fn):
+def _chassis_meters_to_miles(meters: float) -> float:
+    """Chassis reports cumulative meters; telemetry field is miles."""
+    return round(float(meters) / 1000.0 * 0.621371, 2)
+
+
+def _make_dashboard_snapshot_fn(motion, temphum, gps, battery, speed_label_fn,
+                                trip_state: Optional[dict] = None,
+                                odometer: Optional[JetsonOdometer] = None,
+                                peplink=None):
+    """Build dashboard/IoT snapshot.
+
+    trip_state (optional mutable dict) drives session trip mileage:
+      pending_reset: bool  — set True on lock→unlock; next read latches baseline
+      baseline_m:    float|None — chassis get_vehicle_meter() at last unlock
+    Telemetry mileage_m is (current_chassis_m - baseline_m) in miles, so each
+    unlock starts a fresh trip at 0.
+
+    odometer (optional JetsonOdometer) owns cumulative miles in odometer_mi,
+    advanced from positive Segway meter deltas and persisted on the Jetson.
+
+    peplink (optional PeplinkWanReader) supplies cellular_carrier /
+    cellular_bars / cellular_network from the local Peplink router.
+    """
+    if trip_state is None:
+        trip_state = {"pending_reset": False, "baseline_m": None}
+
     def snapshot() -> dict:
         out: dict = {}
 
@@ -330,9 +356,33 @@ def _make_dashboard_snapshot_fn(motion, temphum, gps, battery, speed_label_fn):
                     out["robot_battery_pct"] = round(float(soc), 1)
                 mileage = bat.get("mileage_m")
                 if mileage is not None:
-                    out["mileage_m"] = round(float(mileage) /1000 * 0.621371, 2)
+                    chassis_m = float(mileage)
+                    if odometer is not None:
+                        odometer.update_from_chassis_meters(chassis_m)
+                        out["odometer_mi"] = odometer.miles()
+                    if trip_state.get("pending_reset"):
+                        trip_state["baseline_m"] = chassis_m
+                        trip_state["pending_reset"] = False
+                        log("teleop",
+                            f"trip mileage reset (baseline={chassis_m:.0f} m)")
+                    baseline = trip_state.get("baseline_m")
+                    if baseline is None:
+                        # Still locked / never unlocked this process — report 0
+                        out["mileage_m"] = 0.0
+                    else:
+                        trip_m = max(0.0, chassis_m - float(baseline))
+                        out["mileage_m"] = _chassis_meters_to_miles(trip_m)
+                elif odometer is not None:
+                    out["odometer_mi"] = odometer.miles()
+            elif odometer is not None:
+                out["odometer_mi"] = odometer.miles()
         except Exception as exc:
             log("teleop", f"snapshot battery block error: {exc}")
+            if odometer is not None:
+                try:
+                    out["odometer_mi"] = odometer.miles()
+                except Exception:
+                    pass
 
         try:
             if temphum is not None:
@@ -362,6 +412,21 @@ def _make_dashboard_snapshot_fn(motion, temphum, gps, battery, speed_label_fn):
         except Exception:
             pass
 
+        try:
+            if peplink is not None:
+                wan = peplink.get()
+                age = wan.get("age_sec")
+                stale = getattr(peplink, "_stale_after_sec", 30.0)
+                if age is None or float(age) <= float(stale):
+                    if wan.get("cellular_carrier") is not None:
+                        out["cellular_carrier"] = wan["cellular_carrier"]
+                    if wan.get("cellular_bars") is not None:
+                        out["cellular_bars"] = int(wan["cellular_bars"])
+                    if wan.get("cellular_network") is not None:
+                        out["cellular_network"] = wan["cellular_network"]
+        except Exception:
+            pass
+
         return out
     return snapshot
 
@@ -371,6 +436,7 @@ _DASHBOARD_EXPECTED_KEYS = (
     "speed_mode",
     "robot_battery_pct",
     "mileage_m",
+    "odometer_mi",
     "box_temp_F",
     "humidity_pct",
     "cpu_temp_F",
@@ -379,6 +445,9 @@ _DASHBOARD_EXPECTED_KEYS = (
     "gps_alt",
     "gps_orient",
     "gps_fix",
+    "cellular_carrier",
+    "cellular_bars",
+    "cellular_network",
 )
 
 
@@ -614,6 +683,25 @@ def main() -> None:
     from .heartbeat     import HeartbeatPublisher
     from .display       import DisplayController
 
+    # ── Peplink cellular (early): poll while slower USB/GStreamer inits ────
+    peplink = None
+    if cfg.peplink_enabled and cfg.peplink_password:
+        try:
+            from .peplink_wan import PeplinkWanReader
+            peplink = PeplinkWanReader(
+                host=cfg.peplink_host,
+                username=cfg.peplink_user,
+                password=cfg.peplink_password,
+                poll_sec=cfg.peplink_poll_sec,
+                stale_after_sec=cfg.peplink_stale_after_sec,
+            )
+            peplink.start()
+        except Exception as exc:
+            log("teleop", f"peplink init failed: {exc} — disabled")
+            peplink = None
+    elif cfg.peplink_enabled:
+        log("teleop", "peplink enabled but PEPLINK_PASSWORD unset — skipped")
+
     # ── Cameras ─────────────────────────────────────────────────────────────
     cameras = CamerasManager(cfg)
     cameras.start()
@@ -796,9 +884,20 @@ def main() -> None:
         "speed_label": None,
     }
 
+    # Trip mileage: telemetry mileage_m resets to 0 on every lock→unlock.
+    # Chassis cumulative meters are unchanged; we subtract a baseline latched
+    # on the unlock edge (or on the next battery read if CAN is briefly down).
+    trip_state: dict = {"pending_reset": False, "baseline_m": None}
+
+    # Jetson cumulative odometer (seed 0; advances on Segway meter deltas).
+    odometer = JetsonOdometer()
+
     # ── Azure telemetry ─────────────────────────────────────────────────────
     dashboard_snap = _make_dashboard_snapshot_fn(
-        motion, temphum, gps, battery, lambda: shared.get("speed_label")
+        motion, temphum, gps, battery, lambda: shared.get("speed_label"),
+        trip_state=trip_state,
+        odometer=odometer,
+        peplink=peplink,
     )
 
     azure_tel = AzureTelemetryPublisher(
@@ -847,10 +946,15 @@ def main() -> None:
         """Central place to fan out a lock edge."""
         if new_locked == lock_state["locked"]:
             return
+        was_locked = lock_state["locked"]
         log("teleop",
             f"LOCK EDGE ({source_label}): "
-            f"{lock_state['locked']} -> {new_locked}")
+            f"{was_locked} -> {new_locked}")
         lock_state["locked"] = new_locked
+        # Lock → unlock: start a new trip odometer for telemetry.
+        if was_locked and not new_locked:
+            trip_state["pending_reset"] = True
+            log("teleop", "trip mileage will reset on next chassis meter read")
         if lights is not None:
             lights.set_robot_lock(new_locked)
         session_mgr.set_robot_lock(new_locked)
@@ -1179,6 +1283,7 @@ def main() -> None:
         ("gps",           gps),
         ("temphum",       temphum),
         ("battery",       battery),
+        ("peplink",       peplink),
         ("lidar",         lidar),
         ("cameras",       cameras),
     ]:

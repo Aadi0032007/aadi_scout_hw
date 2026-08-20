@@ -2,14 +2,15 @@
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════
-# ros_start.sh — legacy filename was in the systemd unit; no ROS anymore.
+# teleop_start.sh — start LAB.teleop, optionally with Segway CAN enable.
 #
-# Brings up the Segway CAN motion executor (aadi_segway_can_wrapper.py) and
-# then runs LAB.teleop in the foreground. On Ctrl-C / SIGTERM / teleop exit,
-# gracefully tears the wrapper back down (which soft-stops motion, disables
-# chassis, and exits).
+# SEGWAY_ENABLE (default 1):
+#   1 / unset  — spawn aadi_segway_can_wrapper, wait for chassis green, then
+#                teleop. Hard-fail if chassis cannot enable (same as before).
+#   0 / false / no — skip CAN wrapper entirely (bypass all Segway errors);
+#                start LAB.teleop only (PTZ / lights / cloud / etc.).
 #
-# Intended to be the ExecStart of aadi_ros_start_teleop.service.
+# Set via systemd EnvironmentFile teleop.env (see aadi_ros_teleop.service).
 # ══════════════════════════════════════════════════════════════════════════
 
 # ── Paths ────────────────────────────────────────────────────────────────
@@ -41,6 +42,9 @@ PYTHON="${PYTHON:-/usr/bin/python3}"
 CANALYST_VID="04d8"
 CANALYST_PID="0053"
 
+# Default ON — normal drive path. Rare bypass: SEGWAY_ENABLE=0 in teleop.env
+SEGWAY_ENABLE="${SEGWAY_ENABLE:-1}"
+
 # ── Tracking ─────────────────────────────────────────────────────────────
 
 WRAPPER_PID=""
@@ -50,6 +54,14 @@ TELEOP_PID=""
 
 log()        { echo -e "\n[ros_teleop_start $(date '+%H:%M:%S')] $*\n"; }
 log_inline() { echo   "[ros_teleop_start $(date '+%H:%M:%S')] $*"; }
+
+segway_enable_wanted() {
+  # True unless explicitly disabled.
+  case "${SEGWAY_ENABLE,,}" in
+    0|false|no|off) return 1 ;;
+    *) return 0 ;;
+  esac
+}
 
 # ── Pre-launch cleanup: kill any stray wrapper + free the CANalyst ────────
 #
@@ -149,10 +161,6 @@ trap cleanup EXIT SIGINT SIGTERM
 
 # ── Sanity checks ────────────────────────────────────────────────────────
 
-if [[ ! -f "$WRAPPER" ]]; then
-  echo "[ros_teleop_start] ERROR: wrapper not found: $WRAPPER" >&2
-  exit 2
-fi
 if [[ ! -d "$LAB_DIR" ]]; then
   echo "[ros_teleop_start] ERROR: LAB_DIR not found: $LAB_DIR" >&2
   exit 2
@@ -162,51 +170,59 @@ fi
 # the new wrapper is ready before it's actually started.
 rm -f "$READY_FILE" 2>/dev/null || true
 
-# ── 0. Pre-launch cleanup ────────────────────────────────────────────────
-
-log "Pre-launch cleanup: killing strays + freeing CANalyst..."
+# Always clear leftover wrappers so a previous enable-run cannot hold CAN.
 kill_stray_wrappers
-free_canalyst_usb
 
-# ── 1. Spawn CAN wrapper ─────────────────────────────────────────────────
-
-log "Starting Segway CAN wrapper..."
-log_inline "  ${WRAPPER}"
-log_inline "  motion_port=${MOTION_PORT} status_port=${STATUS_PORT}"
-log_inline "  ready_file=${READY_FILE}"
-log_inline "  log=${WRAPPER_LOG}"
-
-# Launch wrapper detached from our stdin, stdout to log file. It's owned
-# by us via WRAPPER_PID so the trap can kill it cleanly.
-"$PYTHON" "$WRAPPER" \
-  --motion-port "$MOTION_PORT" \
-  --status-port "$STATUS_PORT" \
-  --ready-file "$READY_FILE" \
-  > "$WRAPPER_LOG" 2>&1 &
-WRAPPER_PID=$!
-log_inline "Wrapper PID ${WRAPPER_PID}"
-
-# ── 2. Wait for chassis to reach green ───────────────────────────────────
-
-log "Waiting up to ${READY_TIMEOUT}s for chassis green..."
-DEADLINE=$(( $(date +%s) + READY_TIMEOUT ))
-while [[ ! -f "$READY_FILE" ]]; do
-  # Wrapper crashed before signalling ready?
-  if ! kill -0 "$WRAPPER_PID" 2>/dev/null; then
-    echo "[ros_teleop_start] ERROR: wrapper exited before chassis ready" >&2
-    echo "[ros_teleop_start] ---- last 40 lines of ${WRAPPER_LOG} ----" >&2
-    tail -n 40 "$WRAPPER_LOG" >&2 || true
-    exit 3
+if segway_enable_wanted; then
+  if [[ ! -f "$WRAPPER" ]]; then
+    echo "[ros_teleop_start] ERROR: wrapper not found: $WRAPPER" >&2
+    exit 2
   fi
-  if (( $(date +%s) > DEADLINE )); then
-    echo "[ros_teleop_start] ERROR: chassis did not reach green within ${READY_TIMEOUT}s" >&2
-    echo "[ros_teleop_start] ---- last 40 lines of ${WRAPPER_LOG} ----" >&2
-    tail -n 40 "$WRAPPER_LOG" >&2 || true
-    exit 3
-  fi
-  sleep 0.5
-done
-log "Chassis green — wrapper reports ready."
+
+  log "SEGWAY_ENABLE=${SEGWAY_ENABLE} — enabling chassis (normal path)"
+  log "Pre-launch cleanup: freeing CANalyst..."
+  free_canalyst_usb
+
+  # ── 1. Spawn CAN wrapper ───────────────────────────────────────────────
+
+  log "Starting Segway CAN wrapper..."
+  log_inline "  ${WRAPPER}"
+  log_inline "  motion_port=${MOTION_PORT} status_port=${STATUS_PORT}"
+  log_inline "  ready_file=${READY_FILE}"
+  log_inline "  log=${WRAPPER_LOG}"
+
+  "$PYTHON" "$WRAPPER" \
+    --motion-port "$MOTION_PORT" \
+    --status-port "$STATUS_PORT" \
+    --ready-file "$READY_FILE" \
+    > "$WRAPPER_LOG" 2>&1 &
+  WRAPPER_PID=$!
+  log_inline "Wrapper PID ${WRAPPER_PID}"
+
+  # ── 2. Wait for chassis to reach green ─────────────────────────────────
+
+  log "Waiting up to ${READY_TIMEOUT}s for chassis green..."
+  DEADLINE=$(( $(date +%s) + READY_TIMEOUT ))
+  while [[ ! -f "$READY_FILE" ]]; do
+    if ! kill -0 "$WRAPPER_PID" 2>/dev/null; then
+      echo "[ros_teleop_start] ERROR: wrapper exited before chassis ready" >&2
+      echo "[ros_teleop_start] ---- last 40 lines of ${WRAPPER_LOG} ----" >&2
+      tail -n 40 "$WRAPPER_LOG" >&2 || true
+      exit 3
+    fi
+    if (( $(date +%s) > DEADLINE )); then
+      echo "[ros_teleop_start] ERROR: chassis did not reach green within ${READY_TIMEOUT}s" >&2
+      echo "[ros_teleop_start] ---- last 40 lines of ${WRAPPER_LOG} ----" >&2
+      tail -n 40 "$WRAPPER_LOG" >&2 || true
+      exit 3
+    fi
+    sleep 0.5
+  done
+  log "Chassis green — wrapper reports ready."
+else
+  log "SEGWAY_ENABLE=${SEGWAY_ENABLE} — bypassing Segway CAN (no drive)"
+  log_inline "Skipping wrapper spawn and chassis enable"
+fi
 
 # ── 2b. Wake 8BitDo XInput stream (Jetson xpad has LEDs disabled) ─────────
 # Without the Xbox LED/start OUT packet the dongle enumerates but sends no
@@ -229,9 +245,10 @@ TELEOP_PID=$!
 log_inline "teleop PID ${TELEOP_PID}"
 
 # Wait on teleop. If teleop exits (SIGTERM, crash, etc), the EXIT trap
-# fires and stops the wrapper.
+# fires and stops the wrapper (if any).
 wait "$TELEOP_PID"
 RC=$?
 TELEOP_PID=""
 
 log_inline "teleop exited rc=${RC}"
+exit "$RC"
