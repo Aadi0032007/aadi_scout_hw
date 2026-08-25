@@ -10,6 +10,16 @@ from __future__ import annotations
 motion.py — UDP forward to segway_ros1 Docker + human/AI source arbitration.
 
 Changes vs previous version:
+    - NEW: ang_z drift correction. A constant yaw bias is added to every
+      ang_z command AFTER ang_z_scale, i.e. directly in /cmd_vel space, to
+      cancel the drivetrain's steady drift:
+          ang_out = src_ang * ang_z_scale + ang_z_drift_correction
+        cfg.ang_z_drift_correction     initial value
+      It is applied only on the live output path, so it never leaks into the
+      recorded dataset: published_state_raw() returns the selected source's
+      RAW ang_z (no scale, no correction) and that is what SessionRecorder
+      stores. The correction is suppressed whenever the output is gated to
+      zero (watchdog, lock, brake, lidar) — a braked robot must not yaw.
     - NEW: AI stream watchdog. ai_stale_timeout auto-disables AI when no
       origin="ai" packets are arriving, so enabling AI with lab_inference
       down hands control straight back to the human instead of leaving the
@@ -46,7 +56,8 @@ Public API (back-compatible):
     ai_stale_timeout() -> float            # NEW
     human_in_control() -> bool
     state() -> (lin_x, ang_z, locked, braking)
-    published_state() -> (lin_x, ang_z)
+    published_state() -> (lin_x, ang_z)            # scaled + drift-corrected
+    published_state_raw() -> (lin_x, ang_z)        # NEW — raw, uncorrected
     set_lidar_block_enabled(on: bool)
     lidar_block_enabled() -> bool
 """
@@ -68,6 +79,7 @@ class MotionController:
         publish_hz:          int   = 50,
         watchdog_sec:        float = 0.30,
         ang_z_scale:         float = 0.20,
+        ang_z_drift_correction: float = 0.0,
         lidar_block_fn:      Optional[Callable[[float], bool]] = None,
         lidar_block_enabled: bool  = True,
         # ── human-priority arbiter knobs ─────────────────────────────────
@@ -82,6 +94,7 @@ class MotionController:
         self._publish_hz     = max(1, publish_hz)
         self._watchdog       = watchdog_sec
         self._ang_z_scale    = ang_z_scale
+        self._ang_z_drift    = float(ang_z_drift_correction)
         self._lidar_block_fn = lidar_block_fn
 
         # ── State (protected by _lock) ────────────────────────────────────
@@ -112,9 +125,13 @@ class MotionController:
         self._human_idle_db       = float(human_idle_deadband)
         self._human_stale_timeout = float(human_stale_timeout)
 
-        # Last values actually sent to Docker — for the recorder.
+        # Last values actually sent to Docker — for telemetry.
         self._last_pub_lin: float = 0.0
         self._last_pub_ang: float = 0.0
+        # Same publish tick, but the selected source's RAW ang_z: no
+        # ang_z_scale, no drift correction. This is what the recorder stores,
+        # so the dataset stays in the command space the policy is trained on.
+        self._last_pub_ang_raw: float = 0.0
 
         # HUMAN/AI handover logging — None until the first decision is made.
         self._last_human_in_control: Optional[bool] = None
@@ -137,6 +154,7 @@ class MotionController:
                 f"forwarding → udp://{self._docker_host}:{self._docker_port} "
                 f"@ {self._publish_hz} Hz "
                 f"(watchdog={self._watchdog*1000:.0f}ms, ang_scale={self._ang_z_scale}, "
+                f"ang_drift={self._ang_z_drift:+.3f}, "
                 f"handback={self._human_handback_sec}s, idle_db={self._human_idle_db}, "
                 f"human_stale={self._human_stale_timeout}s, "
                 f"ai_stale={self._ai_stale_timeout}s, "
@@ -294,22 +312,44 @@ class MotionController:
             return src_lin, src_ang, h_locked, h_brake
 
     def published_state(self) -> tuple[float, float]:
+        """Last (lin_x, ang_z) actually sent to Docker — scaled + drift-corrected."""
         with self._lock:
             return self._last_pub_lin, self._last_pub_ang
+
+    def published_state_raw(self) -> tuple[float, float]:
+        """Same publish tick as published_state(), but ang_z in RAW command space.
+
+        No ang_z_scale, no ang_z_drift_correction — this is the value the
+        selected source asked for. Gating still applies: when the output was
+        zeroed (watchdog, lock, brake, lidar) both fields read 0.0, because
+        the robot did not move and the dataset must reflect that.
+
+        Use this for recording; use published_state() for telemetry about what
+        the drivetrain actually received.
+        """
+        with self._lock:
+            return self._last_pub_lin, self._last_pub_ang_raw
 
     # ── publisher loop ──────────────────────────────────────────────────────
 
     def _publish_loop(self) -> None:
         interval = 1.0 / self._publish_hz
         while not self._stop.is_set():
-            lin, ang = self._compute_output()
+            lin, ang, ang_raw = self._compute_output()
             self._send_twist(lin, ang)
             with self._lock:
-                self._last_pub_lin = lin
-                self._last_pub_ang = ang
+                self._last_pub_lin     = lin
+                self._last_pub_ang     = ang
+                self._last_pub_ang_raw = ang_raw
             self._stop.wait(timeout=interval)
 
-    def _compute_output(self) -> tuple[float, float]:
+    def _compute_output(self) -> tuple[float, float, float]:
+        """Return (lin_x, ang_z_out, ang_z_raw).
+
+        ang_z_out is what goes on the wire: src_ang * ang_z_scale + drift.
+        ang_z_raw is the same tick's src_ang untouched — for the recorder.
+        Both are 0.0 together whenever the output is gated.
+        """
         with self._lock:
             now = time.monotonic()
             h_lin, h_ang, h_locked, h_brake, h_t = self._latest_human
@@ -378,22 +418,30 @@ class MotionController:
             braking = h_brake
 
             lin_x = src_lin
-            ang_z = src_ang * self._ang_z_scale
+            # Drift correction lands AFTER the scale, so it is a plain offset
+            # in /cmd_vel space. It is added unconditionally — including at
+            # src_ang == 0.0, which is the case it exists for: "commanded
+            # straight, veers anyway".
+            ang_raw = src_ang
+            ang_z   = src_ang * self._ang_z_scale + self._ang_z_drift
 
             lidar_gate_on = self._lidar_block_enabled
 
+        # Every gated path below returns a hard zero, drift correction
+        # included — a braked, locked or watchdog-silenced robot must sit
+        # still, not yaw at the bias rate.
         if not watchdog_ok or locked or braking:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0
 
         # Lidar safety gate — runtime-togglable via set_lidar_block_enabled.
         if self._lidar_block_fn is not None and lidar_gate_on:
             try:
                 if self._lidar_block_fn(lin_x):
-                    return 0.0, 0.0
+                    return 0.0, 0.0, 0.0
             except Exception as exc:
                 log("motion", f"lidar_block_fn error: {exc}")
 
-        return lin_x, ang_z
+        return lin_x, ang_z, ang_raw
 
     def _send_twist(self, lin: float, ang: float) -> None:
         if self._sock is None:

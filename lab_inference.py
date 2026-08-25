@@ -85,14 +85,19 @@ lat=lon=orientation=0.0, which is a distribution it never saw in training.
 ang_z CONVENTION
 ────────────────────────────────────────────────────────────────────────────
 
-MotionController multiplies the ang_z it receives by cfg.ang_z_scale (0.20)
-before publishing to the chassis:
+MotionController multiplies the ang_z it receives by cfg.ang_z_scale (0.20),
+then adds cfg.ang_z_drift_correction, before publishing to the chassis:
 
-    motion.command(ang_z_raw)  →  /cmd_vel gets ang_z_raw * 0.20
+    motion.command(ang_z_raw)  →  /cmd_vel gets ang_z_raw * 0.20 + drift
+
+The drift term is a constant yaw bias cancelling the drivetrain's veer. It
+lives only on the wire — it is never recorded and never fed back as an
+observation — so nothing in this file has to account for it.
 
 WHICH SPACE IS YOUR DATASET IN? CHECK BEFORE YOU DRIVE.
-teleop.py wires SessionRecorder to motion.published_state(), which is the
-value AFTER the 0.20 multiply. Any recording made by the current build stores
+teleop.py wires SessionRecorder to motion.published_state_raw(), so recordings
+made by the current build store RAW ang_z: no 0.20 multiply, no drift offset.
+Recordings from the interim build wired to motion.published_state() stored
 SCALED ang_z. Older recordings wired to motion.state() stored RAW.
 
 Tell them apart by magnitude — the gamepad's yaw limit is 2.0-3.5 rad/s:
@@ -1057,7 +1062,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--unscale-ang", action="store_true",
                     help="Divide the policy's ang_z by cfg.ang_z_scale before "
                          "sending. Use when the dataset stored ang_z from "
-                         "motion.published_state() (already scaled).")
+                         "motion.published_state() (already scaled) — that is "
+                         "the interim build only; current recordings are RAW "
+                         "and need no flag.")
     ap.add_argument("--temporal-ensemble-coeff", type=float, default=None,
                     help="Enable temporal ensembling (e.g. 0.01). Reduces "
                          "single-frame false turns.")

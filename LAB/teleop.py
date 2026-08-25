@@ -911,6 +911,7 @@ def main() -> None:
         publish_hz=cfg.motion_publish_hz,
         watchdog_sec=cfg.motion_watchdog_sec,
         ang_z_scale=cfg.ang_z_scale,
+        ang_z_drift_correction=cfg.ang_z_drift_correction,
         lidar_block_fn=lidar_block_fn,
         lidar_block_enabled=cfg.lidar_safety_brake,
         ai_stale_timeout=cfg.motion_ai_stale_sec,
@@ -1031,7 +1032,10 @@ def main() -> None:
         fps=cfg.record_fps,
         video_bitrate=cfg.record_video_bitrate,
         encoder_preference=cfg.record_encoder_preference,
-        motion_state_fn=motion.published_state,
+        # RAW variant on purpose: the dataset stores the ang_z the source
+        # asked for, with neither ang_z_scale nor ang_z_drift_correction
+        # folded in. See the ang_z convention note in lab_inference.py.
+        motion_state_fn=motion.published_state_raw,
         gps_get_fn=(gps.get if gps is not None else None),
     )
     recorder.set_robot_lock(True)
@@ -1264,9 +1268,11 @@ def main() -> None:
 
         # ── Drive (single-axis at a time) ───────────────────────────────────
         if "lin_x" in msg or "ang_z" in msg:
-            cur_lin, cur_ang_scaled = motion.published_state()
-            cur_ang = (cur_ang_scaled / cfg.ang_z_scale
-                       if cfg.ang_z_scale else 0.0)
+            # motion.command() takes RAW ang_z, so read back the raw value
+            # rather than un-scaling the published one — the published value
+            # also carries ang_z_drift_correction, which dividing by
+            # ang_z_scale would smear into the held axis.
+            cur_lin, cur_ang = motion.published_state_raw()
             lin = first_float(msg, ("lin_x",), default=cur_lin)
             ang = first_float(msg, ("ang_z",), default=cur_ang)
             motion.command(lin, ang, lock_state["locked"], False,

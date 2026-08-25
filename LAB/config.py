@@ -114,6 +114,12 @@ class LabConfig:
     motion_publish_hz:      int   = 50
     motion_watchdog_sec:    float = 0.50
     ang_z_scale:            float = 0.20
+    # Constant yaw bias added to every ang_z command to cancel the drivetrain's
+    # steady drift. Applied in MotionController AFTER ang_z_scale, so this is a
+    # direct offset in /cmd_vel space (rad/s). Never applied while braked,
+    # locked, watchdog-zeroed or lidar-gated, and never recorded into the
+    # dataset — SessionRecorder stores the raw, unscaled, uncorrected command.
+    ang_z_drift_correction: float = -0.25
     brake_threshold:        float = 0.20
     # Auto-disable AI when no packet has arrived on udp_ai_motion_port for
     # this long. Measured from the later of "AI switched on" and "last AI
