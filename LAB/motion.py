@@ -10,7 +10,14 @@ from __future__ import annotations
 motion.py — UDP forward to segway_ros1 Docker + human/AI source arbitration.
 
 Changes vs previous version:
-    - New runtime toggle for the lidar safety brake, driven by WS bubble_mode:
+    - NEW: AI stream watchdog. ai_stale_timeout auto-disables AI when no
+      origin="ai" packets are arriving, so enabling AI with lab_inference
+      down hands control straight back to the human instead of leaving the
+      robot braked on a dead AI slot. A grace window runs from the moment
+      AI is enabled, so a just-started inference process is not cut off.
+        motion.ai_stale_timeout()      -> float
+        cfg.motion_ai_stale_sec        initial value
+    - Runtime toggle for the lidar safety brake, driven by WS bubble_mode:
         motion.set_lidar_block_enabled(bool)   # runtime on/off
         motion.lidar_block_enabled() -> bool
       cfg.lidar_safety_brake is now the INITIAL value only.
@@ -35,11 +42,13 @@ Public API (back-compatible):
     set_ai_enabled(on: bool)
     ai_enabled() -> bool
     is_ai_enabled() -> bool
+    ai_stream_age() -> float               # NEW
+    ai_stale_timeout() -> float            # NEW
     human_in_control() -> bool
     state() -> (lin_x, ang_z, locked, braking)
     published_state() -> (lin_x, ang_z)
-    set_lidar_block_enabled(on: bool)      # NEW
-    lidar_block_enabled() -> bool          # NEW
+    set_lidar_block_enabled(on: bool)
+    lidar_block_enabled() -> bool
 """
 
 import json
@@ -65,6 +74,8 @@ class MotionController:
         human_handback_sec:  float = 2.0,
         human_idle_deadband: float = 0.05,
         human_stale_timeout: float = 2.0,
+        # ── AI stream watchdog ───────────────────────────────────────────
+        ai_stale_timeout:    float = 1.0,
     ) -> None:
         self._docker_host    = docker_host
         self._docker_port    = docker_port
@@ -86,6 +97,10 @@ class MotionController:
 
         # AI control gate (latched off by default; flipped by explicit call).
         self._ai_enabled = False
+        # Monotonic time AI was last switched ON. Starts the grace window for
+        # the AI stream watchdog; 0.0 while AI is off.
+        self._ai_enabled_at = 0.0
+        self._ai_stale_timeout = float(ai_stale_timeout)
 
         # Runtime lidar brake gate. Toggled at runtime by
         # motion.set_lidar_block_enabled() driven by WS bubble_mode.
@@ -100,6 +115,9 @@ class MotionController:
         # Last values actually sent to Docker — for the recorder.
         self._last_pub_lin: float = 0.0
         self._last_pub_ang: float = 0.0
+
+        # HUMAN/AI handover logging — None until the first decision is made.
+        self._last_human_in_control: Optional[bool] = None
 
         # UDP transport
         self._sock: Optional[socket.socket] = None
@@ -121,6 +139,7 @@ class MotionController:
                 f"(watchdog={self._watchdog*1000:.0f}ms, ang_scale={self._ang_z_scale}, "
                 f"handback={self._human_handback_sec}s, idle_db={self._human_idle_db}, "
                 f"human_stale={self._human_stale_timeout}s, "
+                f"ai_stale={self._ai_stale_timeout}s, "
                 f"lidar_gate={self._lidar_block_enabled})"
             )
         except Exception as exc:
@@ -175,12 +194,41 @@ class MotionController:
                 if self._ai_enabled:
                     log("motion", "AI disabled by human brake")
                 self._ai_enabled = False
+                self._ai_enabled_at = 0.0
 
     def set_ai_enabled(self, on: bool) -> None:
         with self._lock:
+            # The brake is an emergency stop and it hard-latches AI off. A
+            # latched brake re-asserts that on every incoming packet, so
+            # enabling here would flip on and straight back off ~20 ms later
+            # and look like the A button did nothing. Refuse, and say why.
+            if on and self._latest_human[3]:
+                log("motion",
+                    "AI enable REFUSED — emergency brake is engaged. "
+                    "Release the brake, then press A again.")
+                return
+
             prev = self._ai_enabled
             self._ai_enabled = bool(on)
-            if not on:
+            if on:
+                # A standing cruise value is still a human command, so the
+                # handback window never closes and AI cannot take over. That
+                # is intended, but silent — call it out at enable time.
+                h_lin, h_ang = self._latest_human[0], self._latest_human[1]
+                if (abs(h_lin) >= self._human_idle_db
+                        or abs(h_ang) >= self._human_idle_db):
+                    log("motion",
+                        f"AI enabled, but the human is still commanding "
+                        f"lin_x={h_lin:+.2f} ang_z={h_ang:+.2f} — AI takes over "
+                        f"once that returns to neutral")
+                # Start the AI-stream grace window. The watchdog in
+                # _compute_output measures from whichever is later — this
+                # moment, or the last origin="ai" packet — so a freshly
+                # launched lab_inference gets time to be noticed while a
+                # dead stream is still caught within ai_stale_timeout.
+                self._ai_enabled_at = time.monotonic()
+            else:
+                self._ai_enabled_at = 0.0
                 self._latest_ai = (0.0, 0.0, False, False, 0.0)
             if prev != self._ai_enabled:
                 log("motion", f"ai_enabled -> {self._ai_enabled}")
@@ -191,6 +239,17 @@ class MotionController:
 
     def is_ai_enabled(self) -> bool:
         return self.ai_enabled()
+
+    def ai_stream_age(self) -> float:
+        """Seconds since the last origin="ai" packet. inf if there never was one."""
+        with self._lock:
+            a_t = self._latest_ai[4]
+        if a_t <= 0.0:
+            return float("inf")
+        return max(0.0, time.monotonic() - a_t)
+
+    def ai_stale_timeout(self) -> float:
+        return self._ai_stale_timeout
 
     def set_lidar_block_enabled(self, on: bool) -> None:
         """Runtime toggle for the lidar safety brake (bubble_mode from browser).
@@ -263,11 +322,41 @@ class MotionController:
                     f"AI auto-disabled: no human packet for {now - h_t:.1f}s "
                     f"(gamepad disconnect?)")
                 self._ai_enabled = False
+                self._ai_enabled_at = 0.0
                 self._latest_ai  = (0.0, 0.0, False, False, 0.0)
+
+            # AI stream watchdog: lab_inference never started, died, or its
+            # packets stopped. Without this the arbiter would select an AI
+            # slot whose timestamp is stale, the per-source watchdog below
+            # would zero it, and the robot would sit braked with no obvious
+            # cause. Handing control back to the human is both safer and far
+            # easier to diagnose. Measured from the later of "AI switched on"
+            # and "last AI packet" so a just-launched inference is not cut off.
+            ai_ref_t = max(a_t, self._ai_enabled_at)
+            if (self._ai_enabled and self._ai_stale_timeout > 0.0
+                    and ai_ref_t > 0.0
+                    and (now - ai_ref_t) > self._ai_stale_timeout):
+                log("motion",
+                    f"AI auto-disabled: no origin=ai packet for "
+                    f"{now - ai_ref_t:.1f}s (lab_inference not running?)")
+                self._ai_enabled = False
+                self._ai_enabled_at = 0.0
+                self._latest_ai = (0.0, 0.0, False, False, 0.0)
+                a_lin, a_ang, a_t = 0.0, 0.0, 0.0
 
             ai_enabled      = self._ai_enabled
             handback_active = now < self._human_active_until
             human_in_control = handback_active or (not ai_enabled)
+
+            # Handover logging. Only interesting while AI is in play, and only
+            # on a change — this runs at publish_hz.
+            if human_in_control != self._last_human_in_control:
+                if ai_enabled or self._last_human_in_control is False:
+                    log("motion",
+                        f"control → {'HUMAN' if human_in_control else 'AI'}"
+                        + (" (handback window open)"
+                           if human_in_control and ai_enabled else ""))
+                self._last_human_in_control = human_in_control
 
             if human_in_control:
                 src_lin, src_ang, src_t = h_lin, h_ang, h_t

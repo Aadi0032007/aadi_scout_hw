@@ -5,6 +5,8 @@ Polls the local router (read-only) for phone-like WAN fields:
   carrier  - e.g. "RoamLink TMO"
   bars     - signalLevel 0..5
   network  - "5G" / "LTE" / …
+  rsrp     - dBm (primary RAT band)
+  sinr     - dB  (primary RAT band)
 
 Background thread; snapshot() callers just read the cache. Login is
 session-cookie based; we re-login when a status call fails. HTTPS uses an
@@ -157,6 +159,60 @@ class PeplinkWanReader:
                 return item
         return None
 
+    @staticmethod
+    def _normalize_network(network) -> Optional[str]:
+        if not network:
+            return None
+        text = str(network)
+        if text.upper().startswith("5G"):
+            return "5G"
+        if "LTE" in text.upper() or text.upper().startswith("4G"):
+            return "LTE"
+        return text
+
+    @classmethod
+    def _pick_signal(cls, cel: dict, preferred_network: Optional[str]) -> dict:
+        """Return rsrp/sinr from the preferred RAT band, else first available."""
+        rats = cel.get("rat")
+        if not isinstance(rats, list):
+            return {}
+
+        def bands_for(rat: dict):
+            bands = rat.get("band") if isinstance(rat, dict) else None
+            return bands if isinstance(bands, list) else []
+
+        ordered = list(rats)
+        if preferred_network:
+            pref = preferred_network.upper()
+            preferred = [
+                r for r in rats
+                if isinstance(r, dict) and pref in str(r.get("name") or "").upper()
+            ]
+            rest = [r for r in rats if r not in preferred]
+            ordered = preferred + rest
+
+        for rat in ordered:
+            for band in bands_for(rat if isinstance(rat, dict) else {}):
+                if not isinstance(band, dict):
+                    continue
+                sig = band.get("signal")
+                if not isinstance(sig, dict):
+                    continue
+                out: dict = {}
+                if sig.get("rsrp") is not None:
+                    try:
+                        out["cellular_rsrp"] = float(sig["rsrp"])
+                    except (TypeError, ValueError):
+                        pass
+                if sig.get("sinr") is not None:
+                    try:
+                        out["cellular_sinr"] = float(sig["sinr"])
+                    except (TypeError, ValueError):
+                        pass
+                if out:
+                    return out
+        return {}
+
     @classmethod
     def _extract(cls, wan: dict) -> dict:
         out: dict = {}
@@ -181,16 +237,13 @@ class PeplinkWanReader:
             except (TypeError, ValueError):
                 pass
 
-        network = cel.get("network") or cel.get("mobileType") or cel.get("dataTechnology")
+        network = cls._normalize_network(
+            cel.get("network") or cel.get("mobileType") or cel.get("dataTechnology")
+        )
         if network:
-            # Prefer short phone-like label: "5G" / "LTE" over "5G NSA"
-            text = str(network)
-            if text.upper().startswith("5G"):
-                out["cellular_network"] = "5G"
-            elif "LTE" in text.upper() or text.upper().startswith("4G"):
-                out["cellular_network"] = "LTE"
-            else:
-                out["cellular_network"] = text
+            out["cellular_network"] = network
+
+        out.update(cls._pick_signal(cel, network))
         return out
 
     def _poll_once(self) -> bool:

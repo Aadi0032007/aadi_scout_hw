@@ -450,5 +450,11 @@ class LidarReader:
         upd.update(dists)
         upd.update(per_sector_blocked)
 
+        front = dists.get("lidar_front_m")
+        log("lidar", f"front={front if front is not None else '---'} m "
+                     f"(bubble={self._sectors['front'][2]:.2f} "
+                     f"blocked={per_sector_blocked['lidar_blocked_front']} "
+                     f"pts={len(points)})")
+
         with self._lock:
             self._data.update(upd)

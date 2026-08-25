@@ -17,6 +17,11 @@ Major structural changes vs previous version:
       us. See heartbeat.py.
     - UDP motion port stays 55999. Payload is the bridge-server's trimmed
       schema: {seq, t, brain, lin_x, ang_z, brake:int, head}. No robot_lock.
+    - NEW: a SECOND motion listener on cfg.udp_ai_motion_port (55998) for
+      lab_inference. Everything arriving there is AI, by virtue of the port
+      it came in on — teleop never has to trust an "origin" string to decide
+      whether a packet carries operator authority. An origin="ai" packet on
+      the human port is dropped and logged.
     - robot_lock is WS-authoritative. UDP silence just triggers motion.py's
       watchdog (brake in place), does NOT latch lock. The person can resume
       from browser or after restarting their gamepad.
@@ -104,6 +109,15 @@ class UdpListener:
     def start(self) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # A bigger receive buffer costs nothing and means a brief scheduling
+        # stall in this process queues packets instead of dropping them. It
+        # does NOT paper over a stalled reader — motion.py's watchdog still
+        # measures arrival time — but it keeps seq contiguous so UdpFlowTracker
+        # can tell "we were blocked" apart from "the link lost packets".
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        except OSError as exc:
+            log("teleop", f"{self._label} SO_RCVBUF bump failed: {exc}")
         self._sock.bind((self._bind, self._port))
         self._sock.settimeout(0.5)
         self._thread = threading.Thread(target=self._run, daemon=True,
@@ -313,7 +327,8 @@ def _chassis_meters_to_miles(meters: float) -> float:
 def _make_dashboard_snapshot_fn(motion, temphum, gps, battery, speed_label_fn,
                                 trip_state: Optional[dict] = None,
                                 odometer: Optional[JetsonOdometer] = None,
-                                peplink=None):
+                                peplink=None,
+                                rtt=None):
     """Build dashboard/IoT snapshot.
 
     trip_state (optional mutable dict) drives session trip mileage:
@@ -326,7 +341,8 @@ def _make_dashboard_snapshot_fn(motion, temphum, gps, battery, speed_label_fn,
     advanced from positive Segway meter deltas and persisted on the Jetson.
 
     peplink (optional PeplinkWanReader) supplies cellular_carrier /
-    cellular_bars / cellular_network from the local Peplink router.
+    cellular_bars / cellular_network / cellular_rsrp / cellular_sinr
+    from the local Peplink router.
     """
     if trip_state is None:
         trip_state = {"pending_reset": False, "baseline_m": None}
@@ -424,6 +440,18 @@ def _make_dashboard_snapshot_fn(motion, temphum, gps, battery, speed_label_fn,
                         out["cellular_bars"] = int(wan["cellular_bars"])
                     if wan.get("cellular_network") is not None:
                         out["cellular_network"] = wan["cellular_network"]
+                    if wan.get("cellular_rsrp") is not None:
+                        out["cellular_rsrp"] = round(float(wan["cellular_rsrp"]), 1)
+                    if wan.get("cellular_sinr") is not None:
+                        out["cellular_sinr"] = round(float(wan["cellular_sinr"]), 1)
+        except Exception:
+            pass
+
+        try:
+            if rtt is not None:
+                probe = rtt.get()
+                if probe.get("rtt_ms") is not None:
+                    out["rtt_ms"] = round(float(probe["rtt_ms"]), 1)
         except Exception:
             pass
 
@@ -448,6 +476,9 @@ _DASHBOARD_EXPECTED_KEYS = (
     "cellular_carrier",
     "cellular_bars",
     "cellular_network",
+    "cellular_rsrp",
+    "cellular_sinr",
+    "rtt_ms",
 )
 
 
@@ -589,23 +620,61 @@ def _log_tts_intent(raw: str) -> None:
 
 class UdpFlowTracker:
     """Tracks whether UDP motion packets are actively arriving from a given
-    source label. Logs exactly two transitions:
+    source label.
+
+    Two detectors, because they answer different questions:
+
+      observe()  measures the EXACT inter-arrival gap on every packet and
+                 reports any gap longer than the drivetrain watchdog. This
+                 is what catches SHORT stalls (~0.3-1.0s): they brake the
+                 robot and then recover, so a poller never sees them — the
+                 gap opens and closes between two polls, and the age it
+                 could report is quantised to the poll interval anyway.
+
+      _watch()   polls for the "still silent" edge, so a link that goes down
+                 and STAYS down is reported while it is happening rather
+                 than only on recovery.
+
+    Between them no stop goes unlogged.
 
         [teleop] UDP motion FLOWING from <source> (<addr>)
-        [teleop] UDP motion STOPPED (no packet for <n>s)
+        [teleop] UDP motion GAP <n>ms from <source> ...   ← drivetrain braked
+        [teleop]   ↳ probe: next packet +<n>ms — <who stalled>
+        [teleop] UDP motion STOPPED (no packet from <source> for <n>s ...)
 
-    A background watcher thread promotes the "stopped" edge; we don't wait
-    for the next packet to notice silence. Independent of motion.py's
-    per-tick watchdog — this is purely for human-visible logging.
+    The probe line follows every GAP. A contiguous seq proves only that
+    nothing was lost in transit — a sender that paused and a receiver that
+    blocked are indistinguishable by seq alone. The spacing of the packet
+    AFTER the first one back separates them: near-zero means the kernel had
+    been queueing packets while we were blocked; normal spacing means nothing
+    was ever queued, so the pause was upstream of this socket.
+
+    gap_warn_sec MUST track motion.py's watchdog — pass cfg.motion_watchdog_sec
+    at construction. If the two drift apart you reintroduce exactly the blind
+    band this class exists to remove: gaps that brake the robot silently.
     """
 
-    def __init__(self, label: str, stall_sec: float = 1.0) -> None:
+    def __init__(
+        self,
+        label:           str,
+        stall_sec:       float = 1.0,
+        gap_warn_sec:    float = 0.30,
+        poll_sec:        float = 0.10,
+        drain_probe_sec: float = 0.005,
+    ) -> None:
         self._label = label
         self._stall_sec = stall_sec
+        self._gap_warn = gap_warn_sec
+        self._poll_sec = poll_sec
+        self._drain_probe = drain_probe_sec
         self._lock = threading.Lock()
         self._last_t = 0.0
         self._last_addr: Optional[tuple] = None
+        self._last_seq: Optional[int] = None
         self._flowing = False
+        self._gap_count = 0
+        self._worst_gap = 0.0
+        self._probe_pending = False
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._watch, daemon=True, name=f"udp-flow-{label}"
@@ -617,20 +686,89 @@ class UdpFlowTracker:
     def stop(self) -> None:
         self._stop.set()
 
-    def observe(self, addr: tuple) -> None:
-        """Call once per received UDP packet from this source."""
+    def observe(self, addr: tuple, seq: Any = None) -> None:
+        """Call once per received UDP packet from this source.
+
+        A gap longer than gap_warn_sec means motion.py's watchdog had already
+        zeroed the drivetrain before this packet landed — the robot braked and
+        is only now resuming.
+        """
+        now = now_mono()
+        try:
+            seq_i: Optional[int] = int(seq) if seq is not None else None
+        except (TypeError, ValueError):
+            seq_i = None
+
         with self._lock:
             was_flowing = self._flowing
-            self._last_t = now_mono()
+            prev_t   = self._last_t
+            prev_seq = self._last_seq
+            self._last_t    = now
             self._last_addr = addr
-            self._flowing = True
-        if not was_flowing:
+            self._last_seq  = seq_i
+            self._flowing   = True
+
+            gap = (now - prev_t) if prev_t > 0.0 else 0.0
+            report_gap = gap > self._gap_warn
+
+            # Spacing of the SECOND packet after a gap — see the probe log
+            # below. Armed by a gap, disarmed by the next normal packet.
+            probe_gap: Optional[float] = None
+            if self._probe_pending and not report_gap:
+                probe_gap = gap
+                self._probe_pending = False
+
+            count = 0
+            worst = 0.0
+            if report_gap:
+                self._gap_count += 1
+                if gap > self._worst_gap:
+                    self._worst_gap = gap
+                count = self._gap_count
+                worst = self._worst_gap
+                self._probe_pending = True
+
+        if report_gap:
+            parts = [
+                f"UDP motion GAP {gap * 1000:.0f}ms from {self._label}",
+                f"(> {self._gap_warn * 1000:.0f}ms watchdog — drivetrain braked)",
+            ]
+            # A contiguous seq only rules out loss IN TRANSIT. It does NOT say
+            # who stalled: a sender that paused and a receiver that blocked
+            # both deliver consecutive seq. The probe line below settles that.
+            if seq_i is not None and prev_seq is not None:
+                delta = seq_i - prev_seq
+                lost = delta - 1
+                if lost <= 0:
+                    parts.append(f"seq +{delta} (nothing lost in transit)")
+                else:
+                    parts.append(f"seq +{delta} ({lost} lost in transit)")
+            if not was_flowing:
+                parts.append("resumed")
+            parts.append(f"[gap #{count}, worst {worst * 1000:.0f}ms]")
+            log("teleop", " ".join(parts))
+        elif probe_gap is not None:
+            # Who stalled? Inter-arrival of the packet AFTER the first one
+            # back:
+            #   ~0ms     the socket buffer was draining, so packets had been
+            #            queued the whole time → OUR receive thread was blocked
+            #   ~normal  spacing resumed instantly, nothing was ever queued
+            #            → the sender paused, or the link was down
+            drained = probe_gap < self._drain_probe
+            verdict = ("RECEIVER stalled (socket buffer drained — packets were "
+                       "queued here the whole time)"
+                       if drained else
+                       "SENDER paused or link down (no queue built up — "
+                       "packets were never sent/never arrived)")
+            log("teleop",
+                f"  ↳ probe: next packet +{probe_gap * 1000:.1f}ms — {verdict}")
+        elif not was_flowing:
             log("teleop",
                 f"UDP motion FLOWING from {self._label} ({addr[0]}:{addr[1]})")
 
     def _watch(self) -> None:
         while not self._stop.is_set():
-            self._stop.wait(timeout=0.25)
+            self._stop.wait(timeout=self._poll_sec)
             addr: Optional[tuple] = None
             age: float = 0.0
             transition = False
@@ -661,7 +799,8 @@ def main() -> None:
     log("teleop", f"robot_id   = {cfg.robot_id}")
     log("teleop", f"cache_dir  = {cfg.cache_dir}")
     log("teleop", f"record_fps = {cfg.record_fps}")
-    log("teleop", f"motion     = udp://{cfg.udp_listen_ip}:{cfg.udp_motion_port}")
+    log("teleop", f"motion     = udp://{cfg.udp_listen_ip}:{cfg.udp_motion_port} (human)")
+    log("teleop", f"ai_motion  = udp://{cfg.udp_listen_ip}:{cfg.udp_ai_motion_port} (lab_inference)")
     log("teleop", f"fleet_ws   = {cfg.fleet_ws_url_template.format(robot_id=cfg.robot_id)}")
     log("teleop", f"fleet_reg  = {cfg.fleet_register_url} every {cfg.heartbeat_interval_sec}s")
     log("teleop", f"rtsp       = {cfg.gst_rtsp_bind}:{cfg.gst_rtsp_port}  usb_mount=/{cfg.usb_stream_mount}")
@@ -701,6 +840,25 @@ def main() -> None:
             peplink = None
     elif cfg.peplink_enabled:
         log("teleop", "peplink enabled but PEPLINK_PASSWORD unset — skipped")
+
+     # ── Outbound RTT probe (early: independent of cameras / Peplink) ────────
+    rtt = None
+    if cfg.rtt_enabled:
+        try:
+            from .rtt_probe import RttProbe
+            rtt = RttProbe(
+                host=cfg.rtt_host,
+                port=cfg.rtt_port,
+                method=cfg.rtt_method,
+                poll_sec=cfg.rtt_poll_sec,
+                timeout_sec=cfg.rtt_timeout_sec,
+                stale_after_sec=cfg.rtt_stale_after_sec,
+            )
+            rtt.start()
+        except Exception as exc:
+            log("teleop", f"rtt probe init failed: {exc} — disabled")
+            rtt = None
+
 
     # ── Cameras ─────────────────────────────────────────────────────────────
     cameras = CamerasManager(cfg)
@@ -743,7 +901,8 @@ def main() -> None:
     if lidar_block_fn is not None:
         log("teleop",
             f"lidar forward-brake gate wired "
-            f"(initial={'ON' if cfg.lidar_safety_brake else 'OFF'})")
+            f"(initial={'ON' if cfg.lidar_safety_brake else 'OFF'}, "
+            f"front bubble={cfg.lidar_bubble_front_m:.2f} m)")
 
     # ── Motion ──────────────────────────────────────────────────────────────
     motion = MotionController(
@@ -754,6 +913,7 @@ def main() -> None:
         ang_z_scale=cfg.ang_z_scale,
         lidar_block_fn=lidar_block_fn,
         lidar_block_enabled=cfg.lidar_safety_brake,
+        ai_stale_timeout=cfg.motion_ai_stale_sec,
     )
     motion.start()
 
@@ -898,6 +1058,7 @@ def main() -> None:
         trip_state=trip_state,
         odometer=odometer,
         peplink=peplink,
+        rtt=rtt,
     )
 
     azure_tel = AzureTelemetryPublisher(
@@ -933,10 +1094,17 @@ def main() -> None:
 
     # UDP flow trackers — one per source label. Independent of motion.py's
     # per-tick watchdog, purely for human-visible transition logging.
-    udp_flow_remote = UdpFlowTracker("remote (bridge)")
-    udp_flow_local  = UdpFlowTracker("local dongle")
+    # gap_warn_sec is tied to the SAME value motion.py brakes on, so the two
+    # can never drift apart and leave silent stops again.
+    udp_flow_remote = UdpFlowTracker("remote (bridge)",
+                                     gap_warn_sec=cfg.motion_watchdog_sec)
+    udp_flow_local  = UdpFlowTracker("local dongle",
+                                     gap_warn_sec=cfg.motion_watchdog_sec)
+    udp_flow_ai     = UdpFlowTracker("ai (lab_inference)",
+                                     gap_warn_sec=cfg.motion_watchdog_sec)
     udp_flow_remote.start()
     udp_flow_local.start()
+    udp_flow_ai.start()
 
     # ──────────────────────────────────────────────────────────────────────
     #  Dispatchers
@@ -963,15 +1131,32 @@ def main() -> None:
             # the drivetrain lock so an operator can't pan while locked.
             ptz.set_ptz_unlock_state(not new_locked)
 
-    # ── UDP motion dispatcher ───────────────────────────────────────────────
+    # ── UDP motion dispatcher (HUMAN sources only) ──────────────────────────
 
     def on_motion_packet(pkt: dict, addr, port: int) -> None:
         """Handles UDP packets from bridge-server (remote) and the local
         dongle (in-process). Bridge sends a trimmed schema without
-        robot_lock; the local dongle sends the richer schema."""
+        robot_lock; the local dongle sends the richer schema.
+
+        AI has its own listener on cfg.udp_ai_motion_port. An origin="ai"
+        packet arriving HERE would be forwarded as operator input and would
+        bypass the AI enable gate entirely, so it is dropped and reported
+        rather than silently honoured.
+        """
+        if str(pkt.get("origin") or "").strip().lower() == "ai":
+            log("teleop",
+                f"DROPPED origin=ai packet on the HUMAN motion port from "
+                f"{addr[0]}:{addr[1]} — point lab_inference at "
+                f"udp://…:{cfg.udp_ai_motion_port} instead")
+            return
+
         source = "local" if pkt.get("_local") else "remote"
         # Log flow transitions only, not per-packet spam.
-        (udp_flow_local if source == "local" else udp_flow_remote).observe(addr)
+        # seq is carried so a reported gap can say whether packets were lost
+        # in transit or merely buffered while our receive thread stalled.
+        (udp_flow_local if source == "local" else udp_flow_remote).observe(
+            addr, pkt.get("seq")
+        )
         arbiter.report(source)
         if not arbiter.is_active(source):
             return
@@ -1009,6 +1194,27 @@ def main() -> None:
                 if prev_state["speed_label"] is not None and ptz is not None:
                     ptz.capture_home()
                 prev_state["speed_label"] = speed_label
+
+    # ── UDP AI motion dispatcher (lab_inference) ────────────────────────────
+
+    def on_ai_motion_packet(pkt: dict, addr, port: int) -> None:
+        """Everything arriving here is AI, by virtue of the port it came in on.
+
+        Deliberately bypasses SourceArbiter. That arbiter ranks *human input
+        devices* against each other by priority (local dongle 100 beats remote
+        200), and the dongle streams at 50 Hz whenever it is paired — an AI
+        packet routed through it would be discarded on every tick.
+
+        Human-vs-AI arbitration is MotionController's job and it enforces hard
+        human priority: the handback window, the brake latch-off, and lock and
+        brake authority all stay with the operator. AI never sends lock and
+        never sends brake; we pass the current lock through only so the AI slot
+        carries a coherent snapshot.
+        """
+        udp_flow_ai.observe(addr, pkt.get("seq"))
+        lin = first_float(pkt, ("lin_x", "linx", "linear_x"))
+        ang = first_float(pkt, ("ang_z", "angz", "angular_z"))
+        motion.command(lin, ang, lock_state["locked"], False, origin="ai")
 
     # ── Fleet WS dispatcher ─────────────────────────────────────────────────
 
@@ -1091,6 +1297,11 @@ def main() -> None:
             if on != ws_state["last_bubble_mode"]:
                 ws_state["last_bubble_mode"] = on
                 motion.set_lidar_block_enabled(on)   # logs internally
+                if on:
+                    log("teleop",
+                        f"ws bubble ON — forward motion will be blocked "
+                        f"whenever anything is within "
+                        f"{cfg.lidar_bubble_front_m:.2f} m ahead")
 
         # ── AI mode ─────────────────────────────────────────────────────────
         if "AI" in msg:
@@ -1219,6 +1430,10 @@ def main() -> None:
                              on_motion_packet)
     udp_motion.start()
 
+    udp_ai_motion = UdpListener(cfg.udp_listen_ip, cfg.udp_ai_motion_port,
+                                "ai-motion", on_ai_motion_packet)
+    udp_ai_motion.start()
+
     bridge_ws = BridgeWsClient(
         url=cfg.fleet_ws_url_template.format(robot_id=cfg.robot_id),
         on_message=on_ws_message,
@@ -1269,8 +1484,10 @@ def main() -> None:
     session_mgr.stop()
     udp_flow_remote.stop()
     udp_flow_local.stop()
+    udp_flow_ai.stop()
     for name, sub in [
         ("udp_motion",    udp_motion),
+        ("udp_ai_motion", udp_ai_motion),
         ("bridge_ws",     bridge_ws),
         ("heartbeat",     heartbeat),
         ("local",         local),

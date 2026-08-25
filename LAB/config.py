@@ -26,13 +26,19 @@ Added:
     - fleet_camera_names       (list of camera names as seen by the fleet;
                                  separate from the internal CameraConfig list)
     - tailscale_ip_fallback    (used if `tailscale ip -4` fails at register)
+    - udp_ai_motion_port       (AI-ONLY motion listener; lab_inference sends
+                                 here. Separate from the human port so teleop
+                                 routes by port rather than by trusting a
+                                 string field in the payload.)
+    - motion_ai_stale_sec      (auto-disable AI when its stream dies)
 
 Unchanged:
     - udp_motion_port = 55999  (bridge-server writes here; browser writes
                                  events over WS; local dongle stays in-proc)
 
 Wire model after this redesign:
-    UDP :55999                     → motion only (bridge OR local dongle)
+    UDP :55999                     → HUMAN motion only (bridge OR local dongle)
+    UDP :55998                     → AI motion only (lab_inference)
     WSS → streams.revobots.ai/...  → all non-motion events from browser
     HTTPS POST /api/robots/register → fleet visibility, every 60s
 """
@@ -74,7 +80,11 @@ class LabConfig:
 
     # ── Wire protocol ────────────────────────────────────────────────────────
     udp_listen_ip:          str = "0.0.0.0"
-    udp_motion_port:        int = 55999      # trimmed motion payload, 50 Hz, unacked
+    udp_motion_port:        int = 55999      # HUMAN motion, 50 Hz, unacked
+    # AI motion arrives on its own port. Routing by port instead of by an
+    # "origin" field in the payload means an AI packet can never be mistaken
+    # for operator input (which would bypass the AI enable gate entirely).
+    udp_ai_motion_port:     int = 55998      # lab_inference → teleop
     # tcp_events_port removed — events now arrive over the fleet WebSocket.
 
     # ── Fleet WebSocket + heartbeat ─────────────────────────────────────────
@@ -102,9 +112,13 @@ class LabConfig:
     docker_motion_host:     str   = "127.0.0.1"
     docker_motion_port:     int   = 56000
     motion_publish_hz:      int   = 50
-    motion_watchdog_sec:    float = 0.30
+    motion_watchdog_sec:    float = 0.50
     ang_z_scale:            float = 0.20
     brake_threshold:        float = 0.20
+    # Auto-disable AI when no packet has arrived on udp_ai_motion_port for
+    # this long. Measured from the later of "AI switched on" and "last AI
+    # packet", so a just-launched lab_inference is not cut off mid-startup.
+    motion_ai_stale_sec:    float = 1.0
 
     # ── PTZ ──────────────────────────────────────────────────────────────────
     ptz_ip:                 str   = "192.168.10.50"
@@ -233,6 +247,18 @@ class LabConfig:
     peplink_poll_sec:        float = 5.0
     peplink_stale_after_sec: float = 30.0
 
+    # ── Outbound RTT probe (Tailscale path → cloud telemetry as rtt_ms) ─────
+    # Default host is the Tailscale cloud peer (same as udp_telemetry_host);
+    # MediaMTX typically shares that fabric. ICMP measures that overlay path
+    # even when MediaMTX does not accept inbound TCP from the robot.
+    rtt_enabled:             bool  = True
+    rtt_host:                str   = "100.94.48.1"
+    rtt_port:                int   = 443
+    rtt_method:              str   = "icmp"   # icmp | tcp
+    rtt_poll_sec:            float = 5.0
+    rtt_timeout_sec:         float = 3.0
+    rtt_stale_after_sec:     float = 30.0
+
     # ── Lidar ────────────────────────────────────────────────────────────────
     lidar_enabled:          bool  = True
     lidar_symlink:          str   = "/dev/rplidar_s2"
@@ -244,13 +270,17 @@ class LabConfig:
     lidar_range_min_m:      float = 0.05
     lidar_range_max_m:      float = 18.0
     lidar_min_quality:      int   = 0
-    lidar_front_min_deg:    float = -45.0
-    lidar_front_max_deg:    float = 45.0
+    lidar_front_min_deg:    float = -10.0
+    lidar_front_max_deg:    float = 10.0
     lidar_left_min_deg:     float = 45.0
     lidar_left_max_deg:     float = 135.0
     lidar_right_min_deg:    float = -135.0
     lidar_right_max_deg:    float = -45.0
-    lidar_bubble_front_m:   float = 0.10
+    # NOTE: 3.10 m is a very large forward bubble. With bubble_mode ON the
+    # drivetrain refuses forward motion whenever anything is inside it, and
+    # because scans go stale between polls the block flickers — which reads
+    # as the robot braking itself at random. See lidar_stale_after_sec.
+    lidar_bubble_front_m:   float = 3.10
     lidar_bubble_left_m:    float = 0.10
     lidar_bubble_right_m:   float = 0.10
     lidar_stale_after_sec:  float = 2.0
@@ -294,6 +324,16 @@ class LabConfig:
             cfg.peplink_host = secrets["PEPLINK_HOST"]
         if secrets.get("PEPLINK_USER"):
             cfg.peplink_user = secrets["PEPLINK_USER"]
+
+        if secrets.get("RTT_HOST"):
+            cfg.rtt_host = secrets["RTT_HOST"]
+        if secrets.get("RTT_PORT"):
+            try:
+                cfg.rtt_port = int(secrets["RTT_PORT"])
+            except ValueError:
+                pass
+        if secrets.get("RTT_METHOD"):
+            cfg.rtt_method = secrets["RTT_METHOD"].strip().lower()
         # robot_id: prefer explicit ROBOT_ID, fall back to AZURE_DEVICE_ID,
         # then keep the dataclass default. Same precedence as the utils.
         cfg.robot_id        = (secrets.get("ROBOT_ID")

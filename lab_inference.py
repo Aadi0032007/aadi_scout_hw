@@ -1,26 +1,144 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-lab_inference.py — Deploy the trained ACT policy on the REVO Scout AGV.
+lab_inference.py — deploy the trained ACT policy on the REVO Scout AGV.
 
-Place at repo root alongside teleop.py / agv_offline_eval.py.
+Lives at the repo root, alongside teleop_start.sh and the LAB/ package.
 
-Usage
------
-    # Dry-run — print predictions, no robot movement:
+    aadi_scout_hw/
+        lab_inference.py     ← this file
+        LAB/
+            teleop.py
+            motion.py
+            cameras.py
+            utils/frame_bus.py
+            ...
+
+────────────────────────────────────────────────────────────────────────────
+HOW THIS FITS INTO THE ROBOT
+────────────────────────────────────────────────────────────────────────────
+
+This process does NOT drive the robot directly. It is one of three command
+sources that teleop arbitrates between, and it gets its OWN port so the
+routing is structural rather than a string field teleop has to trust:
+
+    local dongle  (LAB/local_gamepad.py)  → in-process, human
+    browser/pilot (bridge or WS)          → udp :55999,  human only
+    THIS FILE                             → udp :55998,  AI only
+
+teleop's MotionController owns the arbitration and enforces HARD HUMAN
+PRIORITY. Our packets are only honoured when all of the following hold:
+
+    1. the operator has enabled AI
+         · gamepad A button      → local ai_mode envelope
+         · gamepad lift-trigger chord → ai_request="enable"
+         · browser AI button     → WS {"AI": 1}
+    2. the human handback window has closed (no meaningful stick input
+       for motion's human_handback_sec, default 2 s)
+    3. the robot is UNLOCKED and the human is not braking
+    4. our packets are arriving (motion's AI watchdog, see below)
+
+Any human brake hard-latches AI back off. We never send robot_lock and we
+never send brake — those belong to the human exclusively.
+
+Because the policy runs at ~15 Hz but motion's watchdog fires at
+cfg.motion_watchdog_sec (0.5 s), the UDP sender runs on its OWN thread at
+--send-hz (default 50 Hz) and repeats the most recent action between policy
+ticks. That keeps the drivetrain fed even if a single inference step is slow,
+and gives teleop a clean "the AI stream is alive" signal. If the policy stops
+producing actions for --action-ttl seconds we send zeros instead of repeating
+a stale command forever, and teleop's own AI watchdog then hands control back
+to the human.
+
+────────────────────────────────────────────────────────────────────────────
+CAMERA
+────────────────────────────────────────────────────────────────────────────
+
+teleop is the sole owner of /dev/videoN. It republishes every frame into a
+/dev/shm ring via LAB/utils/frame_bus.py, so we attach as a reader and never
+touch V4L2 while teleop is up.
+
+    primary   FrameBusReader(cfg.record_camera_name)   ← teleop running
+    fallback  UsbCameraCapture(cam_cfg)                ← teleop NOT running
+
+The fallback exists only for standalone bench testing. It opens the V4L2
+device directly and will fail if teleop already holds it — that failure is
+expected and reported clearly rather than silently producing black frames.
+
+────────────────────────────────────────────────────────────────────────────
+GPS
+────────────────────────────────────────────────────────────────────────────
+
+teleop's GpsReader already binds udp 127.0.0.1:57002. UDP unicast will not
+share a port (SO_REUSEADDR does not help here), so we listen on a SECOND
+fan-out port published by LAB/utils/gps_mux.py:
+
+    GPS_UDP_PORTS="57002,57003"   in the gps_mux environment
+
+    57002 → teleop
+    57003 → this file             (--gps-udp-port, default 57003)
+
+If nothing ever arrives we log loudly rather than silently feeding the policy
+lat=lon=orientation=0.0, which is a distribution it never saw in training.
+
+────────────────────────────────────────────────────────────────────────────
+ang_z CONVENTION
+────────────────────────────────────────────────────────────────────────────
+
+MotionController multiplies the ang_z it receives by cfg.ang_z_scale (0.20)
+before publishing to the chassis:
+
+    motion.command(ang_z_raw)  →  /cmd_vel gets ang_z_raw * 0.20
+
+WHICH SPACE IS YOUR DATASET IN? CHECK BEFORE YOU DRIVE.
+teleop.py wires SessionRecorder to motion.published_state(), which is the
+value AFTER the 0.20 multiply. Any recording made by the current build stores
+SCALED ang_z. Older recordings wired to motion.state() stored RAW.
+
+Tell them apart by magnitude — the gamepad's yaw limit is 2.0-3.5 rad/s:
+
+    |ang_z| peaks near 2-3.5   → RAW    → run without --unscale-ang
+    |ang_z| peaks near 0.4-0.7 → SCALED → run WITH --unscale-ang
+
+Get this wrong and the robot turns 5x too weakly (or 5x too hard).
+
+    without --unscale-ang:  policy out = raw    → passed straight through
+    with    --unscale-ang:  policy out = scaled → divided by 0.20 here, so
+                            MotionController's multiply restores it
+
+The observation echo always feeds back the value in the POLICY's own space,
+not the wire value, so the loop stays inside the training distribution either
+way. This mirrors what the dataset recorded: observation.state ang_z and the
+action ang_z both come from the same source, so they share one space.
+
+────────────────────────────────────────────────────────────────────────────
+USAGE
+────────────────────────────────────────────────────────────────────────────
+
+Dry run — print predictions, robot never moves:
+
     python3 lab_inference.py \
         --policy-path ~/policies/act_scout_dataset_03/checkpoints/080000/pretrained_model \
-        --dataset-repo-id Aadi/scout_dataset_03 \
-        --device cuda
+        --dataset-repo-id Aadi/scout_dataset_03
 
-    # Live — actually drive the robot:
+Download the policy from HuggingFace instead:
+
     python3 lab_inference.py \
-        --policy-path ~/policies/act_scout_dataset_03/checkpoints/080000/pretrained_model \
+        --policy-id Aadi/act_scout_dataset_03 \
+        --dataset-repo-id Aadi/scout_dataset_03
+
+Live — teleop must already be running; the operator still has to press AI:
+
+    python3 lab_inference.py \
+        --policy-path ~/policies/.../pretrained_model \
         --dataset-repo-id Aadi/scout_dataset_03 \
-        --device cuda \
         --send \
         --temporal-ensemble-coeff 0.01 \
         --ang-deadband 0.15
+
+Stale absolute action_bins.pt path baked into the checkpoint config:
+
+    ... --action-bins-path /path/to/agvdata-noyolo_bins_uniform_a01.pt
 """
 
 from __future__ import annotations
@@ -32,146 +150,465 @@ import socket
 import sys
 import threading
 import time
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
 
-# ── repo root on sys.path ──────────────────────────────────────────────────
+# ── repo root on sys.path so `import LAB...` works from anywhere ────────────
 _REPO = Path(__file__).resolve().parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-# ── LAB ───────────────────────────────────────────────────────────────────
-from LAB.common  import log
-from LAB.config  import LabConfig
-# NOTE: We no longer instantiate MotionController here. lab_inference now
-# sends UDP packets into teleop's motion listener with origin="ai", and
-# teleop's MotionController handles human/AI arbitration centrally.
-from LAB.sensors import GpsReader
+from LAB.common import log                      # noqa: E402
+from LAB.config import CameraConfig, LabConfig  # noqa: E402
+from LAB.sensors import GpsReader               # noqa: E402
 
-# ── LeRobot — identical imports to lerobot_inference_api.py ───────────────
-from lerobot.configs.policies           import PreTrainedConfig
-from lerobot.datasets.lerobot_dataset   import LeRobotDatasetMetadata
-from lerobot.datasets.utils             import build_dataset_frame
-from lerobot.policies.factory           import make_policy, make_pre_post_processors
-from lerobot.policies.utils             import make_robot_action
-from lerobot.processor                  import make_default_processors
-from lerobot.processor.rename_processor import rename_stats
-from lerobot.utils.constants            import ACTION, OBS_STR
-from lerobot.utils.control_utils        import predict_action
-from lerobot.utils.utils                import get_safe_torch_device, init_logging
+# ── LeRobot ─────────────────────────────────────────────────────────────────
+from lerobot.common.control_utils import predict_action              # noqa: E402
+from lerobot.configs.policies import PreTrainedConfig                # noqa: E402
+from lerobot.datasets import LeRobotDatasetMetadata                  # noqa: E402
+from lerobot.policies.factory import make_policy, make_pre_post_processors  # noqa: E402
+from lerobot.policies.utils import make_robot_action                 # noqa: E402
+from lerobot.processor import make_default_processors                # noqa: E402
+from lerobot.processor.rename_processor import rename_stats          # noqa: E402
+from lerobot.utils.constants import ACTION, OBS_STR                  # noqa: E402
+from lerobot.utils.device_utils import get_safe_torch_device         # noqa: E402
+from lerobot.utils.feature_utils import build_dataset_frame          # noqa: E402
+from lerobot.utils.utils import init_logging                         # noqa: E402
 
 
-# ── Constants ──────────────────────────────────────────────────────────────
-# Camera key must match data_convert_agv.py: CAMERA_KEY = "front"
-CAMERA_KEY             = "front"
-BLANK_FRAME_THRESHOLD  = 5.0    # mean pixel value below this → blank frame
-BLANK_FRAME_MAX_CONSEC = 30     # halt after this many consecutive bad frames
+# ── Constants ───────────────────────────────────────────────────────────────
+
+# Must match data_convert_agv.py's CAMERA_KEY.
+CAMERA_KEY = "front"
+
+BLANK_FRAME_THRESHOLD = 5.0    # mean pixel below this → treat as blank
+BLANK_FRAME_MAX_CONSEC = 30    # halt after this many consecutive bad frames
+
+DEFAULT_GPS_UDP_PORT = 57003   # second gps_mux fan-out target
+DEFAULT_AI_UDP_PORT = 55998    # teleop's AI-only motion listener
+DEFAULT_SEND_HZ = 50.0         # UDP tx rate, independent of policy rate
+DEFAULT_ACTION_TTL = 0.5       # stop repeating an action older than this
+GPS_WARN_AFTER_SEC = 10.0      # complain if no GPS by then
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#
-#  END-TO-END PIPELINE EXPLANATION
-#  ─────────────────────────────────────────────────────────────────────────
-#
-#  1. DATA RECORDING (teleop.py + record.py)
-#  ─────────────────────────────────────────
-#  Operator drives with a gamepad. UDP packet arrives with raw ang_z
-#  (large values, ±3.5 rad/s range).
-#
-#  motion.command(lin_x, raw_ang_z, locked, brake)
-#      ↓
-#  MotionController stores raw_ang_z as self._ang_z
-#  MotionController publishes to /cmd_vel: lin_x, raw_ang_z * ang_z_scale(0.20)
-#      ↓
-#  motion.published_state() → returns (lin_x, raw_ang_z * 0.20)   ← SCALED
-#  motion.state()           → returns (lin_x, raw_ang_z, ...)      ← RAW
-#
-#  SessionRecorder is wired to motion.published_state (see teleop.py line 514).
-#  It writes to JSONL:
-#      linear_velocity  = lin_x
-#      angular_velocity = raw_ang_z * 0.20     ← SCALED value stored on disk
-#
-#  Camera frame (BGR) is written to MP4 simultaneously.
-#
-#
-#  2. DATASET CREATION (split_session_agv.py → data_convert_agv.py)
-#  ─────────────────────────────────────────────────────────────────
-#  split_session_agv.py: cuts long recordings into 2-minute chunks.
-#  Each chunk becomes one episode folder: session_N/session_N.mp4 + .jsonl
-#
-#  data_convert_agv.py: for each episode folder:
-#    - reads frame from MP4 → converts BGR→RGB
-#    - reads row from JSONL:
-#        lin_x = row["linear_velocity"]      ← the SCALED value (×0.20 already)
-#        ang_z = row["angular_velocity"]     ← the SCALED value (×0.20 already)
-#        lat, lon, orientation from GPS fields
-#    - builds raw_observation dict:
-#        { lin_x, ang_z, lat, long, orientation, "front": frame_rgb }
-#    - applies robot_observation_processor (make_default_processors — currently identity)
-#    - calls build_dataset_frame → packs into LeRobot dataset format
-#    - action stored = { lin_x, ang_z } — same SCALED values
-#
-#  Result: dataset stores SCALED ang_z (already ×0.20) in both
-#  observation.state and action vectors.
-#
-#
-#  3. TRAINING
-#  ──────────────────────────────────────────────────────────────────────────
-#  ACT policy trained on LeRobot dataset. Input: image + state vector
-#  [lin_x, ang_z_scaled, lat, lon, orientation]. Output: action chunk
-#  [lin_x, ang_z_scaled] × chunk_size steps.
-#
-#  The policy learns SCALED ang_z throughout — it never sees raw values.
-#  ang_z in the dataset is small (mean ~0.007, range ±0.70 approx = ±3.5×0.20).
-#
-#  With discretization (Method 1): action head outputs logits over 31 bins
-#  per action dimension. Bin centers are in normalized (MEAN_STD) space.
-#  At inference: softmax → expected value → un-normalize → SCALED ang_z.
-#
-#
-#  4. INFERENCE (this file)
-#  ──────────────────────────────────────────────────────────────────────────
-#  No gamepad. Policy IS the sole source of commands.
-#
-#  Observation state feedback:
-#    During teleoperation: motion.state() returned raw_ang_z from the gamepad.
-#    During inference: there is no gamepad. We must feed back SCALED ang_z
-#    to match what the dataset stored as observation.state ang_z.
-#    Source: motion.published_state() → (lin_x, ang_z_scaled) — correct.
-#
-#  Policy output:
-#    pred_ang_z is SCALED (×0.20 already applied by the dataset convention).
-#    The robot expects SCALED ang_z on /cmd_vel.
-#    motion.command() takes RAW ang_z and multiplies by 0.20 internally.
-#    So: ang_z_cmd = pred_ang_z / ang_z_scale   (undo the scale so
-#        motion.command(ang_z_cmd) * 0.20 = pred_ang_z on /cmd_vel)
-#
-#  In numbers: policy outputs 0.14 rad/s (scaled).
-#    We pass 0.14 / 0.20 = 0.70 to motion.command().
-#    MotionController sends 0.70 * 0.20 = 0.14 to /cmd_vel. ✓
-#
-#  Next observation feedback:
-#    motion.published_state() → 0.14 (scaled) → fed back as ang_z obs. ✓
-#    This matches what the dataset stored, so the policy sees the right dist.
-#
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+#  AI motion sender — 50 Hz UDP to teleop, decoupled from policy latency
+# ════════════════════════════════════════════════════════════════════════════
+
+class AiMotionSender:
+    """Streams the latest policy action to teleop's motion listener.
+
+    Runs at a fixed rate on its own thread so a slow inference step can never
+    starve teleop's drivetrain watchdog. The policy loop calls set_action();
+    this thread repeats whatever it last saw.
+
+    Fail-safe: if set_action() has not been called for `action_ttl` seconds
+    the repeated command decays to zero. teleop's AI watchdog then observes
+    a zero-velocity-but-alive stream; if we stop entirely it auto-disables AI
+    and hands control back to the human.
+
+    We deliberately send neither robot_lock nor a nonzero brake — both are
+    human-authoritative in MotionController and an AI packet must never be
+    able to unlock the robot or latch a brake.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        send_hz: float = DEFAULT_SEND_HZ,
+        action_ttl: float = DEFAULT_ACTION_TTL,
+        enabled: bool = True,
+    ) -> None:
+        self._host = host
+        self._port = port
+        self._period = 1.0 / max(1.0, float(send_hz))
+        self._action_ttl = float(action_ttl)
+        self._enabled = bool(enabled)
+
+        self._lock = threading.Lock()
+        self._lin = 0.0
+        self._ang = 0.0
+        self._action_t = 0.0          # monotonic, 0 = nothing set yet
+        self._seq = 0
+        self._stale_logged = False
+
+        self._sock: Optional[socket.socket] = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # ── lifecycle ───────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        if not self._enabled:
+            log("inference", "dry run — no UDP will be sent (omit --send to keep this)")
+            return
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        except Exception as exc:
+            log("inference", f"UDP socket create failed: {exc} — AI output disabled")
+            self._enabled = False
+            return
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="ai-motion-tx"
+        )
+        self._thread.start()
+        log("inference",
+            f"AI motion → udp://{self._host}:{self._port} @ "
+            f"{1.0 / self._period:.0f} Hz (origin=ai, ttl={self._action_ttl:.2f}s)")
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        # Explicit zero burst so the chassis is not left holding our last
+        # command while teleop's watchdog counts down.
+        if self._sock is not None:
+            for _ in range(5):
+                self._emit(0.0, 0.0)
+                time.sleep(0.02)
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+    # ── public API ──────────────────────────────────────────────────────────
+
+    def set_action(self, lin_x: float, ang_z: float) -> None:
+        with self._lock:
+            self._lin = float(lin_x)
+            self._ang = float(ang_z)
+            self._action_t = time.monotonic()
+            self._stale_logged = False
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    # ── internals ───────────────────────────────────────────────────────────
+
+    def _current_command(self) -> tuple[float, float]:
+        now = time.monotonic()
+        with self._lock:
+            if self._action_t <= 0.0:
+                return 0.0, 0.0
+            age = now - self._action_t
+            if age > self._action_ttl:
+                if not self._stale_logged:
+                    log("inference",
+                        f"action stale ({age:.2f}s > ttl) — sending zeros")
+                    self._stale_logged = True
+                return 0.0, 0.0
+            return self._lin, self._ang
+
+    def _emit(self, lin: float, ang: float) -> None:
+        if self._sock is None:
+            return
+        self._seq += 1
+        payload = {
+            "seq": self._seq,
+            "t": time.time(),
+            "origin": "ai",
+            "lin_x": round(float(lin), 4),
+            "ang_z": round(float(ang), 4),
+            "brake": 0.0,
+        }
+        try:
+            self._sock.sendto(
+                json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                (self._host, self._port),
+            )
+        except Exception as exc:
+            log("inference", f"motion sendto error: {exc}")
+
+    def _run(self) -> None:
+        next_t = time.monotonic()
+        while not self._stop.is_set():
+            lin, ang = self._current_command()
+            self._emit(lin, ang)
+            next_t += self._period
+            delay = next_t - time.monotonic()
+            if delay < -self._period:
+                next_t = time.monotonic()
+                delay = 0.0
+            if delay > 0:
+                self._stop.wait(timeout=delay)
 
 
-# ── Policy pipeline ────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#  Frame source — shared-memory bus first, direct V4L2 only as a fallback
+# ════════════════════════════════════════════════════════════════════════════
+
+class FrameSource:
+    """Reads BGR frames from teleop's frame bus, or straight from V4L2.
+
+    teleop owns /dev/videoN exclusively, so the bus is the only correct path
+    while it is running. The direct path exists for bench work with teleop
+    stopped; if teleop holds the device it will fail to open and we say so
+    instead of quietly serving nothing.
+    """
+
+    def __init__(
+        self,
+        cam_cfg: CameraConfig,
+        expected_hw: tuple[int, int],
+        prefer_bus: bool = True,
+        bus_timeout_sec: float = 3.0,
+    ) -> None:
+        self._cam_cfg = cam_cfg
+        self._expected_hw = expected_hw
+        self._bus = None
+        self._usb = None
+        self.label = "none"
+
+        if prefer_bus:
+            self._bus = self._attach_bus(cam_cfg.name, bus_timeout_sec)
+            if self._bus is not None:
+                self.label = f"frame bus (/dev/shm/lab_{cam_cfg.name})"
+                return
+
+        self._usb = self._open_direct(cam_cfg)
+        if self._usb is not None:
+            self.label = f"direct V4L2 ({cam_cfg.source})"
+            return
+
+        raise RuntimeError(
+            f"no frame source for camera {cam_cfg.name!r}. The frame bus is "
+            f"empty (is teleop running, and is publish_frames=True for this "
+            f"camera?) and {cam_cfg.source} could not be opened directly "
+            f"(teleop is probably holding it)."
+        )
+
+    # ── construction helpers ────────────────────────────────────────────────
+
+    def _attach_bus(self, camera_name: str, timeout_sec: float):
+        try:
+            from LAB.utils.frame_bus import FrameBusReader
+        except Exception as exc:
+            log("inference", f"frame_bus import failed: {exc}")
+            return None
+
+        log("inference", f"attaching to frame bus {camera_name!r}…")
+        rdr = FrameBusReader(camera_name)
+
+        deadline = time.monotonic() + timeout_sec
+        frame = None
+        while time.monotonic() < deadline:
+            _ts, frame = rdr.read_latest()
+            if frame is not None:
+                break
+            time.sleep(0.1)
+
+        if frame is None:
+            log("inference",
+                f"frame bus: nothing published within {timeout_sec:.0f}s "
+                f"— is teleop running?")
+            rdr.close()
+            return None
+
+        exp_h, exp_w = self._expected_hw
+        if frame.shape[:2] != (exp_h, exp_w):
+            log("inference",
+                f"frame bus shape {frame.shape} != expected "
+                f"({exp_h}, {exp_w}, 3) — check record_width/record_height "
+                f"against the camera config")
+            rdr.close()
+            return None
+
+        log("inference",
+            f"frame bus OK: shape={frame.shape} mean_px={float(frame.mean()):.0f}")
+        return rdr
+
+    def _open_direct(self, cam_cfg: CameraConfig):
+        try:
+            from LAB.cameras import UsbCameraCapture
+        except Exception as exc:
+            log("inference", f"cameras import failed: {exc}")
+            return None
+
+        # Never publish from here — teleop owns the bus region for this name
+        # and two publishers would fight over /dev/shm/lab_<name>.
+        solo_cfg = dataclass_replace(cam_cfg, publish_frames=False)
+        log("inference", f"falling back to direct V4L2 on {solo_cfg.source}")
+        cap = UsbCameraCapture(solo_cfg)
+        if not cap.start():
+            return None
+        # Give the capture thread a moment to land its first frame.
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            _ts, frame = cap.read_latest()
+            if frame is not None:
+                return cap
+            time.sleep(0.1)
+        log("inference", "direct V4L2 opened but produced no frames")
+        cap.stop()
+        return None
+
+    # ── public API ──────────────────────────────────────────────────────────
+
+    def read(self) -> Optional[np.ndarray]:
+        if self._bus is not None:
+            _ts, frame = self._bus.read_latest()
+            return frame
+        if self._usb is not None:
+            _ts, frame = self._usb.read_latest()
+            return frame
+        return None
+
+    def close(self) -> None:
+        if self._bus is not None:
+            try:
+                self._bus.close()
+            except Exception:
+                pass
+            self._bus = None
+        if self._usb is not None:
+            try:
+                self._usb.stop()
+            except Exception:
+                pass
+            self._usb = None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Frame validation
+# ════════════════════════════════════════════════════════════════════════════
+
+class FrameValidator:
+    """Rejects None / wrong-shape / blank frames, halts on a sustained run.
+
+    A blank frame usually means the USB camera wedged or the bus writer died.
+    Feeding those to the policy produces confident nonsense, so a long streak
+    is a hard stop rather than a warning.
+    """
+
+    def __init__(
+        self,
+        expected_h: int,
+        expected_w: int,
+        blank_thresh: float = BLANK_FRAME_THRESHOLD,
+        max_consec: int = BLANK_FRAME_MAX_CONSEC,
+    ) -> None:
+        self.expected_shape = (expected_h, expected_w, 3)
+        self.blank_thresh = blank_thresh
+        self.max_consec = max_consec
+        self.n_total = 0
+        self.n_none = 0
+        self.n_wrong_shape = 0
+        self.n_blank = 0
+        self.n_ok = 0
+        self._consec_bad = 0
+
+    def validate(self, frame: Optional[np.ndarray]) -> tuple[bool, str]:
+        self.n_total += 1
+
+        if frame is None:
+            self.n_none += 1
+            self._consec_bad += 1
+            self._check_halt()
+            return False, "frame is None"
+
+        if frame.shape != self.expected_shape:
+            self.n_wrong_shape += 1
+            self._consec_bad += 1
+            self._check_halt()
+            return False, f"wrong shape {frame.shape}, expected {self.expected_shape}"
+
+        mean_px = float(frame.mean())
+        if mean_px < self.blank_thresh:
+            self.n_blank += 1
+            self._consec_bad += 1
+            self._check_halt()
+            return False, f"blank frame mean_px={mean_px:.1f} < {self.blank_thresh}"
+
+        self.n_ok += 1
+        self._consec_bad = 0
+        return True, ""
+
+    def summary(self) -> str:
+        return (
+            f"total={self.n_total} ok={self.n_ok} none={self.n_none} "
+            f"wrong_shape={self.n_wrong_shape} blank={self.n_blank}"
+        )
+
+    def _check_halt(self) -> None:
+        if self._consec_bad >= self.max_consec:
+            raise RuntimeError(
+                f"{self._consec_bad} consecutive bad frames — halting. "
+                f"{self.summary()}"
+            )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Policy pipeline
+# ════════════════════════════════════════════════════════════════════════════
+
+def _resolve_action_bins_path(
+    policy_cfg,
+    policy_path: str,
+    override: Optional[str] = None,
+) -> None:
+    """Repair a stale absolute action_bins_path baked in at training time.
+
+    Resolution order:
+      1. --action-bins-path override
+      2. <policy_path>/<basename of the baked path>
+      3. <policy_path>/action_bins.pt
+      4. the baked path itself, if it happens to exist here
+    """
+    if not hasattr(policy_cfg, "action_bins_path"):
+        return  # policy does not use discretization
+
+    baked = getattr(policy_cfg, "action_bins_path", None)
+    resolved: Optional[Path] = None
+
+    if override:
+        resolved = Path(override).expanduser()
+    else:
+        candidates = []
+        if baked:
+            candidates.append(Path(policy_path) / Path(str(baked)).name)
+        candidates.append(Path(policy_path) / "action_bins.pt")
+        if baked:
+            candidates.append(Path(str(baked)))
+        for c in candidates:
+            try:
+                if c.exists():
+                    resolved = c
+                    break
+            except OSError:
+                continue
+
+    if resolved is None or not resolved.exists():
+        raise FileNotFoundError(
+            f"action_bins_path in the policy config points at {baked!r}, which "
+            f"does not exist on this machine, and nothing usable was found in "
+            f"{policy_path}. Pass --action-bins-path pointing at the .pt file "
+            f"(normally shipped alongside the checkpoint)."
+        )
+
+    log("inference", f"action_bins_path: {baked}  →  {resolved}")
+    policy_cfg.action_bins_path = str(resolved)
+
 
 def build_policy_pipeline(
-    policy_path:     str,
+    policy_path: str,
     dataset_repo_id: str,
-    device:          str = "cuda",
-    rename_map:      Optional[dict] = None,
+    device: str = "cuda",
+    rename_map: Optional[dict] = None,
+    action_bins_path: Optional[str] = None,
 ):
-    """
-    Identical to lerobot_inference_api.build_policy_pipeline.
-    Uses ds_meta.features directly for normalization-aligned feature schema.
-    Uses make_default_processors() for [SYMMETRY] with data_convert_agv.py.
+    """Build policy + pre/post processors aligned with data_convert_agv.py.
+
+    ds_meta.features is used directly so the normalization schema matches the
+    dataset exactly, and make_default_processors() keeps observation handling
+    symmetric with the offline converter.
     """
     if rename_map is None:
         rename_map = {}
@@ -180,29 +617,32 @@ def build_policy_pipeline(
     _, robot_action_processor, robot_observation_processor = make_default_processors()
 
     policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
-    policy_cfg.device          = device
-    policy_cfg.pretrained_path = policy_path
+    policy_cfg.device = device
+    policy_cfg.pretrained_path = Path(policy_path)
 
-    policy = make_policy(policy_cfg, ds_meta=ds_meta)
+    _resolve_action_bins_path(policy_cfg, policy_path, override=action_bins_path)
+
+    policy = make_policy(policy_cfg, ds_meta=ds_meta, rename_map=rename_map)
 
     preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg      = policy_cfg,
-        pretrained_path = policy_path,
-        dataset_stats   = rename_stats(ds_meta.stats, rename_map),
-        preprocessor_overrides = {
-            "device_processor":              {"device": device},
+        policy_cfg=policy_cfg,
+        pretrained_path=policy_path,
+        dataset_stats=rename_stats(ds_meta.stats, rename_map),
+        preprocessor_overrides={
+            # policy_cfg.device is the *resolved* device — PreTrainedConfig
+            # falls back if the requested one is unavailable.
+            "device_processor": {"device": policy_cfg.device},
             "rename_observations_processor": {"rename_map": rename_map},
         },
     )
 
-    # Verify camera key exists in the dataset features at startup
     image_key = f"{OBS_STR}.images.{CAMERA_KEY}"
     if image_key not in ds_meta.features:
         available = [k for k in ds_meta.features if "image" in k.lower()]
         raise RuntimeError(
-            f"Camera key '{image_key}' not found in dataset features. "
-            f"Available image keys: {available}. "
-            f"Update CAMERA_KEY at the top of this file."
+            f"Camera key {image_key!r} not found in dataset features. "
+            f"Available image keys: {available}. Update CAMERA_KEY at the top "
+            f"of this file."
         )
 
     return (
@@ -215,246 +655,183 @@ def build_policy_pipeline(
     )
 
 
-# ── Frame validator ────────────────────────────────────────────────────────
-
-class FrameValidator:
-    """
-    Three checks per frame:
-      1. Not None
-      2. Shape == (expected_h, expected_w, 3)
-      3. Mean pixel > blank_thresh  (not black/blank)
-    Raises RuntimeError after max_consec consecutive bad frames.
-    """
-
-    def __init__(
-        self,
-        expected_h:   int,
-        expected_w:   int,
-        blank_thresh: float = BLANK_FRAME_THRESHOLD,
-        max_consec:   int   = BLANK_FRAME_MAX_CONSEC,
-    ) -> None:
-        self.expected_shape = (expected_h, expected_w, 3)
-        self.blank_thresh   = blank_thresh
-        self.max_consec     = max_consec
-        self.n_total        = 0
-        self.n_none         = 0
-        self.n_wrong_shape  = 0
-        self.n_blank        = 0
-        self.n_ok           = 0
-        self._consec_bad    = 0
-
-    def validate(self, frame: Optional[np.ndarray]) -> tuple[bool, str]:
-        self.n_total += 1
-
-        if frame is None:
-            self.n_none      += 1
-            self._consec_bad += 1
-            self._check_halt()
-            return False, "frame is None"
-
-        if frame.shape != self.expected_shape:
-            self.n_wrong_shape += 1
-            self._consec_bad   += 1
-            self._check_halt()
-            return False, f"wrong shape {frame.shape}, expected {self.expected_shape}"
-
-        mean_px = float(frame.mean())
-        if mean_px < self.blank_thresh:
-            self.n_blank     += 1
-            self._consec_bad += 1
-            self._check_halt()
-            return False, f"blank frame mean_px={mean_px:.1f} < {self.blank_thresh}"
-
-        self.n_ok        += 1
-        self._consec_bad  = 0
-        return True, ""
-
-    def summary(self) -> str:
-        return (
-            f"total={self.n_total} ok={self.n_ok} "
-            f"none={self.n_none} wrong_shape={self.n_wrong_shape} blank={self.n_blank}"
-        )
-
-    def _check_halt(self) -> None:
-        if self._consec_bad >= self.max_consec:
-            raise RuntimeError(
-                f"{self._consec_bad} consecutive bad frames — halting. "
-                f"{self.summary()}"
-            )
-
-
-# ── Raw observation builder ────────────────────────────────────────────────
-
 def build_raw_observation(
     frame_bgr: np.ndarray,
-    lin_x:     float,
-    ang_z:     float,
-    gps_data:  dict,
+    lin_x: float,
+    ang_z: float,
+    gps_data: dict,
 ) -> dict:
-    """
-    Builds the raw observation dict — identical structure to
-    data_convert_agv.py / row_to_raw_obs_and_action().
+    """Raw observation dict — same structure as data_convert_agv.py.
 
-    lin_x and ang_z must be RAW (motion.state() values) to match
-    what the old dataset stored as observation state.
-    GPS fields default to 0.0 if None (no fix yet — same as converter).
-    Image is BGR→RGB (same as converter's cv2.cvtColor call).
+    ang_z must be in the same space the dataset stored (RAW by default; see
+    the ang_z convention note at the top of this file). GPS fields fall back
+    to 0.0 exactly as the offline converter does when there is no fix.
     """
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    lat = float(gps_data.get("gps_latitude",  0.0) or 0.0)
+    lat = float(gps_data.get("gps_latitude", 0.0) or 0.0)
     lon = float(gps_data.get("gps_longitude", 0.0) or 0.0)
-    ori = float(gps_data.get("orientation",   0.0) or 0.0)
+    ori = float(
+        gps_data.get("heading_deg_true", gps_data.get("orientation", 0.0)) or 0.0
+    )
 
     return {
-        "lin_x":       lin_x,
-        "ang_z":       ang_z,      # RAW — matches old dataset observation.state
-        "lat":         lat,
-        "long":        lon,
+        "lin_x": lin_x,
+        "ang_z": ang_z,
+        "lat": lat,
+        "long": lon,
         "orientation": ori,
-        CAMERA_KEY:    frame_rgb,  # "front"
+        CAMERA_KEY: frame_rgb,
     }
 
 
-# ── Main inference class ───────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#  LabInference
+# ════════════════════════════════════════════════════════════════════════════
 
 class LabInference:
 
     def __init__(
         self,
-        policy_path:             str,
-        dataset_repo_id:         str,
-        device:                  str,
-        cfg:                     LabConfig,
-        send:                    bool  = False,
-        ang_deadband:            float = 0.0,
+        policy_path: str,
+        dataset_repo_id: str,
+        device: str,
+        cfg: LabConfig,
+        *,
+        send: bool = False,
+        fps: Optional[float] = None,
+        send_hz: float = DEFAULT_SEND_HZ,
+        action_ttl: float = DEFAULT_ACTION_TTL,
+        udp_host: str = "127.0.0.1",
+        udp_port: Optional[int] = None,
+        gps_udp_port: int = DEFAULT_GPS_UDP_PORT,
+        ang_deadband: float = 0.0,
+        unscale_ang: bool = False,
         temporal_ensemble_coeff: Optional[float] = None,
-        duration_s:              Optional[float] = None,
+        duration_s: Optional[float] = None,
+        action_bins_path: Optional[str] = None,
+        no_gps: bool = False,
     ) -> None:
-        self._cfg         = cfg
-        self._ang_z_scale = cfg.ang_z_scale   # 0.20
-        self._send        = send
-        self._ang_deadband= ang_deadband
-        self._stop        = threading.Event()
-        self._duration_s  = duration_s
+        self._cfg = cfg
+        self._send = send
+        self._ang_deadband = ang_deadband
+        self._unscale_ang = unscale_ang
+        self._ang_z_scale = float(getattr(cfg, "ang_z_scale", 0.20) or 0.20)
+        self._duration_s = duration_s
+        self._fps = float(fps or getattr(cfg, "record_fps", 15) or 15)
+        self._stop = threading.Event()
 
-        # ── 1. Policy pipeline ────────────────────────────────────────────
+        # ── 1. Policy ───────────────────────────────────────────────────────
         log("inference", f"loading policy: {policy_path}")
         (
             self._policy,
             self._preprocessor,
             self._postprocessor,
-            _robot_action_processor,    # unused — no robot object
-            self._robot_obs_processor,  # make_default_processors [SYMMETRY]
-            self._features,             # ds_meta.features — normalization aligned
+            _robot_action_processor,   # unused — we have no Robot object
+            self._robot_obs_processor,
+            self._features,
         ) = build_policy_pipeline(
-            policy_path     = policy_path,
-            dataset_repo_id = dataset_repo_id,
-            device          = device,
+            policy_path=policy_path,
+            dataset_repo_id=dataset_repo_id,
+            device=device,
+            action_bins_path=action_bins_path,
         )
 
-        # ── 2. Temporal ensembling ────────────────────────────────────────
         if temporal_ensemble_coeff is not None:
             self._enable_temporal_ensembling(temporal_ensemble_coeff)
 
-        # ── 3. Frame validator ────────────────────────────────────────────
+        # ── 2. Frame validation ─────────────────────────────────────────────
         self._validator = FrameValidator(
-            expected_h = cfg.record_height,
-            expected_w = cfg.record_width,
+            expected_h=cfg.record_height,
+            expected_w=cfg.record_width,
         )
 
-        # ── 4. Motion UDP sender (replaces MotionController) ──────────────
-        # Previously we owned a MotionController and forwarded directly to
-        # the Docker bridge. Now we send UDP packets to teleop's motion
-        # listener (cfg.udp_motion_port, default 55999) tagged origin="ai".
-        # teleop's MotionController arbitrates human vs AI per its
-        # human-priority policy.
-        #
-        # No rclpy. No direct Docker UDP. teleop must be running.
-        self._motion_udp_host = "127.0.0.1"
-        self._motion_udp_port = getattr(cfg, "udp_motion_port", 55999)
-        self._motion_sock: Optional[socket.socket] = None
-        if send:
-            self._motion_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            log("inference",
-                f"motion UDP → {self._motion_udp_host}:{self._motion_udp_port} "
-                f"(origin=ai)  — teleop must be running")
-            # Initial inert packet so teleop has a fresh AI slot (still
-            # ignored until the human chord-enables AI).
-            self._send_motion_ai(0.0, 0.0, locked=False, braking=False)
-
-        # Self-consistent obs echo (replaces motion.state() in the obs loop).
-        # We feed our last commanded values back as the policy's obs state
-        # so the loop is coherent when no gamepad is present. This mirrors
-        # what motion.state() used to return — the last value we commanded.
-        self._last_sent_lin: float = 0.0
-        self._last_sent_ang: float = 0.0
-
-        # ── 5. GPS ────────────────────────────────────────────────────────
-        self._gps = GpsReader(
-            udp_host = cfg.gps_udp_host,
-            udp_port = cfg.gps_udp_port,
-        )
-        self._gps.start()
-
-        # ── 6. Camera ────────────────────────────────────────────────────
-        self._frame_bus_reader = None
-        self._cameras          = None
-
+        # ── 3. Camera ───────────────────────────────────────────────────────
         cam_cfg = next(
             (c for c in cfg.cameras if c.name == cfg.record_camera_name), None
         )
         if cam_cfg is None:
+            names = [c.name for c in cfg.cameras]
             raise RuntimeError(
-                f"Camera {cfg.record_camera_name!r} not in cfg.cameras"
+                f"camera {cfg.record_camera_name!r} not in cfg.cameras "
+                f"(have: {names})"
             )
+        self._frames = FrameSource(
+            cam_cfg,
+            expected_hw=(cfg.record_height, cfg.record_width),
+        )
+        log("inference", f"camera source: {self._frames.label}")
 
-        if cam_cfg.publish_frames:
-            self._frame_bus_reader = self._try_attach_frame_bus(cam_cfg.name)
+        # ── 4. GPS ──────────────────────────────────────────────────────────
+        self._gps: Optional[GpsReader] = None
+        self._gps_warned = False
+        self._gps_start_t = 0.0
+        if no_gps:
+            log("inference", "GPS disabled (--no-gps) — lat/lon/orientation = 0.0")
+        else:
+            if gps_udp_port == getattr(cfg, "gps_udp_port", 57002):
+                log("inference",
+                    f"WARNING: --gps-udp-port {gps_udp_port} is the same port "
+                    f"teleop binds. The bind will fail while teleop runs. Add a "
+                    f"second fan-out target to gps_mux "
+                    f"(GPS_UDP_PORTS=\"{cfg.gps_udp_port},{DEFAULT_GPS_UDP_PORT}\") "
+                    f"and use --gps-udp-port {DEFAULT_GPS_UDP_PORT}.")
+            self._gps = GpsReader(
+                udp_host=cfg.gps_udp_host,
+                udp_port=gps_udp_port,
+            )
+            self._gps.start()
+            self._gps_start_t = time.monotonic()
 
-        if self._frame_bus_reader is None:
-            log("inference",
-                f"camera {cam_cfg.name!r}: direct V4L2 ({cam_cfg.source})")
-            from LAB.cameras import MultiCameraCapture
-            self._cameras = MultiCameraCapture.from_configs([cam_cfg])
-            if not self._cameras.has(cam_cfg.name):
-                raise RuntimeError(
-                    f"Cannot open camera {cam_cfg.name!r} at {cam_cfg.source}. "
-                    f"Is teleop.py already holding the V4L2 device?"
-                )
+        # ── 5. AI motion output ─────────────────────────────────────────────
+        self._tx = AiMotionSender(
+            host=udp_host,
+            port=int(udp_port
+                     or getattr(cfg, "udp_ai_motion_port", DEFAULT_AI_UDP_PORT)),
+            send_hz=send_hz,
+            action_ttl=action_ttl,
+            enabled=send,
+        )
+        self._tx.start()
 
-        self._camera_name = cam_cfg.name
+        # Self-consistent observation echo. During teleoperation the dataset
+        # recorded the value the operator had just commanded; with no gamepad
+        # present we feed back what WE last commanded, which keeps the loop in
+        # the same distribution:
+        #     tick N   : command(pred_ang)
+        #     tick N+1 : obs ang_z = pred_ang
+        self._last_cmd_lin = 0.0
+        self._last_cmd_ang = 0.0
+
         log("inference", "init complete")
 
-    # ── Public ─────────────────────────────────────────────────────────────
+    # ── public ──────────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        mode = "SENDING TO ROBOT" if self._send else "DRY RUN (print only)"
-        log("inference", f"starting — {mode}  deadband={self._ang_deadband}  scale={self._ang_z_scale}")
-
-        if self._send:
-            self._send_motion_ai(0.0, 0.0, locked=False, braking=False)
+        mode = "SENDING (origin=ai)" if self._send else "DRY RUN — no UDP"
+        log("inference",
+            f"starting — {mode}  fps={self._fps:.0f}  "
+            f"deadband={self._ang_deadband}  unscale_ang={self._unscale_ang}")
 
         self._policy.reset()
         self._preprocessor.reset()
         self._postprocessor.reset()
 
-        interval  = 1.0 / self._cfg.stream_fps   # 1/15 s
+        interval = 1.0 / max(1.0, self._fps)
         next_tick = time.monotonic()
-        frame_i   = 0
-        t_start      = time.time()       # wall-clock for timestamps
-        t_start_mono = time.monotonic()  # for duration limit
+        t_start_mono = time.monotonic()
+        frame_i = 0
 
         print()
-        print(f"{'frame':>6}  {'timestamp':>12}  {'frame_mean':>10}  "
-              f"{'obs_lin':>8}  {'obs_ang':>10}  "
-              f"{'lin_x':>8}  {'ang_z_pred':>12}  {'ang_z_cmd':>12}  "
-              f"{'→robot':>8}")
-        print("─" * 105)
+        print(f"{'frame':>6}  {'wall_ts':>13}  {'mean_px':>8}  "
+              f"{'obs_lin':>9}  {'obs_ang':>10}  "
+              f"{'pred_lin':>9}  {'pred_ang':>11}  {'ang_cmd':>10}  "
+              f"{'gps':>4}  {'tx':>4}")
+        print("─" * 104)
 
         try:
             while not self._stop.is_set():
-                # Duration limit (--duration)
-                if self._duration_s is not None and (time.monotonic() - t_start_mono) >= self._duration_s:
+                if (self._duration_s is not None
+                        and (time.monotonic() - t_start_mono) >= self._duration_s):
                     log("inference", f"duration {self._duration_s}s reached — stopping")
                     break
 
@@ -462,280 +839,249 @@ class LabInference:
                 if sleep_for > 0:
                     time.sleep(sleep_for)
                 next_tick += interval
+                # Never chase a backlog after a slow inference step.
+                if next_tick < time.monotonic() - interval:
+                    next_tick = time.monotonic() + interval
 
                 wall_ts = time.time()
 
-                # ── A. Grab and validate frame ─────────────────────────────
-                frame_bgr = self._read_frame()
+                # ── A. frame ────────────────────────────────────────────────
+                frame_bgr = self._frames.read()
                 ok, reason = self._validator.validate(frame_bgr)
                 if not ok:
+                    # A bad frame must not leave a stale action being repeated.
+                    self._tx.set_action(0.0, 0.0)
+                    self._last_cmd_lin = 0.0
+                    self._last_cmd_ang = 0.0
                     log("inference", f"SKIP f={frame_i}: {reason}")
                     frame_i += 1
                     continue
 
                 mean_px = float(frame_bgr.mean())
 
-                # ── B. Observation state — SCALED ang_z from published_state
-                #
-                # Dataset stores ang_z = raw_ang_z * 0.20 (published_state).
-                # Policy was trained on that scaled value as obs state.
-                # During inference there is no gamepad, so published_state()
-                # reflects what we sent last tick — already in scaled space.
-                # This is exactly what the policy expects as its state input.
-                #
-                # OLD dataset: ang_z was recorded from motion.state() = raw pre-scale.
-                # Policy predicts raw ang_z. Feed raw back as obs to match training.
-                # motion.state() returns whatever raw value we last passed to
-                # motion.command() — so the loop is self-consistent:
-                #   tick N:   motion.command(pred_ang_raw)
-                #   tick N+1: motion.state() -> pred_ang_raw -> obs ang_z ✓
-                if self._send:
-                    lin_x_obs    = self._last_sent_lin
-                    ang_z_raw_obs = self._last_sent_ang
-                    ang_z_obs    = ang_z_raw_obs   # raw — matches old dataset
-                else:
-                    lin_x_obs, ang_z_obs = 0.0, 0.0
+                # ── B. observation state ────────────────────────────────────
+                lin_x_obs = self._last_cmd_lin
+                ang_z_obs = self._last_cmd_ang
 
-                gps_data = self._gps.get()
+                gps_data = self._gps.get() if self._gps is not None else {}
+                self._check_gps(gps_data)
+                has_fix = bool(gps_data.get("gps_latitude") is not None)
 
-                # ── C. Build observation (identical to data_convert_agv.py) ─
                 raw_obs = build_raw_observation(
-                    frame_bgr = frame_bgr,
-                    lin_x     = lin_x_obs,
-                    ang_z     = ang_z_obs,   # RAW — matches old dataset
-                    gps_data  = gps_data,
+                    frame_bgr=frame_bgr,
+                    lin_x=lin_x_obs,
+                    ang_z=ang_z_obs,
+                    gps_data=gps_data,
                 )
-                obs_processed     = self._robot_obs_processor(raw_obs)
+                obs_processed = self._robot_obs_processor(raw_obs)
                 observation_frame = build_dataset_frame(
                     self._features, obs_processed, prefix=OBS_STR
                 )
 
-                # ── D. Policy inference ────────────────────────────────────
+                # ── C. policy ───────────────────────────────────────────────
                 action_values = predict_action(
-                    observation   = observation_frame,
-                    policy        = self._policy,
-                    device        = get_safe_torch_device(self._policy.config.device),
-                    preprocessor  = self._preprocessor,
-                    postprocessor = self._postprocessor,
-                    use_amp       = self._policy.config.use_amp,
-                    task          = None,
-                    robot_type    = "revobots_agv_follower",
+                    observation=observation_frame,
+                    policy=self._policy,
+                    device=get_safe_torch_device(self._policy.config.device),
+                    preprocessor=self._preprocessor,
+                    postprocessor=self._postprocessor,
+                    use_amp=self._policy.config.use_amp,
+                    task=None,
+                    robot_type="revobots_agv_follower",
                 )
                 act_pred = make_robot_action(action_values, self._features)
 
-                # OLD dataset: policy output is RAW ang_z (not scaled).
                 pred_lin = float(act_pred.get("lin_x", 0.0))
-                pred_ang = float(act_pred.get("ang_z", 0.0))   # RAW
+                pred_ang = float(act_pred.get("ang_z", 0.0))
 
-                # ── E. Deadband ────────────────────────────────────────────
-                pred_ang_after_db = pred_ang
+                # ── D. deadband ─────────────────────────────────────────────
+                ang_after_db = pred_ang
                 if self._ang_deadband > 0.0 and abs(pred_ang) < self._ang_deadband:
-                    pred_ang_after_db = 0.0
+                    ang_after_db = 0.0
 
-                # ── F. Compute command value for motion.command() ──────────
-                #
-                # Policy outputs SCALED ang_z (e.g. 0.14 rad/s).
-                # motion.command() takes RAW ang_z and multiplies by 0.20.
-                # We must un-scale so the robot receives the intended value:
-                #
-                # OLD dataset: pred_ang is already RAW.
-                # motion.command(raw) * 0.20 → /cmd_vel receives raw*0.20 ✓
-                # No division needed — pass raw directly.
-                ang_z_cmd = pred_ang_after_db
+                # ── E. convention ───────────────────────────────────────────
+                # Default: dataset stored RAW ang_z, MotionController applies
+                # ang_z_scale, so pass it straight through. With --unscale-ang
+                # the dataset stored the already-scaled value, so undo the
+                # scale here to keep /cmd_vel at the intended rate.
+                ang_cmd = (ang_after_db / self._ang_z_scale
+                           if self._unscale_ang else ang_after_db)
 
-                # ── G. Print what is being sent ────────────────────────────
-                sent_marker = "SEND" if self._send else "----"
-                db_marker   = " DB" if pred_ang_after_db != pred_ang else "   "
+                # ── F. publish ──────────────────────────────────────────────
+                # The wire gets ang_cmd; the observation echo gets the value
+                # in the POLICY's own space. Those differ under --unscale-ang,
+                # and feeding the wire value back would hand the policy an
+                # observation 1/ang_z_scale larger than anything in its
+                # training set.
+                self._tx.set_action(pred_lin, ang_cmd)
+                self._last_cmd_lin = pred_lin
+                self._last_cmd_ang = ang_after_db
+
+                db_mark = "*" if ang_after_db != pred_ang else " "
                 print(
                     f"{frame_i:>6d}  "
-                    f"{wall_ts:>12.3f}  "
-                    f"{mean_px:>10.1f}  "
-                    f"{lin_x_obs:>+8.4f}  "
+                    f"{wall_ts:>13.3f}  "
+                    f"{mean_px:>8.1f}  "
+                    f"{lin_x_obs:>+9.4f}  "
                     f"{ang_z_obs:>+10.5f}  "
-                    f"{pred_lin:>+8.4f}  "
-                    f"{pred_ang:>+12.5f}{db_marker}  "
-                    f"{ang_z_cmd:>+12.5f}  "
-                    f"{sent_marker:>8}"
+                    f"{pred_lin:>+9.4f}  "
+                    f"{pred_ang:>+10.5f}{db_mark}  "
+                    f"{ang_cmd:>+10.5f}  "
+                    f"{('fix' if has_fix else '---'):>4}  "
+                    f"{('SEND' if self._send else '----'):>4}"
                 )
-
-                # ── H. Send to robot ───────────────────────────────────────
-                if self._send:
-                    self._send_motion_ai(
-                        lin_x   = pred_lin,
-                        ang_z   = ang_z_cmd,   # raw pred_ang; teleop's MotionController applies *0.20
-                        locked  = False,
-                        braking = False,
-                    )
 
                 frame_i += 1
 
         except RuntimeError as exc:
             print()
             log("inference", f"HALT — {exc}")
+        except KeyboardInterrupt:
+            print()
         except Exception as exc:
             print()
             log("inference", f"loop error: {exc}")
             import traceback
             traceback.print_exc()
         finally:
-            print("─" * 105)
+            print("─" * 104)
             log("inference", f"frame stats: {self._validator.summary()}")
-            self._safe_stop()
+            self._shutdown()
 
     def stop(self) -> None:
         self._stop.set()
 
-    # ── Internal ───────────────────────────────────────────────────────────
+    # ── internals ───────────────────────────────────────────────────────────
+
+    def _check_gps(self, gps_data: dict) -> None:
+        if self._gps is None or self._gps_warned or not self._gps_start_t:
+            return
+        if gps_data.get("gps_latitude") is not None:
+            self._gps_warned = True   # got a fix, stop checking
+            return
+        if (time.monotonic() - self._gps_start_t) < GPS_WARN_AFTER_SEC:
+            return
+        self._gps_warned = True
+        log("inference",
+            f"WARNING: no GPS after {GPS_WARN_AFTER_SEC:.0f}s — the policy is "
+            f"seeing lat=lon=orientation=0.0, which it never saw in training. "
+            f"Check that gps_mux is fanning out to this port.")
 
     def _enable_temporal_ensembling(self, coeff: float) -> None:
         cfg_p = self._policy.config
         log("inference",
-            f"temporal ensembling: coeff={coeff} n_action_steps=1 chunk={cfg_p.chunk_size}")
+            f"temporal ensembling: coeff={coeff} n_action_steps=1 "
+            f"chunk={cfg_p.chunk_size}")
         cfg_p.temporal_ensemble_coeff = coeff
         cfg_p.n_action_steps = 1
         try:
             from lerobot.policies.act.modeling_act import ACTTemporalEnsembler
-            self._policy.temporal_ensembler = ACTTemporalEnsembler(coeff, cfg_p.chunk_size)
+            self._policy.temporal_ensembler = ACTTemporalEnsembler(
+                coeff, cfg_p.chunk_size
+            )
         except ImportError:
             log("inference", "WARNING: cannot import ACTTemporalEnsembler")
         self._policy.reset()
 
-    def _try_attach_frame_bus(self, camera_name: str) -> Optional[object]:
-        """Attach to SHM frame bus. Returns reader if first frame is valid, else None."""
+    def _shutdown(self) -> None:
+        log("inference", "stopping…")
+        # Zero the command before tearing the socket down.
+        self._tx.set_action(0.0, 0.0)
         try:
-            from LAB.utils.frame_bus import FrameBusReader
-            log("inference", f"trying frame bus for {camera_name!r}...")
-            rdr = FrameBusReader(camera_name)
-
-            deadline = time.monotonic() + 2.0
-            frame = None
-            while time.monotonic() < deadline:
-                _, frame = rdr.read_latest()
-                if frame is not None:
-                    break
-                time.sleep(0.1)
-
-            if frame is None:
-                log("inference",
-                    f"frame bus: no frame after 2s — is teleop.py running? "
-                    f"Falling back to direct V4L2.")
-                rdr.close()
-                return None
-
-            # Validate the first frame before committing
-            tmp = FrameValidator(
-                expected_h   = self._cfg.record_height,
-                expected_w   = self._cfg.record_width,
-                blank_thresh = BLANK_FRAME_THRESHOLD,
-                max_consec   = 1,
-            )
-            ok, reason = tmp.validate(frame)
-            if not ok:
-                log("inference",
-                    f"frame bus first frame invalid ({reason}) — "
-                    f"falling back to direct V4L2.")
-                rdr.close()
-                return None
-
-            log("inference",
-                f"frame bus OK: shape={frame.shape}  mean_px={frame.mean():.0f}")
-            return rdr
-
+            self._tx.stop()
         except Exception as exc:
-            log("inference", f"frame bus attach failed ({exc}) — using direct V4L2")
-            return None
-
-    def _read_frame(self) -> Optional[np.ndarray]:
-        if self._frame_bus_reader is not None:
-            _, frame = self._frame_bus_reader.read_latest()
-            return frame
-        if self._cameras is not None:
-            _, frame = self._cameras.read(self._camera_name)
-            return frame
-        return None
-
-    def _send_motion_ai(self, lin_x: float, ang_z: float,
-                        locked: bool = False, braking: bool = False) -> None:
-        """Send one AI motion packet to teleop's UDP motion listener.
-
-        Tagged origin="ai" so teleop's MotionController routes it through
-        the human/AI arbiter (which may ignore it if AI isn't enabled or
-        if the human is currently in control).
-
-        Also stores the values locally so the next obs read can echo them
-        — keeps the inference loop self-consistent without needing to
-        round-trip through motion.state().
-        """
-        if self._motion_sock is None:
-            # Dry-run: keep self-consistent obs only.
-            self._last_sent_lin = float(lin_x)
-            self._last_sent_ang = float(ang_z)
-            return
+            log("inference", f"tx stop error: {exc}")
         try:
-            payload = json.dumps({
-                "lin_x":      float(lin_x),
-                "ang_z":      float(ang_z),
-                "robot_lock": bool(locked),
-                "brake":      1.0 if braking else 0.0,
-                "origin":     "ai",
-            }).encode("utf-8")
-            self._motion_sock.sendto(
-                payload, (self._motion_udp_host, self._motion_udp_port)
-            )
-            self._last_sent_lin = float(lin_x)
-            self._last_sent_ang = float(ang_z)
+            self._frames.close()
         except Exception as exc:
-            log("inference", f"motion sendto error: {exc}")
-
-    def _safe_stop(self) -> None:
-        log("inference", "stopping — zeroing and closing UDP socket")
-        if self._send:
-            for _ in range(3):
-                self._send_motion_ai(0.0, 0.0, locked=False, braking=False)
-                time.sleep(0.05)
-        if self._motion_sock is not None:
-            try: self._motion_sock.close()
-            except Exception: pass
-            self._motion_sock = None
-
-        if self._cameras is not None:
-            try: self._cameras.stop_all()
-            except Exception: pass
-
-        if self._frame_bus_reader is not None:
-            try: self._frame_bus_reader.close()
-            except Exception: pass
-
-        try: self._gps.stop()
-        except Exception: pass
-
+            log("inference", f"camera close error: {exc}")
+        if self._gps is not None:
+            try:
+                self._gps.stop()
+            except Exception:
+                pass
         log("inference", "shutdown complete")
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#  CLI
+# ════════════════════════════════════════════════════════════════════════════
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description=__doc__,
+        description="Deploy the trained ACT policy on the REVO Scout AGV.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--policy-path",     required=True,
-                    help="Pretrained checkpoint directory.")
+
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--policy-path", default=None,
+                     help="Local pretrained checkpoint directory.")
+    src.add_argument("--policy-id", default=None,
+                     help="HuggingFace repo id to download the policy from "
+                          "(e.g. 'Aadi/act_scout_dataset_03').")
+    ap.add_argument("--policy-revision", default=None,
+                    help="Optional git revision/branch/tag for --policy-id.")
     ap.add_argument("--dataset-repo-id", required=True,
                     help="HF dataset repo-id (features + normalization stats).")
-    ap.add_argument("--device",          default="cuda")
-    ap.add_argument("--send",            action="store_true",
-                    help="Send commands to the robot. Without this flag the "
-                         "script prints predictions only — no robot movement.")
-    ap.add_argument("--ang-deadband",    type=float, default=0.0,
-                    help="Zero ang_z below this magnitude (in scaled space, "
-                         "same units as policy output). Recommended: 0.10–0.15.")
-    ap.add_argument("--duration", type=float, default=None,
-                    help="Stop after this many seconds. Default: run until Ctrl+C.")
+    ap.add_argument("--device", default="cuda")
+
+    ap.add_argument("--send", action="store_true",
+                    help="Stream commands to teleop as origin=ai. The operator "
+                         "still has to enable AI on the gamepad or browser "
+                         "before the robot will act on them.")
+    ap.add_argument("--fps", type=float, default=None,
+                    help="Policy tick rate (default: cfg.record_fps).")
+    ap.add_argument("--send-hz", type=float, default=DEFAULT_SEND_HZ,
+                    help=f"UDP transmit rate, independent of the policy rate "
+                         f"(default: {DEFAULT_SEND_HZ:.0f}).")
+    ap.add_argument("--action-ttl", type=float, default=DEFAULT_ACTION_TTL,
+                    help=f"Stop repeating an action older than this and send "
+                         f"zeros instead (default: {DEFAULT_ACTION_TTL}s).")
+    ap.add_argument("--udp-host", default="127.0.0.1",
+                    help="teleop motion listener host (default: 127.0.0.1).")
+    ap.add_argument("--udp-port", type=int, default=None,
+                    help=f"teleop's AI-only motion listener port (default: "
+                         f"cfg.udp_ai_motion_port, else {DEFAULT_AI_UDP_PORT}). "
+                         f"This is NOT the human port — do not point it at 55999.")
+
+    ap.add_argument("--gps-udp-port", type=int, default=DEFAULT_GPS_UDP_PORT,
+                    help=f"Second gps_mux fan-out port (default: "
+                         f"{DEFAULT_GPS_UDP_PORT}). Must NOT be the port teleop "
+                         f"binds.")
+    ap.add_argument("--no-gps", action="store_true",
+                    help="Skip GPS entirely and feed 0.0 for lat/lon/orientation.")
+
+    ap.add_argument("--ang-deadband", type=float, default=0.0,
+                    help="Zero ang_z below this magnitude, in the policy's own "
+                         "output units. Recommended: 0.10–0.15.")
+    ap.add_argument("--unscale-ang", action="store_true",
+                    help="Divide the policy's ang_z by cfg.ang_z_scale before "
+                         "sending. Use when the dataset stored ang_z from "
+                         "motion.published_state() (already scaled).")
     ap.add_argument("--temporal-ensemble-coeff", type=float, default=None,
-                    help="Enable temporal ensembling (e.g. 0.01). "
-                         "Reduces single-frame false turns.")
+                    help="Enable temporal ensembling (e.g. 0.01). Reduces "
+                         "single-frame false turns.")
+    ap.add_argument("--duration", type=float, default=None,
+                    help="Stop after this many seconds (default: until Ctrl+C).")
+    ap.add_argument("--action-bins-path", default=None,
+                    help="Override for the policy config's action_bins .pt file.")
     return ap.parse_args()
+
+
+def resolve_policy_path(args: argparse.Namespace) -> str:
+    """Return a local checkpoint dir, downloading from HF if needed."""
+    if args.policy_path:
+        return args.policy_path
+    from huggingface_hub import snapshot_download
+    log("inference",
+        f"downloading policy from HF: {args.policy_id}"
+        + (f" @ {args.policy_revision}" if args.policy_revision else ""))
+    local_dir = snapshot_download(
+        repo_id=args.policy_id,
+        revision=args.policy_revision,
+    )
+    log("inference", f"policy downloaded to: {local_dir}")
+    return local_dir
 
 
 def main() -> int:
@@ -743,49 +1089,73 @@ def main() -> int:
     init_logging()
 
     cfg = LabConfig.load_secrets()
+    policy_path = resolve_policy_path(args)
+
+    udp_port = args.udp_port or getattr(cfg, "udp_ai_motion_port",
+                                        DEFAULT_AI_UDP_PORT)
+    fps = args.fps or getattr(cfg, "record_fps", 15)
+
+    if int(udp_port) == int(getattr(cfg, "udp_motion_port", 55999)):
+        print(f"\n  REFUSING TO START: --udp-port {udp_port} is the HUMAN motion "
+              f"port.\n  Sending AI commands there makes them indistinguishable "
+              f"from operator\n  input and bypasses the AI enable gate entirely. "
+              f"Use {DEFAULT_AI_UDP_PORT}.\n")
+        return 2
 
     print()
-    print("═" * 60)
+    print("═" * 66)
     print("  LAB INFERENCE")
-    print("═" * 60)
-    print(f"  policy          : {args.policy_path}")
+    print("═" * 66)
+    print(f"  policy source   : {args.policy_id or args.policy_path}")
+    print(f"  policy path     : {policy_path}")
     print(f"  dataset         : {args.dataset_repo_id}")
     print(f"  device          : {args.device}")
-    print(f"  --send          : {args.send}  ← {'ROBOT WILL MOVE' if args.send else 'dry run, no movement'}")
+    print(f"  --send          : {args.send}  ← "
+          f"{'streaming origin=ai' if args.send else 'dry run, no UDP'}")
+    print(f"  motion target   : udp://{args.udp_host}:{udp_port}  (AI-only port)")
+    print(f"  policy rate     : {fps} Hz     tx rate: {args.send_hz:.0f} Hz")
+    print(f"  action ttl      : {args.action_ttl}s")
     print(f"  ang_deadband    : {args.ang_deadband}")
+    print(f"  unscale_ang     : {args.unscale_ang}  (ang_z_scale={cfg.ang_z_scale})")
     print(f"  temporal_coeff  : {args.temporal_ensemble_coeff}")
-    print(f"  duration        : {args.duration if args.duration else 'unlimited (Ctrl+C to stop)'}")
-    print(f"  ang_z_scale     : {cfg.ang_z_scale}  (internal to MotionController)")
-    print(f"  camera          : {cfg.record_camera_name}")
-    print(f"  frame shape     : ({cfg.record_height}, {cfg.record_width}, 3)")
-    print(f"  GPS UDP         : {cfg.gps_udp_host}:{cfg.gps_udp_port}")
-    print()
-    print("  Column guide:")
-    print("  frame  timestamp  frame_mean  obs_lin  obs_ang  lin_x  ang_z_pred(DB)  ang_z_cmd  →robot")
-    print("  ─────────────────────────────────────────────────────────────────────────────")
-    print("  ang_z_pred = policy output (RAW — old dataset)")
-    print("  DB         = deadbanded to zero")
-    print("  ang_z_cmd  = ang_z_pred (passed directly to motion.command())")
-    print("             motion.command() × 0.20 → /cmd_vel receives ang_z_pred × 0.20 ✓")
-    print("═" * 60)
+    print(f"  duration        : {args.duration if args.duration else 'unlimited (Ctrl+C)'}")
+    print(f"  action_bins     : {args.action_bins_path or '(auto — from checkpoint dir)'}")
+    print(f"  camera          : {cfg.record_camera_name} "
+          f"({cfg.record_height}x{cfg.record_width})")
+    print(f"  GPS             : "
+          f"{'disabled' if args.no_gps else f'{cfg.gps_udp_host}:{args.gps_udp_port}'}")
+    print("─" * 66)
+    print("  The robot only moves when teleop is running AND the operator has")
+    print("  enabled AI AND the human handback window has closed. Any brake or")
+    print("  stick input takes control straight back.")
+    print("═" * 66)
     print()
 
     inf = LabInference(
-        policy_path             = args.policy_path,
-        dataset_repo_id         = args.dataset_repo_id,
-        device                  = args.device,
-        cfg                     = cfg,
-        send                    = args.send,
-        ang_deadband            = args.ang_deadband,
-        temporal_ensemble_coeff = args.temporal_ensemble_coeff,
-        duration_s              = args.duration,
+        policy_path=policy_path,
+        dataset_repo_id=args.dataset_repo_id,
+        device=args.device,
+        cfg=cfg,
+        send=args.send,
+        fps=args.fps,
+        send_hz=args.send_hz,
+        action_ttl=args.action_ttl,
+        udp_host=args.udp_host,
+        udp_port=args.udp_port,
+        gps_udp_port=args.gps_udp_port,
+        ang_deadband=args.ang_deadband,
+        unscale_ang=args.unscale_ang,
+        temporal_ensemble_coeff=args.temporal_ensemble_coeff,
+        duration_s=args.duration,
+        action_bins_path=args.action_bins_path,
+        no_gps=args.no_gps,
     )
 
-    def _on_signal(sig, frame):
+    def _on_signal(_sig, _frm):
         print("\n[inference] interrupt — stopping")
         inf.stop()
 
-    signal.signal(signal.SIGINT,  _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
     inf.run()

@@ -748,6 +748,7 @@ class BridgeServer:
         WS_LOG.info("→ browser: %s", message)
 
     async def _broadcast(self, payload: dict[str, Any]) -> None:
+        """Send to all browsers. Safe to await; prefer _broadcast_nowait from poll_loop."""
         if not self.clients:
             return
         message = json.dumps(payload)
@@ -755,11 +756,20 @@ class BridgeServer:
         if msg_type == "gamepad":
             WS_LOG.info("→ browser: %s", message)
         elif msg_type == "state":
-            WS_LOG.info("→ browser: %s", _format_ws_state(payload))
+            # DEBUG: state can fire every stick tick; INFO logging starved the UDP loop.
+            WS_LOG.debug("→ browser: %s", _format_ws_state(payload))
         await asyncio.gather(
             *[client.send(message) for client in list(self.clients)],
             return_exceptions=True,
         )
+
+    def _broadcast_nowait(self, payload: dict[str, Any]) -> None:
+        """Schedule a WebSocket broadcast without blocking the gamepad/UDP loops."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._broadcast(payload))
 
     def _send_udp(self, payload: dict[str, Any]) -> None:
         dest = self.session.tailscale_ip
@@ -785,6 +795,8 @@ class BridgeServer:
         )
 
     async def poll_loop(self) -> None:
+        """Poll gamepad ~60 Hz. WebSocket sends are fire-and-forget so they cannot stall UDP."""
+        next_t = time.monotonic()
         while True:
             gamepad_event, state_event = self.reader.poll()
             if gamepad_event is not None:
@@ -796,18 +808,27 @@ class BridgeServer:
                         "buttons": empty_buttons(),
                         "axes": empty_axes(),
                     }
-                    await self._broadcast(cleared)
+                    self._broadcast_nowait(cleared)
                 elif gamepad_event.get("connected") is True:
                     self._on_gamepad_reconnected()
-                await self._broadcast(gamepad_event)
+                self._broadcast_nowait(gamepad_event)
             if state_event is not None:
-                await self._broadcast(state_event)
-            await asyncio.sleep(POLL_INTERVAL)
+                self._broadcast_nowait(state_event)
+            next_t += POLL_INTERVAL
+            delay = next_t - time.monotonic()
+            if delay < -POLL_INTERVAL:
+                # Fell far behind (system sleep / heavy stall) — resync clock.
+                next_t = time.monotonic()
+                delay = 0.0
+            if delay > 0:
+                await asyncio.sleep(delay)
 
     async def udp_loop(self) -> None:
+        """Send teleop UDP on a wall-clock 50 Hz schedule (not soft sleep-then-send)."""
         if not self.udp_enabled:
             LOG.info("UDP teleop half disabled (--no-udp)")
             return
+        next_t = time.monotonic()
         while True:
             if (
                 self.session.lock == 0
@@ -821,7 +842,14 @@ class BridgeServer:
                 self._send_udp(payload)
                 self.udp_seq += 1
                 self._maybe_log_udp()
-            await asyncio.sleep(UDP_INTERVAL)
+            next_t += UDP_INTERVAL
+            delay = next_t - time.monotonic()
+            if delay < -UDP_INTERVAL:
+                # Fell far behind — skip missed slots and resync to now.
+                next_t = time.monotonic()
+                delay = 0.0
+            if delay > 0:
+                await asyncio.sleep(delay)
 
     async def run(self) -> None:
         # compression=None disables permessage-deflate. Some browser + proxy
