@@ -119,7 +119,7 @@ class LabConfig:
     # direct offset in /cmd_vel space (rad/s). Never applied while braked,
     # locked, watchdog-zeroed or lidar-gated, and never recorded into the
     # dataset — SessionRecorder stores the raw, unscaled, uncorrected command.
-    ang_z_drift_correction: float = -0.25
+    ang_z_drift_correction: float = -0.0
     brake_threshold:        float = 0.20
     # Auto-disable AI when no packet has arrived on udp_ai_motion_port for
     # this long. Measured from the later of "AI switched on" and "last AI
