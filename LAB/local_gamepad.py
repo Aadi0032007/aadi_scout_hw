@@ -67,7 +67,7 @@ SEND_HZ = 50
 AXIS_ACTION_THRESHOLD_COUNTS = 30000
 
 AXIS4_NEG_MESSAGE           = "Hellow how are you today?"
-AXIS4_POS_MESSAGE           = "please let me go!"
+AXIS4_POS_MESSAGE           = "Touch Down!"
 TALK_DURATION_SEC           = 7.0
 AXIS4_MULTI_TAP_WINDOW_SEC  = 1.0
 MUSIC_TRACK_ID              = 1
