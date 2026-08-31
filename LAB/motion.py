@@ -27,6 +27,16 @@ Changes vs previous version:
       AI is enabled, so a just-started inference process is not cut off.
         motion.ai_stale_timeout()      -> float
         cfg.motion_ai_stale_sec        initial value
+    - NEW: TX debug print. With debug_cmd=True the publisher logs every
+      (lin_x, ang_z) pair just before it goes out on the UDP socket, together
+      with WHERE it came from (HUMAN or AI), whether the AI gate is open, the
+      raw pre-scale ang_z, and which gate zeroed the output if any:
+          [motion] TX lin_x=+0.35 ang_z=-0.077 (raw_ang=-0.35) src=HUMAN ai=off gate=none
+      One line per publish tick, unconditionally — every packet that leaves
+      is printed, so the log is a complete record of what the robot got.
+      At publish_hz=50 that is 50 lines/s.
+        cfg.motion_debug_cmd           initial value
+
     - Runtime toggle for the lidar safety brake, driven by WS bubble_mode:
         motion.set_lidar_block_enabled(bool)   # runtime on/off
         motion.lidar_block_enabled() -> bool
@@ -62,6 +72,8 @@ Public API (back-compatible):
     published_state_raw() -> (lin_x, ang_z)        # NEW — raw, uncorrected
     set_lidar_block_enabled(on: bool)
     lidar_block_enabled() -> bool
+    set_debug_cmd(on: bool)                        # NEW — runtime TX printing
+    debug_cmd() -> bool                            # NEW
 """
 
 import json
@@ -90,6 +102,8 @@ class MotionController:
         human_stale_timeout: float = 2.0,
         # ── AI stream watchdog ───────────────────────────────────────────
         ai_stale_timeout:    float = 1.0,
+        # ── TX debug print ───────────────────────────────────────────────
+        debug_cmd:           bool  = False,
     ) -> None:
         self._docker_host    = docker_host
         self._docker_port    = docker_port
@@ -138,6 +152,12 @@ class MotionController:
         # HUMAN/AI handover logging — None until the first decision is made.
         self._last_human_in_control: Optional[bool] = None
 
+        # ── TX debug print state (publisher thread only) ──────────────────
+        self._debug_cmd      = bool(debug_cmd)
+        self._dbg_src        = "HUMAN"   # who _compute_output selected
+        self._dbg_ai_on      = False     # AI gate state at that tick
+        self._dbg_gate       = "none"    # what zeroed the output, if anything
+
         # UDP transport
         self._sock: Optional[socket.socket] = None
         self._stop = threading.Event()
@@ -160,7 +180,8 @@ class MotionController:
                 f"handback={self._human_handback_sec}s, idle_db={self._human_idle_db}, "
                 f"human_stale={self._human_stale_timeout}s, "
                 f"ai_stale={self._ai_stale_timeout}s, "
-                f"lidar_gate={self._lidar_block_enabled})"
+                f"lidar_gate={self._lidar_block_enabled}, "
+                f"tx_debug={'on' if self._debug_cmd else 'off'})"
             )
         except Exception as exc:
             log("motion", f"start failed: {exc}")
@@ -290,6 +311,16 @@ class MotionController:
         with self._lock:
             return self._lidar_block_enabled
 
+    def set_debug_cmd(self, on: bool) -> None:
+        """Runtime on/off for the TX debug print (see _log_tx)."""
+        prev = self._debug_cmd
+        self._debug_cmd = bool(on)
+        if prev != self._debug_cmd:
+            log("motion", f"debug_cmd -> {self._debug_cmd}")
+
+    def debug_cmd(self) -> bool:
+        return self._debug_cmd
+
     def human_in_control(self) -> bool:
         with self._lock:
             return (time.monotonic() < self._human_active_until) or (not self._ai_enabled)
@@ -338,6 +369,7 @@ class MotionController:
         interval = 1.0 / self._publish_hz
         while not self._stop.is_set():
             lin, ang, ang_raw = self._compute_output()
+            self._log_tx(lin, ang, ang_raw)
             self._send_twist(lin, ang)
             with self._lock:
                 self._last_pub_lin     = lin
@@ -429,21 +461,45 @@ class MotionController:
 
             lidar_gate_on = self._lidar_block_enabled
 
+            # Snapshot for the TX debug print — who won the arbitration on
+            # this tick, and whether the AI gate was even open.
+            self._dbg_src   = "HUMAN" if human_in_control else "AI"
+            self._dbg_ai_on = ai_enabled
+
         # Every gated path below returns a hard zero, drift correction
         # included — a braked, locked or watchdog-silenced robot must sit
         # still, not yaw at the bias rate.
         if not watchdog_ok or locked or braking:
+            self._dbg_gate = ("watchdog" if not watchdog_ok
+                              else "lock" if locked else "brake")
             return 0.0, 0.0, 0.0
 
         # Lidar safety gate — runtime-togglable via set_lidar_block_enabled.
         if self._lidar_block_fn is not None and lidar_gate_on:
             try:
                 if self._lidar_block_fn(lin_x, ang_raw):
+                    self._dbg_gate = "lidar"
                     return 0.0, 0.0, 0.0
             except Exception as exc:
                 log("motion", f"lidar_block_fn error: {exc}")
 
+        self._dbg_gate = "none"
         return lin_x, ang_z, ang_raw
+
+    def _log_tx(self, lin: float, ang: float, ang_raw: float) -> None:
+        """Print exactly what is about to hit the wire, and where it came from.
+
+        Called from the publisher thread only, so the _dbg_* fields written by
+        _compute_output on the same tick need no lock. One line per packet,
+        no rate limit and no de-duplication: the log is a complete record of
+        what the robot was sent, idle ticks included.
+        """
+        if not self._debug_cmd:
+            return
+        log("motion",
+            f"TX lin_x={lin:+.3f} ang_z={ang:+.4f} (raw_ang={ang_raw:+.3f}) "
+            f"src={self._dbg_src} ai={'on' if self._dbg_ai_on else 'off'} "
+            f"gate={self._dbg_gate}")
 
     def _send_twist(self, lin: float, ang: float) -> None:
         if self._sock is None:

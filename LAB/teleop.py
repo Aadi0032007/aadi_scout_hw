@@ -918,6 +918,7 @@ def main() -> None:
         lidar_block_fn=lidar_block_fn,
         lidar_block_enabled=cfg.lidar_safety_brake,
         ai_stale_timeout=cfg.motion_ai_stale_sec,
+        debug_cmd=getattr(cfg, "motion_debug_cmd", False),
     )
     motion.start()
 

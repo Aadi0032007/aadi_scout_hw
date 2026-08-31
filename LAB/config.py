@@ -125,6 +125,10 @@ class LabConfig:
     # this long. Measured from the later of "AI switched on" and "last AI
     # packet", so a just-launched lab_inference is not cut off mid-startup.
     motion_ai_stale_sec:    float = 1.0
+    # Print every (lin_x, ang_z) pair just before it is sent to the robot,
+    # with its source (HUMAN/AI) and the gate that zeroed it, if any. One
+    # line per publish tick — at motion_publish_hz=50 that is 50 lines/s.
+    motion_debug_cmd:       bool  = True
 
     # ── PTZ ──────────────────────────────────────────────────────────────────
     ptz_ip:                 str   = "192.168.10.50"
@@ -289,7 +293,7 @@ class LabConfig:
     # drivetrain refuses forward motion whenever anything is inside it, and
     # because scans go stale between polls the block flickers — which reads
     # as the robot braking itself at random. See lidar_stale_after_sec.
-    lidar_bubble_front_m:   float = 3.10
+    lidar_bubble_front_m:   float = 1.0
     lidar_bubble_left_m:    float = 0.10
     lidar_bubble_right_m:   float = 0.10
     lidar_stale_after_sec:  float = 2.0
