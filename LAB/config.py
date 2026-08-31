@@ -266,7 +266,7 @@ class LabConfig:
     rtt_stale_after_sec:     float = 30.0
 
     # ── Lidar ────────────────────────────────────────────────────────────────
-    lidar_enabled:          bool  = False
+    lidar_enabled:          bool  = True
     lidar_symlink:          str   = "/dev/rplidar_s2"
     lidar_usb_serial:       str   = "4afc166e056ff011aec34b9b1045c30f"
     lidar_port:             str   = ""
