@@ -44,7 +44,9 @@ Arbitration (unchanged):
     - AI honored only if set_ai_enabled(True) AND handback closed.
     - Human brake hard-latches AI off.
     - Human always authoritative for lock and brake.
-    - Watchdog + lidar_block_fn apply to the selected source.
+    - Watchdog + lidar_block_fn apply to the selected source. It is called as
+      lidar_block_fn(lin_x, ang_raw): front bubble gates forward, left/right
+      bubbles gate turns.
     - Lidar gate now respects _lidar_block_enabled (see set_lidar_block_enabled).
 
 Public API (back-compatible):
@@ -80,7 +82,7 @@ class MotionController:
         watchdog_sec:        float = 0.30,
         ang_z_scale:         float = 0.20,
         ang_z_drift_correction: float = 0.0,
-        lidar_block_fn:      Optional[Callable[[float], bool]] = None,
+        lidar_block_fn:      Optional[Callable[[float, float], bool]] = None,
         lidar_block_enabled: bool  = True,
         # ── human-priority arbiter knobs ─────────────────────────────────
         human_handback_sec:  float = 2.0,
@@ -436,7 +438,7 @@ class MotionController:
         # Lidar safety gate — runtime-togglable via set_lidar_block_enabled.
         if self._lidar_block_fn is not None and lidar_gate_on:
             try:
-                if self._lidar_block_fn(lin_x):
+                if self._lidar_block_fn(lin_x, ang_raw):
                     return 0.0, 0.0, 0.0
             except Exception as exc:
                 log("motion", f"lidar_block_fn error: {exc}")

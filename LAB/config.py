@@ -273,15 +273,18 @@ class LabConfig:
     lidar_baud:             int   = 1_000_000
     lidar_poll_hz:          float = 2.0
     lidar_scan_timeout_sec: float = 3.0
+    # Sample window per update. ~0.8 s is several revolutions at ~10 Hz;
+    # the reader holds one SCAN session open and reads windows off it.
+    lidar_sample_sec:       float = 0.8
     lidar_range_min_m:      float = 0.05
     lidar_range_max_m:      float = 18.0
     lidar_min_quality:      int   = 0
-    lidar_front_min_deg:    float = -10.0
-    lidar_front_max_deg:    float = 10.0
-    lidar_left_min_deg:     float = 45.0
-    lidar_left_max_deg:     float = 135.0
-    lidar_right_min_deg:    float = -135.0
-    lidar_right_max_deg:    float = -45.0
+    lidar_front_min_deg:    float = -30.0
+    lidar_front_max_deg:    float = 30.0
+    lidar_left_min_deg:     float = 60.0
+    lidar_left_max_deg:     float = 120.0
+    lidar_right_min_deg:    float = -120.0
+    lidar_right_max_deg:    float = -60.0
     # NOTE: 3.10 m is a very large forward bubble. With bubble_mode ON the
     # drivetrain refuses forward motion whenever anything is inside it, and
     # because scans go stale between polls the block flickers — which reads

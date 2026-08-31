@@ -875,6 +875,7 @@ def main() -> None:
                 baud=cfg.lidar_baud,
                 poll_hz=cfg.lidar_poll_hz,
                 scan_timeout_sec=cfg.lidar_scan_timeout_sec,
+                sample_sec=cfg.lidar_sample_sec,
                 range_min=cfg.lidar_range_min_m,
                 range_max=cfg.lidar_range_max_m,
                 min_quality=cfg.lidar_min_quality,
@@ -897,12 +898,14 @@ def main() -> None:
     # Lidar block fn is ALWAYS wired if lidar exists. Runtime on/off is via
     # motion.set_lidar_block_enabled() driven by WS bubble_mode. The initial
     # state comes from cfg.lidar_safety_brake.
-    lidar_block_fn = lidar.is_blocked_forward if lidar is not None else None
+    lidar_block_fn = lidar.is_blocked_cmd if lidar is not None else None
     if lidar_block_fn is not None:
         log("teleop",
-            f"lidar forward-brake gate wired "
+            f"lidar directional brake gate wired "
             f"(initial={'ON' if cfg.lidar_safety_brake else 'OFF'}, "
-            f"front bubble={cfg.lidar_bubble_front_m:.2f} m)")
+            f"front={cfg.lidar_bubble_front_m:.2f} m "
+            f"left={cfg.lidar_bubble_left_m:.2f} m "
+            f"right={cfg.lidar_bubble_right_m:.2f} m)")
 
     # ── Motion ──────────────────────────────────────────────────────────────
     motion = MotionController(

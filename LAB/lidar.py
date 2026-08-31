@@ -8,9 +8,13 @@ latest-snapshot dict. Consumers call get() to retrieve sector distances and
 a "blocked" flag derived from configurable bubble thresholds.
 
 Protocol portions adapted from util_lidar_driver.py (Slamtec UART SCAN mode
-at 1 Mbps). The standalone-script scaffolding (env file, argparse, main loop,
-print_status) is intentionally not included here — those concerns now live in
-config.py and teleop.py.
+at 1 Mbps). The sampling loop follows util_lidar_values.py: start_scan() ONCE,
+then repeated read_points_for() windows over a live stream — re-issuing the
+stop/reset/SCAN handshake every poll never lets the motor reach steady RPM.
+
+The standalone-script scaffolding (env file, argparse, main loop, print_status)
+is intentionally not included here — those concerns now live in config.py and
+teleop.py.
 """
 
 from __future__ import annotations
@@ -151,6 +155,7 @@ class _RPLidarS2:
 
     def __init__(self, port: str, baudrate: int, timeout: float = 1.0) -> None:
         self.port = port
+        self.baudrate = baudrate
         self._serial = serial.Serial(
             port=port,
             baudrate=baudrate,
@@ -159,13 +164,56 @@ class _RPLidarS2:
             bytesize=serial.EIGHTBITS,
             timeout=timeout,
         )
-
-    def close(self) -> None:
+        # Prefer short read timeouts so streaming loops can poll the deadline.
         try:
-            if self._serial.is_open:
-                self._serial.close()
+            self._serial.timeout = min(float(timeout), 0.05)
         except Exception:
             pass
+
+    def close(self) -> None:
+        """Stop scanning/motor and close the port without restarting the motor.
+
+        RPLIDAR USB adapters run the motor when DTR is low. Closing the serial
+        port normally deasserts DTR (HUPCL), which starts the motor again.
+        We clear HUPCL and leave DTR asserted so the motor stays off after exit.
+        """
+        if not self._serial.is_open:
+            return
+        try:
+            self.stop()
+        except Exception:
+            pass
+        try:
+            self.stop_motor()
+            time.sleep(0.05)
+        except Exception:
+            pass
+        try:
+            self._leave_dtr_asserted_on_close()
+        except Exception:
+            pass
+        try:
+            self._serial.close()
+        except Exception:
+            pass
+
+    def _leave_dtr_asserted_on_close(self) -> None:
+        """Prevent Linux from dropping DTR when the last fd is closed."""
+        try:
+            import termios
+        except ImportError:
+            return
+        fd = self._serial.fileno()
+        attrs = termios.tcgetattr(fd)
+        # attrs: [iflag, oflag, cflag, lflag, ispeed, ospeed, cc]
+        attrs[2] &= ~termios.HUPCL
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        # Motor off = DTR asserted (high) on Slamtec USB adapters.
+        self._serial.dtr = True
+
+    def shutdown(self) -> None:
+        """Stop scan + motor and close (safe to call from finally blocks)."""
+        self.close()
 
     def _send_command(self, cmd: int) -> None:
         self._serial.write(bytes([_SYNC_BYTE, cmd, cmd]))  # checksum = cmd ^ 0
@@ -190,7 +238,8 @@ class _RPLidarS2:
             raise LidarError(f"Bad measurement length: {len(raw)}")
         new_scan = bool(raw[0] & 0x01)
         inv_new_scan = bool((raw[0] >> 1) & 0x01)
-        if new_scan != inv_new_scan:
+        # Slamtec: S and /S must be complements. Same bits => invalid sample.
+        if new_scan == inv_new_scan:
             raise LidarError("New scan flag mismatch")
         quality = raw[0] >> 2
         angle_deg = ((raw[1] >> 1) | (raw[2] << 7)) / 64.0
@@ -210,12 +259,8 @@ class _RPLidarS2:
                 del raw_buf[0]
         return None
 
-    def collect_scan(
-        self,
-        timeout_sec: float,
-        stop_event: threading.Event,
-        max_points: int = 8000,
-    ) -> List[ScanPoint]:
+    def start_scan(self) -> None:
+        """Enter SCAN mode once and spin the motor (keep streaming)."""
         self.stop()
         time.sleep(0.1)
         self.reset()
@@ -230,40 +275,66 @@ class _RPLidarS2:
         except Exception:
             pass
         self.start_motor()
-        time.sleep(0.3)
+        time.sleep(0.5)
 
-        deadline = time.monotonic() + timeout_sec
+    def read_points_for(
+        self,
+        duration_sec: float,
+        *,
+        raw_buf: Optional[bytearray] = None,
+        max_points: int = 50000,
+        stop_event: Optional[threading.Event] = None,
+    ) -> List[ScanPoint]:
+        """Read all valid samples for duration_sec (no new_scan gating).
+
+        Prefer this for stable sector stats: ~0.5-1.0 s is several full
+        revolutions at ~10 Hz. raw_buf is owned by the caller and carries
+        partial measurements across calls — the byte stream is continuous, so
+        dropping it between windows would resync for nothing.
+
+        stop_event is a local addition (the driver script has no equivalent):
+        this runs on a daemon thread, and without it teleop shutdown stalls
+        for up to a full sample window.
+        """
+        if raw_buf is None:
+            raw_buf = bytearray()
+        deadline = time.monotonic() + max(0.05, float(duration_sec))
         points: List[ScanPoint] = []
-        saw_new_scan = False
-        rotation_done = False
-        raw_buf = bytearray()
-
         while time.monotonic() < deadline and len(points) < max_points:
-            if stop_event.is_set():
+            if stop_event is not None and stop_event.is_set():
                 break
-            raw_buf.extend(self._serial.read(256))
-            chunk = self._find_next_measurement(raw_buf)
-            if chunk is None:
-                continue
-            del raw_buf[:_MEASUREMENT_LEN]
-            new_scan, quality, angle_deg, distance_m = self._parse_measurement(chunk)
-            if new_scan:
-                if saw_new_scan:
-                    rotation_done = True
+            # Pull more bytes only when we don't already have a full sample.
+            if len(raw_buf) < _MEASUREMENT_LEN:
+                chunk_in = self._serial.read(512)
+                if chunk_in:
+                    raw_buf.extend(chunk_in)
+                elif not raw_buf:
+                    continue
+            # Drain every complete/valid measurement currently buffered.
+            drained = False
+            while len(points) < max_points:
+                chunk = self._find_next_measurement(raw_buf)
+                if chunk is None:
                     break
-                saw_new_scan = True
-            points.append(ScanPoint(
-                angle_deg=_normalize_angle_deg(angle_deg),
-                distance_m=distance_m,
-                quality=quality,
-            ))
-            if rotation_done:
-                break
-
+                drained = True
+                del raw_buf[:_MEASUREMENT_LEN]
+                _new_scan, quality, angle_deg, distance_m = self._parse_measurement(
+                    chunk
+                )
+                points.append(
+                    ScanPoint(
+                        angle_deg=_normalize_angle_deg(angle_deg),
+                        distance_m=distance_m,
+                        quality=quality,
+                    )
+                )
+            if not drained and time.monotonic() < deadline:
+                # No aligned sample yet — pull more bytes.
+                chunk_in = self._serial.read(512)
+                if chunk_in:
+                    raw_buf.extend(chunk_in)
         if not points:
-            raise LidarError("No scan points received")
-        if not rotation_done and len(points) < 20:
-            raise LidarError("Incomplete scan")
+            raise LidarError("No scan points received (check power, port, baud)")
         return points
 
 
@@ -281,15 +352,16 @@ class LidarReader:
         baud: int = 1_000_000,
         poll_hz: float = 2.0,
         scan_timeout_sec: float = 3.0,
+        sample_sec: float = 0.8,
         range_min: float = 0.05,
         range_max: float = 18.0,
         min_quality: int = 0,
-        front_min_deg: float = -45.0,
-        front_max_deg: float = 45.0,
-        left_min_deg: float = 45.0,
-        left_max_deg: float = 135.0,
-        right_min_deg: float = -135.0,
-        right_max_deg: float = -45.0,
+        front_min_deg: float = -30.0,
+        front_max_deg: float = 30.0,
+        left_min_deg: float = 60.0,
+        left_max_deg: float = 120.0,
+        right_min_deg: float = -120.0,
+        right_max_deg: float = -60.0,
         bubble_front_m: float = 0.10,
         bubble_left_m: float = 0.10,
         bubble_right_m: float = 0.10,
@@ -300,7 +372,10 @@ class LidarReader:
         self._usb_serial = usb_serial
         self._baud = baud
         self._poll_interval = 1.0 / poll_hz if poll_hz > 0 else 0.5
+        # Retained for API compatibility. The streaming loop paces on
+        # sample_sec + poll_interval, so nothing consults this any more.
         self._scan_timeout = scan_timeout_sec
+        self._sample_sec = sample_sec
         self._range_min = range_min
         self._range_max = range_max
         self._min_quality = min_quality
@@ -323,7 +398,10 @@ class LidarReader:
                 self._data["lidar_status"] = "no_serial"
             return
         self._thread.start()
-        log("lidar", f"lidar reader started (baud={self._baud} poll_hz={1.0/self._poll_interval:.1f})")
+        log("lidar",
+            f"lidar reader started (baud={self._baud} "
+            f"poll_hz={1.0/self._poll_interval:.1f} "
+            f"sample={self._sample_sec:.2f}s)")
 
     def get(self) -> dict:
         with self._lock:
@@ -333,25 +411,57 @@ class LidarReader:
             snapshot["lidar_age_sec"] = max(0.0, now_mono() - ts)
         return snapshot
 
-    def is_blocked(self) -> bool:
-        """Any sector inside its bubble + scan is fresh."""
+    def _fresh(self) -> Optional[dict]:
+        """Snapshot if the scan is usable, else None (bad status or stale)."""
         snap = self.get()
         if snap.get("lidar_status") != "ok":
-            return False
+            return None
         if snap.get("lidar_age_sec", 999.0) > self._stale_after:
+            return None
+        return snap
+
+    def is_blocked(self) -> bool:
+        """Any sector inside its bubble + scan is fresh."""
+        snap = self._fresh()
+        if snap is None:
             return False
         return bool(snap.get("lidar_blocked", False))
 
     def is_blocked_forward(self, commanded_lin_x: Optional[float]) -> bool:
-        """Forward-only brake hint: only blocks if commanded forward AND front bubble fires."""
+        """Forward-only brake: blocks if commanded forward AND front bubble fires."""
         if commanded_lin_x is None or commanded_lin_x <= 0.0:
             return False
-        snap = self.get()
-        if snap.get("lidar_status") != "ok":
-            return False
-        if snap.get("lidar_age_sec", 999.0) > self._stale_after:
+        snap = self._fresh()
+        if snap is None:
             return False
         return bool(snap.get("lidar_blocked_front", False))
+
+    def is_blocked_cmd(
+        self,
+        commanded_lin_x: Optional[float],
+        commanded_ang_z: Optional[float] = None,
+    ) -> bool:
+        """Directional brake: front blocks forward, left/right block turns.
+
+        Mirrors print_status() in util_lidar_driver.py (STOP if front OR left
+        OR right is inside its bubble), but only against the sectors the
+        command actually drives into — so a wall on one side cannot freeze
+        the robot in place with no way to drive out of it.
+        """
+        snap = self._fresh()
+        if snap is None:
+            return False
+
+        if (commanded_lin_x is not None and commanded_lin_x > 0.0
+                and snap.get("lidar_blocked_front", False)):
+            return True
+        if commanded_ang_z is not None:
+            # ROS convention: +ang_z is a left (counter-clockwise) turn.
+            if commanded_ang_z > 0.0 and snap.get("lidar_blocked_left", False):
+                return True
+            if commanded_ang_z < 0.0 and snap.get("lidar_blocked_right", False):
+                return True
+        return False
 
     def stop(self) -> None:
         self._stop.set()
@@ -372,7 +482,9 @@ class LidarReader:
             if port is None:
                 with self._lock:
                     self._data["lidar_status"] = "no_port"
-                log("lidar", f"no port found (symlink={self._symlink}, usb_serial={self._usb_serial})")
+                log("lidar",
+                    f"no port found (symlink={self._symlink}, "
+                    f"usb_serial={self._usb_serial})")
                 self._stop.wait(timeout=backoff)
                 backoff = min(backoff * 2, 10.0)
                 continue
@@ -389,13 +501,25 @@ class LidarReader:
 
             log("lidar", f"connected on {port}")
             backoff = 1.0
+            raw_buf = bytearray()
 
             try:
+                driver.start_scan()
+                # Motor needs a moment after DTR spin-up before dense samples
+                # arrive; prime once and throw away whatever lands.
+                self._stop.wait(timeout=1.0)
+                try:
+                    driver.read_points_for(
+                        0.3, raw_buf=raw_buf, stop_event=self._stop)
+                except LidarError:
+                    pass
+
                 while not self._stop.is_set():
                     loop_start = time.monotonic()
                     try:
-                        points = driver.collect_scan(
-                            timeout_sec=self._scan_timeout,
+                        points = driver.read_points_for(
+                            self._sample_sec,
+                            raw_buf=raw_buf,
                             stop_event=self._stop,
                         )
                         self._update_from_scan(points)
@@ -403,10 +527,14 @@ class LidarReader:
                         log("lidar", f"scan error: {exc}")
                         with self._lock:
                             self._data["lidar_status"] = "scan_error"
+                        # Re-enter SCAN on the SAME port rather than dropping
+                        # the connection: the byte stream is what went out of
+                        # sync, not the device.
                         try:
                             driver.stop()
-                            time.sleep(0.5)
-                            driver.reset()
+                            time.sleep(0.3)
+                            driver.start_scan()
+                            raw_buf.clear()
                         except Exception:
                             break
 
@@ -420,11 +548,9 @@ class LidarReader:
                     self._data["lidar_status"] = "error"
             finally:
                 try:
-                    driver.stop()
-                    driver.stop_motor()
+                    driver.shutdown()
                 except Exception:
                     pass
-                driver.close()
 
     def _update_from_scan(self, points: List[ScanPoint]) -> None:
         dists: dict = {}
