@@ -103,7 +103,8 @@ CH_HEADLIGHTS      = 3
 CH_XMAS            = 4      # xwalk-exclusive
 CH_SPEAKER_AMP     = 6      # unlock-gated — audio amp power
 CH_FAN             = 7 
-# channels 5, 8 unused
+CH_DISPLAY         = 5
+CH_8               = 8
 
 # Channels that participate in "lights on" (unlock-auto-on) and talk-blink.
 # Xmas is intentionally excluded — it's xwalk-exclusive.
@@ -117,7 +118,7 @@ XWALK_CHANNELS = (CH_HEADLIGHTS, CH_TAIL_HALO_LEFT, CH_TAIL_HALO_RIGHT, CH_XMAS)
 # Includes the amp so LOCK / stop() / crash cleanup all power the amp down.
 ALL_CHANNELS = (
     CH_HEADLIGHTS, CH_TAIL_HALO_LEFT, CH_TAIL_HALO_RIGHT, CH_XMAS,
-    CH_SPEAKER_AMP,
+    CH_SPEAKER_AMP, CH_DISPLAY, CH_8,
 )
 
 
