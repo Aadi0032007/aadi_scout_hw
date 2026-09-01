@@ -243,8 +243,8 @@ class LightsController:
 
         # Fan stays on through lock and unlock.
         self._ensure_fan_on()
-        self._ensure_display_on()
-        self._ensure_8_on()
+        # self._ensure_display_on()
+        # self._ensure_8_on()
 
     def command(self, envelope: dict) -> None:
         """Dispatch one parsed envelope {seq, t, type, data}."""
