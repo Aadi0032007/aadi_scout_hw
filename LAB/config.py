@@ -128,7 +128,7 @@ class LabConfig:
     # Print every (lin_x, ang_z) pair just before it is sent to the robot,
     # with its source (HUMAN/AI) and the gate that zeroed it, if any. One
     # line per publish tick — at motion_publish_hz=50 that is 50 lines/s.
-    motion_debug_cmd:       bool  = True
+    motion_debug_cmd:       bool  = False
 
     # ── PTZ ──────────────────────────────────────────────────────────────────
     ptz_ip:                 str   = "192.168.10.50"
@@ -168,10 +168,10 @@ class LabConfig:
     ])
 
     # ── Display / touchscreen ───────────────────────────────────────────────
-    display_enabled:          bool = False
+    display_enabled:          bool = True
     display_name:             Optional[str] = None   # e.g. ":0"; auto-detect if None
     display_asset_dir:        str  = str(Path.home() / "Revobots" / "display")
-    display_default_wallpaper: str = "REVOBOTS_LOGO_1.png"
+    display_default_wallpaper: str = "REVOBOTS_LOGO_AC90R.png"
     display_rotate:           int  = 90      # portrait-mounted monitor on landscape framebuffer
     display_fullscreen:       bool = True
     display_fps:              int  = 30
@@ -277,12 +277,14 @@ class LabConfig:
     lidar_baud:             int   = 1_000_000
     lidar_poll_hz:          float = 2.0
     lidar_scan_timeout_sec: float = 3.0
+    # auto | legacy | express | hq — auto uses S2 typical DenseBoost express
+    lidar_scan_mode:      str   = "legacy"
     # Sample window per update. ~0.8 s is several revolutions at ~10 Hz;
     # the reader holds one SCAN session open and reads windows off it.
     lidar_sample_sec:       float = 0.8
-    lidar_range_min_m:      float = 0.05
+    lidar_range_min_m:      float = 0.75
     lidar_range_max_m:      float = 18.0
-    lidar_min_quality:      int   = 0
+    lidar_min_quality:      int   = 10
     lidar_front_min_deg:    float = -30.0
     lidar_front_max_deg:    float = 30.0
     lidar_left_min_deg:     float = 60.0
@@ -297,6 +299,8 @@ class LabConfig:
     lidar_bubble_left_m:    float = 0.10
     lidar_bubble_right_m:   float = 0.10
     lidar_stale_after_sec:  float = 2.0
+    # Consecutive blocked lidar polls before bubble brake engages (release on 1st clear).
+    lidar_block_confirm_polls: int = 2
     # Initial value of the lidar safety brake. Runtime-togglable by the
     # browser via WS bubble_mode → motion.set_lidar_block_enabled().
     lidar_safety_brake:     bool  = False

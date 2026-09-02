@@ -875,6 +875,7 @@ def main() -> None:
                 baud=cfg.lidar_baud,
                 poll_hz=cfg.lidar_poll_hz,
                 scan_timeout_sec=cfg.lidar_scan_timeout_sec,
+                scan_mode=cfg.lidar_scan_mode,
                 sample_sec=cfg.lidar_sample_sec,
                 range_min=cfg.lidar_range_min_m,
                 range_max=cfg.lidar_range_max_m,
@@ -889,6 +890,7 @@ def main() -> None:
                 bubble_left_m=cfg.lidar_bubble_left_m,
                 bubble_right_m=cfg.lidar_bubble_right_m,
                 stale_after_sec=cfg.lidar_stale_after_sec,
+                block_confirm_polls=cfg.lidar_block_confirm_polls,
             )
             lidar.start()
         except Exception as exc:

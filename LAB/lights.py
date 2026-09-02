@@ -18,10 +18,10 @@ silent as well as dark.
     channel 2  →  left  taillight + left  halo
     channel 3  →  headlights (with strobe wiring — one on/off)
     channel 4  →  xmas lights                 (xwalk-exclusive)
-    channel 5  →  (unused — leave off)
+    channel 5  →  monitor power (HDMI splitter leg 1)
     channel 6  →  speaker amplifier           (unlock-gated)
     channel 7  →  cooling fan                 (always on while teleop runs)
-    channel 8  →  (unused — leave off)
+    channel 8  →  monitor power (HDMI splitter leg 2)
 
 Behavior:
 
@@ -30,12 +30,12 @@ Behavior:
         - channel 4 (xmas) stays off
         - channel 6 (speaker amp) turns ON
         - channel 7 (fan) stays ON
-        - channels 5, 8 stay off
+        - channels 5, 8 (monitors) stay ON
 
     LOCK EDGE (robot goes locked)
         - channels 1–4 and 6 off (amp powered down); blinks/signals cancelled
         - channel 7 (fan) stays ON
-        - channels 5, 8 stay off
+        - channels 5, 8 (monitors) stay ON
 
     Turn signals (from indicator envelope)
         - Left  → channel 2 blinks for signal_timeout_sec, self-expires
@@ -102,9 +102,10 @@ CH_TAIL_HALO_LEFT  = 2
 CH_HEADLIGHTS      = 3
 CH_XMAS            = 4      # xwalk-exclusive
 CH_SPEAKER_AMP     = 6      # unlock-gated — audio amp power
-CH_FAN             = 7 
-CH_DISPLAY         = 5
-CH_8               = 8
+CH_FAN             = 7
+CH_DISPLAY_LEFT    = 5      # monitor power (HDMI splitter)
+CH_DISPLAY_RIGHT   = 8      # monitor power (HDMI splitter)
+MONITOR_CHANNELS   = (CH_DISPLAY_LEFT, CH_DISPLAY_RIGHT)
 
 # Channels that participate in "lights on" (unlock-auto-on) and talk-blink.
 # Xmas is intentionally excluded — it's xwalk-exclusive.
@@ -118,7 +119,7 @@ XWALK_CHANNELS = (CH_HEADLIGHTS, CH_TAIL_HALO_LEFT, CH_TAIL_HALO_RIGHT, CH_XMAS)
 # Includes the amp so LOCK / stop() / crash cleanup all power the amp down.
 ALL_CHANNELS = (
     CH_HEADLIGHTS, CH_TAIL_HALO_LEFT, CH_TAIL_HALO_RIGHT, CH_XMAS,
-    CH_SPEAKER_AMP, CH_DISPLAY, CH_8,
+    CH_SPEAKER_AMP,
 )
 
 
@@ -177,8 +178,9 @@ class LightsController:
         # for the life of this process (lock/unlock do not touch it).
         self.all_off()
         self._ensure_fan_on()
+        self._ensure_displays_on()
         self._blink_thread.start()
-        log("lights", "ready (8-ch relay, amp=ch6 unlock-gated, fan=ch7 always-on)")
+        log("lights", "ready (8-ch relay, amp=ch6 unlock-gated, fan=ch7, monitors=ch5+ch8)")
 
     def stop(self) -> None:
         self._stop.set()
@@ -191,6 +193,8 @@ class LightsController:
         # Fan goes off only when teleop exits (not on lock).
         self.all_off()
         self._write_relay(CH_FAN, False)
+        for ch in MONITOR_CHANNELS:
+            self._write_relay(ch, False)
         with self._dev_lock:
             if self._dev is not None:
                 try:
@@ -241,10 +245,9 @@ class LightsController:
         else:
             self._apply_steady()
 
-        # Fan stays on through lock and unlock.
+        # Fan and monitors stay on through lock and unlock.
         self._ensure_fan_on()
-        # self._ensure_display_on()
-        # self._ensure_8_on()
+        self._ensure_displays_on()
 
     def command(self, envelope: dict) -> None:
         """Dispatch one parsed envelope {seq, t, type, data}."""
@@ -468,13 +471,10 @@ class LightsController:
         """Cooling fan (ch7): always on while teleop is running."""
         self._write_relay(CH_FAN, True)
 
-    def _ensure_display_on(self) -> None:
-        """Cooling fan (ch7): always on while teleop is running."""
-        self._write_relay(CH_DISPLAY, True)
-    
-    def _ensure_8_on(self) -> None:
-        """Cooling fan (ch7): always on while teleop is running."""
-        self._write_relay(CH_8, True)
+    def _ensure_displays_on(self) -> None:
+        """Monitor power (ch5 + ch8): always on while teleop is running."""
+        for ch in MONITOR_CHANNELS:
+            self._write_relay(ch, True)
 
     def _apply_all_off(self) -> None:
         """Drive normal robot outputs low.
@@ -484,9 +484,7 @@ class LightsController:
         """
         for ch in ALL_CHANNELS:
             self._write_relay(ch, False)
-
-        # Unused channel 8 forced off. Do not include CH_FAN (7).
-        self._write_relay(8, False)
+        # Do not include CH_FAN (7) or MONITOR_CHANNELS (5, 8) here.
 
     # ── blink loop ──────────────────────────────────────────────────────────
 

@@ -242,18 +242,16 @@ class LocalGamepad:
     # ── pygame init helpers ─────────────────────────────────────────────────
 
     def _init_pygame(self):
-        """Init pygame's joystick subsystem only. Do NOT touch pygame.display
-        or pygame.init() — that would conflict with LAB.display which owns the
-        video subsystem in this process."""
+        """Init pygame for joystick input. Display uses MPV, so pygame.display
+        is not needed here — use a dummy video driver to avoid grabbing HDMI."""
         try:
             import pygame
         except ImportError:
             log("local_gp", "pygame not installed — local gamepad disabled")
             return None
         try:
-            # If pygame hasn't been initialized at all yet (display_enabled=False
-            # case), we still need a video subsystem for the event loop to work.
-            # Use dummy driver so we don't conflict with anyone else.
+            # Use dummy video driver so pygame never grabs the physical HDMI
+            # output (MPV owns the monitor via LAB.display).
             if not pygame.get_init():
                 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
                 # Only force dummy video if nobody else is going to init it

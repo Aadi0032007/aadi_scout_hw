@@ -1,42 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Jul  8 04:37:38 2026
+display.py — MPV fullscreen display subsystem (HDMI still images).
 
-@author: Aadi
+Runtime-facing API:
+    start()                 — start MPV and show the default wallpaper
+    stop()                  — quit MPV and release the display
+    show_text(text)         — render text to a temp PNG and show fullscreen
+    set_wallpaper(image)    — show a PNG/JPG fullscreen, resolved from display/
+    clear()                 — return to the default wallpaper
+
+Uses DisplayManager (mpv JSON IPC) so pygame remains free for the local
+gamepad joystick subsystem.
 """
 
 from __future__ import annotations
-"""
-display.py — pygame fullscreen display subsystem.
-
-Runtime-facing API:
-    start()                 — start the pygame worker thread
-    stop()                  — stop pygame and release the display
-    show_text(text)         — render a centered fullscreen message
-    set_wallpaper(image)    — render a PNG/JPG fullscreen, resolved from display/
-    clear()                 — return to the default wallpaper or blank screen
-
-This is intentionally modeled after util_pygame_monitor_test.py, but turned
-into a non-blocking teleop subsystem. Pygame work stays on one background
-thread; the WS dispatcher only enqueues commands and never waits on X/SDL.
-"""
 
 import os
-import sys
 import threading
 from pathlib import Path
 from queue import Empty, Full, Queue
 from typing import Optional
 
 from .common import log
+from .utils.display_manager import (
+    DisplayManager,
+    parse_rotation_from_filename,
+)
 
-
-# Colors copied from the working monitor utility style.
-BG = (18, 22, 32)
-PANEL_BG = (24, 30, 44)
-TEXT = (240, 240, 245)
-MUTED = (180, 188, 200)
-ERROR = (255, 150, 120)
+_TEXT_IMAGE_PATH = "/tmp/revo-display-text.png"
 
 
 class DisplayController:
@@ -44,27 +35,28 @@ class DisplayController:
         self,
         display: Optional[str] = None,
         asset_dir: str = "",
-        default_wallpaper: str = "REVOBOTS_LOGO_1.png",
+        default_wallpaper: str = "REVOBOTS_LOGO_AC90R.png",
         rotate: int = 90,
         fullscreen: bool = True,
         fps: int = 30,
         enabled: bool = True,
     ) -> None:
-        self._display = display
-        self._asset_dir = Path(asset_dir).expanduser() if asset_dir else None
+        self._display = display or _resolve_display_name()
+        self._asset_dir = (
+            Path(asset_dir).expanduser()
+            if asset_dir
+            else Path.home() / "Revobots" / "display"
+        )
         self._default_wallpaper = default_wallpaper
         self._rotate = rotate if rotate in (0, 90, 180, 270) else 0
-        self._fullscreen = bool(fullscreen)
-        self._fps = max(1, int(fps))
         self._enabled = bool(enabled)
+        # fullscreen/fps kept for config API compatibility; MPV owns the window.
+        _ = fullscreen, fps
 
         self._queue: Queue[dict] = Queue(maxsize=8)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._ready = threading.Event()
-        self._started = False
-
-    # ── lifecycle ─────────────────────────────────────────────────────────
+        self._mgr: Optional[DisplayManager] = None
 
     def start(self) -> None:
         if not self._enabled:
@@ -77,18 +69,13 @@ class DisplayController:
             target=self._run, daemon=True, name="display"
         )
         self._thread.start()
-        self._started = True
 
     def stop(self) -> None:
         self._stop.set()
         self._enqueue({"cmd": "stop"})
         if self._thread is not None:
-            self._thread.join(timeout=3.0)
+            self._thread.join(timeout=5.0)
             self._thread = None
-        self._ready.clear()
-        self._started = False
-
-    # ── public commands ───────────────────────────────────────────────────
 
     def show_text(self, text: str) -> None:
         text = str(text or "").strip()
@@ -105,16 +92,12 @@ class DisplayController:
     def clear(self) -> None:
         self._enqueue({"cmd": "clear"})
 
-    # ── internals ─────────────────────────────────────────────────────────
-
     def _enqueue(self, item: dict) -> None:
         if not self._enabled:
             return
         try:
             self._queue.put_nowait(item)
         except Full:
-            # Keep the newest UI command. Dropping one stale display update is
-            # preferable to ever blocking the WS/audio/motion dispatch thread.
             try:
                 self._queue.get_nowait()
             except Empty:
@@ -126,147 +109,69 @@ class DisplayController:
 
     def _run(self) -> None:
         try:
-            import pygame  # type: ignore
-        except Exception as exc:
-            log("display", f"pygame not installed ({exc}) — display disabled")
-            return
+            self._mgr = DisplayManager(display=self._display)
+            if not self._mgr.start():
+                log("display", "mpv start failed — is mpv installed? (sudo apt install mpv)")
+                return
 
-        try:
-            chosen = _setup_display(self._display)
-            os.environ.setdefault("SDL_MOUSE_TOUCH_EVENTS", "1")
-            pygame.init()
-            pygame.display.set_caption("Revo Display")
-            screen = _open_screen(pygame, fullscreen=self._fullscreen)
-            sw, sh = screen.get_size()
-            cw, ch = _canvas_size(sw, sh, self._rotate)
-            canvas = pygame.Surface((cw, ch))
-            clock = pygame.time.Clock()
-            log("display", f"ready DISPLAY={chosen} screen={sw}x{sh} canvas={cw}x{ch} rotate={self._rotate}")
-            self._ready.set()
-
-            dirty = True
+            log("display", f"ready DISPLAY={self._display} asset_dir={self._asset_dir}")
             if self._default_wallpaper:
-                dirty = self._draw_wallpaper(pygame, canvas, self._default_wallpaper)
-            if not dirty:
-                self._draw_text(pygame, canvas, "Display ready", subtitle="Waiting for browser command")
-                dirty = True
+                self._show_wallpaper(self._default_wallpaper)
 
             while not self._stop.is_set():
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        self._stop.set()
-                    elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                        self._stop.set()
+                try:
+                    item = self._queue.get(timeout=0.25)
+                except Empty:
+                    continue
 
-                # Drain all pending commands and apply the newest state changes.
-                while True:
-                    try:
-                        item = self._queue.get_nowait()
-                    except Empty:
-                        break
-                    cmd = item.get("cmd")
-                    if cmd == "stop":
-                        self._stop.set()
-                        break
-                    if cmd == "text":
-                        self._draw_text(pygame, canvas, str(item.get("text") or ""))
-                        dirty = True
-                    elif cmd == "wallpaper":
-                        dirty = self._draw_wallpaper(pygame, canvas, str(item.get("image") or ""))
-                    elif cmd == "clear":
-                        if self._default_wallpaper:
-                            dirty = self._draw_wallpaper(pygame, canvas, self._default_wallpaper)
-                        else:
-                            canvas.fill(BG)
-                            dirty = True
-
-                if dirty:
-                    _present_canvas(pygame, screen, canvas, self._rotate)
-                    pygame.display.flip()
-                    dirty = False
-
-                clock.tick(self._fps)
+                cmd = item.get("cmd")
+                if cmd == "stop":
+                    break
+                if cmd == "text":
+                    self._show_text(str(item.get("text") or ""))
+                elif cmd == "wallpaper":
+                    self._show_wallpaper(str(item.get("image") or ""))
+                elif cmd == "clear":
+                    if self._default_wallpaper:
+                        self._show_wallpaper(self._default_wallpaper)
+                    elif self._mgr is not None:
+                        self._mgr.clear()
         except Exception as exc:
             log("display", f"display worker error: {exc}")
         finally:
-            try:
-                pygame.quit()  # type: ignore[name-defined]
-            except Exception:
-                pass
+            if self._mgr is not None:
+                try:
+                    self._mgr.stop()
+                except Exception:
+                    pass
+                self._mgr = None
             log("display", "stopped")
 
-    def _draw_wallpaper(self, pygame, canvas, raw: str) -> bool:
+    def _show_wallpaper(self, raw: str) -> None:
+        if self._mgr is None:
+            return
         path = self._resolve_image_path(raw)
         if path is None:
             log("display", f"wallpaper not found: {raw!r}")
-            self._draw_text(
-                pygame,
-                canvas,
-                "Image not found",
-                subtitle=str(raw),
-                color=ERROR,
-            )
-            return True
-        try:
-            image = pygame.image.load(str(path))
-            if image.get_alpha() is not None:
-                image = image.convert_alpha()
-            else:
-                image = image.convert()
-            iw, ih = image.get_size()
-            cw, ch = canvas.get_size()
-            scale = min(cw / iw, ch / ih)
-            new_size = (max(1, int(iw * scale)), max(1, int(ih * scale)))
-            image = pygame.transform.smoothscale(image, new_size)
-            rect = image.get_rect(center=(cw // 2, ch // 2))
-            canvas.fill((0, 0, 0))
-            canvas.blit(image, rect)
-            log("display", f"wallpaper={path.name}")
-            return True
-        except Exception as exc:
-            log("display", f"wallpaper load error {path}: {exc}")
-            self._draw_text(pygame, canvas, "Image load error", subtitle=path.name, color=ERROR)
-            return True
+            return
+        rotate = parse_rotation_from_filename(path)
+        if rotate == 0 and self._rotate:
+            rotate = self._rotate
+        ok = self._mgr.show_image(path, rotate=rotate)
+        if ok:
+            log("display", f"wallpaper={path.name}" + (f" rotate={rotate}" if rotate else ""))
+        else:
+            log("display", f"wallpaper show failed: {path}")
 
-    def _draw_text(
-        self,
-        pygame,
-        canvas,
-        text: str,
-        subtitle: str = "",
-        color: tuple = TEXT,
-    ) -> None:
-        canvas.fill(BG)
-        cw, ch = canvas.get_size()
-        margin = max(cw // 12, 32)
-        panel = pygame.Rect(margin, margin, cw - margin * 2, ch - margin * 2)
-        pygame.draw.rect(canvas, PANEL_BG, panel, border_radius=28)
-        pygame.draw.rect(canvas, MUTED, panel, width=3, border_radius=28)
-
-        title_font = _load_font(pygame, max(min(cw, ch) // 9, 42), bold=True)
-        body_font = _load_font(pygame, max(min(cw, ch) // 18, 26), bold=False)
-        max_w = panel.width - margin
-
-        _draw_multiline_centered(
-            pygame,
-            canvas,
-            title_font,
-            text,
-            color,
-            panel.centery - (body_font.get_linesize() if subtitle else 0),
-            max_w,
-        )
-        if subtitle:
-            _draw_multiline_centered(
-                pygame,
-                canvas,
-                body_font,
-                subtitle,
-                MUTED,
-                panel.centery + max(title_font.get_linesize(), 60),
-                max_w,
-            )
-        log("display", f"text={_preview(text)!r}")
+    def _show_text(self, text: str) -> None:
+        path = _render_text_image(text, self._rotate)
+        if path is None:
+            log("display", f"text render failed: {_preview(text)!r}")
+            return
+        if self._mgr is not None:
+            ok = self._mgr.show_image(path, rotate=0)
+            if ok:
+                log("display", f"text={_preview(text)!r}")
 
     def _resolve_image_path(self, raw: str) -> Optional[Path]:
         raw = str(raw or "").strip()
@@ -280,16 +185,15 @@ class DisplayController:
             candidates.append(p)
         else:
             candidates.append(Path.cwd() / p)
-            if self._asset_dir is not None:
-                candidates.append(self._asset_dir / p)
-                candidates.append(self._asset_dir / p.name)
+            candidates.append(self._asset_dir / p)
+            candidates.append(self._asset_dir / p.name)
             candidates.extend([
                 module_dir / "display" / p,
                 module_dir / "display" / p.name,
                 module_dir.parent / "display" / p,
                 module_dir.parent / "display" / p.name,
-                Path.home() / "Revobots" / "development" / "display" / p,
-                Path.home() / "Revobots" / "development" / "display" / p.name,
+                Path.home() / "Revobots" / "display" / p,
+                Path.home() / "Revobots" / "display" / p.name,
             ])
 
         seen: set[str] = set()
@@ -303,59 +207,72 @@ class DisplayController:
         return None
 
 
-def _setup_display(display: Optional[str]) -> str:
-    """Pick an X11 display when teleop is started from SSH/systemd."""
-    if display:
-        os.environ["DISPLAY"] = display
-    elif not os.environ.get("DISPLAY"):
-        for cand in (":0", ":10", ":1"):
-            if os.path.exists(f"/tmp/.X11-unix/X{cand.lstrip(':')}"):
-                os.environ["DISPLAY"] = cand
-                break
-
-    if not os.environ.get("XAUTHORITY"):
-        for path in (
-            os.path.expanduser("~/.Xauthority"),
-            f"/run/user/{os.getuid()}/gdm/Xauthority",
-        ):
-            if os.path.isfile(path):
-                os.environ["XAUTHORITY"] = path
-                break
-
-    chosen = os.environ.get("DISPLAY", "")
-    if not chosen:
-        raise RuntimeError("no DISPLAY set; for the physical monitor use DISPLAY=:0")
-    return chosen
+def _resolve_display_name() -> str:
+    if os.environ.get("DISPLAY"):
+        return os.environ["DISPLAY"]
+    for cand in (":0", ":10", ":1"):
+        if os.path.exists(f"/tmp/.X11-unix/X{cand.lstrip(':')}"):
+            return cand
+    return ":0"
 
 
-def _open_screen(pygame, fullscreen: bool):
+def _render_text_image(text: str, rotate: int) -> Optional[str]:
+    """Render centered text to a PNG for MPV. Returns path or None."""
     try:
-        if fullscreen:
-            return pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-        return pygame.display.set_mode((1024, 600), pygame.RESIZABLE)
-    except pygame.error as exc:
-        if fullscreen:
-            log("display", f"fullscreen failed ({exc}); trying windowed mode")
-            return pygame.display.set_mode((1024, 600), pygame.RESIZABLE)
-        raise
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        log("display", "Pillow not installed — cannot render display text")
+        return None
 
+    # Portrait-friendly canvas; MPV video-rotate handles orientation.
+    width, height = (1080, 1920) if rotate in (90, 270) else (1920, 1080)
+    bg = (18, 22, 32)
+    panel = (24, 30, 44)
+    fg = (240, 240, 245)
 
-def _load_font(pygame, size: int, bold: bool = False):
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
-        if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
-        if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ]
-    for path in candidates:
+    img = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(img)
+    margin = width // 12
+    draw.rounded_rectangle(
+        (margin, margin, width - margin, height - margin),
+        radius=28,
+        fill=panel,
+        outline=(180, 188, 200),
+        width=3,
+    )
+
+    size = max(min(width, height) // 12, 42)
+    font = None
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    ):
         if os.path.isfile(path):
-            return pygame.font.Font(path, size)
-    return pygame.font.SysFont("sans", size, bold=bold)
+            font = ImageFont.truetype(path, size)
+            break
+    if font is None:
+        font = ImageFont.load_default()
+
+    max_w = width - margin * 4
+    lines = _wrap_text(text, font, max_w)
+    line_h = size + 8
+    total_h = line_h * len(lines)
+    y = (height - total_h) // 2
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        tw = bbox[2] - bbox[0]
+        draw.text(((width - tw) // 2, y), line, fill=fg, font=font)
+        y += line_h
+
+    try:
+        img.save(_TEXT_IMAGE_PATH, "PNG")
+        return _TEXT_IMAGE_PATH
+    except OSError as exc:
+        log("display", f"text image save failed: {exc}")
+        return None
 
 
-def _wrap_text(font, text: str, max_width: int) -> list[str]:
+def _wrap_text(text: str, font, max_width: int) -> list[str]:
     lines: list[str] = []
     for paragraph in str(text or "").splitlines() or [""]:
         words = paragraph.split()
@@ -365,42 +282,13 @@ def _wrap_text(font, text: str, max_width: int) -> list[str]:
         current = words[0]
         for word in words[1:]:
             trial = f"{current} {word}"
-            if font.size(trial)[0] <= max_width:
+            if font.getlength(trial) <= max_width:
                 current = trial
             else:
                 lines.append(current)
                 current = word
         lines.append(current)
     return lines or [""]
-
-
-def _draw_multiline_centered(pygame, surface, font, text: str, color: tuple, center_y: int, max_width: int) -> None:
-    lines = _wrap_text(font, text, max_width)
-    line_h = font.get_linesize()
-    total_h = line_h * len(lines)
-    y = center_y - total_h // 2
-    for line in lines:
-        rendered = font.render(line, True, color)
-        rect = rendered.get_rect(center=(surface.get_width() // 2, y + line_h // 2))
-        surface.blit(rendered, rect)
-        y += line_h
-
-
-def _canvas_size(screen_w: int, screen_h: int, rotate: int) -> tuple[int, int]:
-    if rotate in (90, 270):
-        return screen_h, screen_w
-    return screen_w, screen_h
-
-
-def _present_canvas(pygame, screen, canvas, rotate: int) -> None:
-    screen.fill(BG)
-    if rotate == 0:
-        screen.blit(canvas, (0, 0))
-        return
-    rotated = pygame.transform.rotate(canvas, -rotate)
-    if rotated.get_size() != screen.get_size():
-        rotated = pygame.transform.smoothscale(rotated, screen.get_size())
-    screen.blit(rotated, (0, 0))
 
 
 def _preview(text: str, limit: int = 60) -> str:
